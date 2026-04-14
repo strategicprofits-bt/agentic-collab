@@ -1243,7 +1243,13 @@ route('POST', '/api/reminders', async (req, res, _match, ctx) => {
   if (!body.prompt || typeof body.prompt !== 'string') {
     return json(res, 400, { error: 'prompt required' });
   }
-  if (typeof body.cadenceMinutes !== 'number' || body.cadenceMinutes < 5) {
+  // deliverAt (clock-time) mode relaxes cadenceMinutes — it defaults to 1440 (daily)
+  const deliverAt = typeof body.deliverAt === 'string' ? body.deliverAt : undefined;
+  if (deliverAt && !/^\d{2}:\d{2}$/.test(deliverAt)) {
+    return json(res, 400, { error: 'deliverAt must be HH:MM format' });
+  }
+  const cadenceMinutes = (typeof body.cadenceMinutes === 'number' ? body.cadenceMinutes : (deliverAt ? 1440 : undefined)) as number;
+  if (!deliverAt && (typeof cadenceMinutes !== 'number' || cadenceMinutes < 5)) {
     return json(res, 400, { error: 'cadenceMinutes must be >= 5' });
   }
 
@@ -1254,8 +1260,9 @@ route('POST', '/api/reminders', async (req, res, _match, ctx) => {
     agentName: body.agentName as string,
     createdBy: (body.createdBy as string | undefined) ?? undefined,
     prompt: body.prompt as string,
-    cadenceMinutes: body.cadenceMinutes as number,
+    cadenceMinutes,
     skipIfActive: typeof body.skipIfActive === 'boolean' ? body.skipIfActive : undefined,
+    deliverAt,
   });
 
   broadcastReminderUpdate(ctx);

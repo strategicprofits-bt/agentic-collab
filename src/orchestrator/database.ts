@@ -220,6 +220,11 @@ export class Database {
     if (!reminderColumns.some((c) => c['name'] === 'skip_if_active')) {
       this.db.exec('ALTER TABLE reminders ADD COLUMN skip_if_active INTEGER NOT NULL DEFAULT 0');
     }
+
+    // Add deliver_at column for clock-time delivery (HH:MM format)
+    if (!reminderColumns.some((c) => c['name'] === 'deliver_at')) {
+      this.db.exec('ALTER TABLE reminders ADD COLUMN deliver_at TEXT');
+    }
   }
 
   /** Expose raw handle for LockManager (shares same DB connection). */
@@ -669,8 +674,12 @@ export class Database {
 
   // ── Reminders ──
 
-  createReminder(opts: { agentName: string; createdBy?: string; prompt: string; cadenceMinutes: number; skipIfActive?: boolean }): Reminder {
-    if (opts.cadenceMinutes < 5) {
+  createReminder(opts: { agentName: string; createdBy?: string; prompt: string; cadenceMinutes: number; skipIfActive?: boolean; deliverAt?: string }): Reminder {
+    if (opts.deliverAt) {
+      if (!/^\d{2}:\d{2}$/.test(opts.deliverAt)) {
+        throw new Error('deliverAt must be HH:MM format');
+      }
+    } else if (opts.cadenceMinutes < 5) {
       throw new Error('cadenceMinutes must be >= 5');
     }
     // Auto-assign sort_order as max(sort_order) + 1 for that agent's pending reminders
@@ -680,9 +689,9 @@ export class Database {
     const nextOrder = ((maxRow['max_order'] as number) ?? -1) + 1;
 
     this.db.prepare(`
-      INSERT INTO reminders (agent_name, created_by, prompt, cadence_minutes, sort_order, skip_if_active)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(opts.agentName, opts.createdBy ?? null, opts.prompt, opts.cadenceMinutes, nextOrder, opts.skipIfActive ? 1 : 0);
+      INSERT INTO reminders (agent_name, created_by, prompt, cadence_minutes, sort_order, skip_if_active, deliver_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(opts.agentName, opts.createdBy ?? null, opts.prompt, opts.cadenceMinutes, nextOrder, opts.skipIfActive ? 1 : 0, opts.deliverAt ?? null);
 
     const row = this.db.prepare('SELECT * FROM reminders WHERE id = last_insert_rowid()').get() as Record<string, unknown>;
     return mapReminderRow(row);
@@ -745,7 +754,7 @@ export class Database {
     return mapReminderRow(row);
   }
 
-  updateReminder(id: number, opts: { prompt?: string; cadenceMinutes?: number; skipIfActive?: boolean }): Reminder | undefined {
+  updateReminder(id: number, opts: { prompt?: string; cadenceMinutes?: number; skipIfActive?: boolean; deliverAt?: string | null }): Reminder | undefined {
     const sets: string[] = [];
     const params: unknown[] = [];
     if (opts.prompt !== undefined) { sets.push('prompt = ?'); params.push(opts.prompt); }
@@ -754,6 +763,12 @@ export class Database {
       sets.push('cadence_minutes = ?'); params.push(opts.cadenceMinutes);
     }
     if (opts.skipIfActive !== undefined) { sets.push('skip_if_active = ?'); params.push(opts.skipIfActive ? 1 : 0); }
+    if (opts.deliverAt !== undefined) {
+      if (opts.deliverAt !== null && !/^\d{2}:\d{2}$/.test(opts.deliverAt)) {
+        throw new Error('deliverAt must be HH:MM format or null');
+      }
+      sets.push('deliver_at = ?'); params.push(opts.deliverAt);
+    }
     if (sets.length === 0) return this.getReminder(id);
     params.push(id);
     this.db.prepare(`UPDATE reminders SET ${sets.join(', ')} WHERE id = ?`).run(...params);
@@ -767,7 +782,10 @@ export class Database {
   }
 
   listDueReminders(): Reminder[] {
-    // For each agent, find their top pending reminder where cadence has elapsed
+    // For each agent, find their top pending reminder where delivery is due.
+    // Two modes:
+    //   1. deliver_at (clock-time): fire when local time >= deliver_at AND not yet delivered today
+    //   2. cadence (interval): fire when cadence_minutes have elapsed since last delivery
     const rows = this.db.prepare(`
       SELECT r.* FROM reminders r
       INNER JOIN (
@@ -777,8 +795,19 @@ export class Database {
         GROUP BY agent_name
       ) top ON r.agent_name = top.agent_name AND r.sort_order = top.min_order
       WHERE r.status = 'pending'
-        AND (r.last_delivered_at IS NULL
-             OR (julianday('now') - julianday(r.last_delivered_at)) * 86400.0 >= r.cadence_minutes * 60)
+        AND (
+          CASE
+            WHEN r.deliver_at IS NOT NULL THEN
+              -- Clock-time mode: current local time >= target AND not delivered today
+              strftime('%H:%M', 'now', 'localtime') >= r.deliver_at
+              AND (r.last_delivered_at IS NULL
+                   OR date(r.last_delivered_at, 'localtime') < date('now', 'localtime'))
+            ELSE
+              -- Cadence mode: enough time has elapsed
+              r.last_delivered_at IS NULL
+              OR (julianday('now') - julianday(r.last_delivered_at)) * 86400.0 >= r.cadence_minutes * 60
+          END
+        )
     `).all() as Array<Record<string, unknown>>;
     return rows.map(mapReminderRow);
   }
@@ -948,6 +977,7 @@ function mapReminderRow(row: Record<string, unknown>): Reminder {
     createdBy: row['created_by'] as string | null,
     prompt: row['prompt'] as string,
     cadenceMinutes: row['cadence_minutes'] as number,
+    deliverAt: (row['deliver_at'] as string) ?? null,
     skipIfActive: (row['skip_if_active'] as number) === 1,
     sortOrder: row['sort_order'] as number,
     status: row['status'] as ReminderStatus,

@@ -198,6 +198,7 @@ export type Reminder = {
   createdBy: string | null;
   prompt: string;
   cadenceMinutes: number;
+  deliverAt: string | null; // HH:MM local time — when set, overrides cadence for daily clock-time delivery
   skipIfActive: boolean;
   sortOrder: number;
   status: ReminderStatus;

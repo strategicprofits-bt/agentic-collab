@@ -379,31 +379,41 @@ cmd('reminder', 'reminder <sub> [args...]', 'Manage reminders (add|list|done|can
   const sargs = args.slice(1);
 
   if (sub === 'add') {
-    // collab reminder add <agent> "<prompt>" --cadence 10m [--from <name>]
-    let cadence = null, from = null;
+    // collab reminder add <agent> "<prompt>" --cadence 10m [--at HH:MM] [--from <name>]
+    let cadence = null, from = null, at = null;
     const positional = [];
     for (let i = 0; i < sargs.length; i++) {
       if (sargs[i] === '--cadence' && sargs[i + 1]) { cadence = sargs[++i]; }
+      else if (sargs[i] === '--at' && sargs[i + 1]) { at = sargs[++i]; }
       else if (sargs[i] === '--from' && sargs[i + 1]) { from = sargs[++i]; }
       else { positional.push(sargs[i]); }
     }
     const targetAgent = positional[0];
     const prompt = positional.slice(1).join(' ');
     if (!targetAgent || !prompt) {
-      console.error('usage: collab reminder add <agent> "<prompt>" --cadence 10m [--from <name>]');
+      console.error('usage: collab reminder add <agent> "<prompt>" --cadence 10m [--at HH:MM] [--from <name>]');
       process.exit(1);
     }
-    // parse cadence: "10m" → 10, "30m" → 30, bare number → minutes
-    let cadenceMinutes = 30;
-    if (cadence) {
-      const m = cadence.match(/^(\d+)m?$/);
-      if (!m) { console.error('error: --cadence must be like 10m or 30'); process.exit(1); }
-      cadenceMinutes = parseInt(m[1], 10);
+    // --at HH:MM enables clock-time delivery (daily at that local time)
+    if (at) {
+      if (!/^\d{2}:\d{2}$/.test(at)) { console.error('error: --at must be HH:MM (e.g. 06:00)'); process.exit(1); }
+      const createdBy = from || agentName() || undefined;
+      const body = { agentName: targetAgent, prompt, cadenceMinutes: 1440, deliverAt: at, createdBy };
+      const reminder = await api('POST', '/api/reminders', body);
+      console.log(`created reminder #${reminder.id} for ${targetAgent} (daily at ${at})`);
+    } else {
+      // parse cadence: "10m" → 10, "30m" → 30, bare number → minutes
+      let cadenceMinutes = 30;
+      if (cadence) {
+        const m = cadence.match(/^(\d+)m?$/);
+        if (!m) { console.error('error: --cadence must be like 10m or 30'); process.exit(1); }
+        cadenceMinutes = parseInt(m[1], 10);
+      }
+      if (cadenceMinutes < 5) { console.error('error: cadence must be >= 5 minutes'); process.exit(1); }
+      const createdBy = from || agentName() || undefined;
+      const reminder = await api('POST', '/api/reminders', { agentName: targetAgent, prompt, cadenceMinutes, createdBy });
+      console.log(`created reminder #${reminder.id} for ${targetAgent} (every ${cadenceMinutes}m)`);
     }
-    if (cadenceMinutes < 5) { console.error('error: cadence must be >= 5 minutes'); process.exit(1); }
-    const createdBy = from || agentName() || undefined;
-    const reminder = await api('POST', '/api/reminders', { agentName: targetAgent, prompt, cadenceMinutes, createdBy });
-    console.log(`created reminder #${reminder.id} for ${targetAgent} (every ${cadenceMinutes}m)`);
   }
 
   else if (sub === 'list') {
@@ -427,7 +437,8 @@ cmd('reminder', 'reminder <sub> [args...]', 'Manage reminders (add|list|done|can
       console.log(`${'ID'.padEnd(maxId)}  ${'Agent'.padEnd(maxAgent)}  ${'Prompt'.padEnd(maxPrompt)}  Cadence   Status`);
       for (const r of rows) {
         const prompt = r.prompt.length > 50 ? r.prompt.slice(0, 47) + '...' : r.prompt;
-        const cadence = `${r.cadenceMinutes}m`.padEnd(9);
+        const schedule = r.deliverAt ? `at ${r.deliverAt}` : `${r.cadenceMinutes}m`;
+        const cadence = schedule.padEnd(9);
         const status = r.status === 'completed' ? 'done' : 'pending';
         console.log(`${r.id.toString().padEnd(maxId)}  ${r.agentName.padEnd(maxAgent)}  ${prompt.padEnd(maxPrompt)}  ${cadence} ${status}`);
       }
