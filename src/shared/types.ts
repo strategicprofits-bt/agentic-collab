@@ -172,7 +172,7 @@ export type DashboardMessage = {
 
 // ── Message Queue ──
 
-export type PendingMessageStatus = 'pending' | 'delivered' | 'failed';
+export type PendingMessageStatus = 'pending' | 'delivering' | 'delivered' | 'failed';
 
 export type PendingMessage = {
   id: number;

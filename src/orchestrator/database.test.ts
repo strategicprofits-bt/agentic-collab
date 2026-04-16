@@ -350,12 +350,17 @@ describe('Database', () => {
       assert.ok(messages.every(m => m.status === 'pending'));
     });
 
-    it('marks attempt started', () => {
+    it('claims message for delivery atomically', () => {
       const messages = db.getDeliverableMessages('agent-b');
       const msg = messages[0]!;
-      db.markAttemptStarted(msg.id);
+      const claimed = db.claimForDelivery(msg.id);
+      assert.equal(claimed, true);
       const updated = db.getPendingMessageById(msg.id)!;
+      assert.equal(updated.status, 'delivering');
       assert.ok(updated.lastAttemptAt !== null);
+      // Second claim should fail — already delivering
+      const claimedAgain = db.claimForDelivery(msg.id);
+      assert.equal(claimedAgain, false);
     });
 
     it('marks message delivered', () => {
@@ -373,7 +378,7 @@ describe('Database', () => {
         targetAgent: 'agent-d',
         envelope: 'will fail',
       });
-      db.markAttemptStarted(msg.id);
+      db.claimForDelivery(msg.id);
       db.markAttemptFailed(msg.id, 'proxy unreachable');
       const updated = db.getPendingMessageById(msg.id)!;
       assert.equal(updated.retryCount, 1);
@@ -390,7 +395,7 @@ describe('Database', () => {
       });
       // Exhaust all retries
       for (let i = 0; i < 5; i++) {
-        db.markAttemptStarted(msg.id);
+        db.claimForDelivery(msg.id);
         db.markAttemptFailed(msg.id, `attempt ${i + 1} failed`);
       }
       const updated = db.getPendingMessageById(msg.id)!;
@@ -431,7 +436,7 @@ describe('Database', () => {
         targetAgent: 'agent-stale',
         envelope: 'stale test',
       });
-      db.markAttemptStarted(msg.id);
+      db.claimForDelivery(msg.id);
       // Manually backdate the last_attempt_at to make it stale
       db.rawDb.prepare(
         `UPDATE pending_messages SET last_attempt_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-120 seconds') WHERE id = ?`

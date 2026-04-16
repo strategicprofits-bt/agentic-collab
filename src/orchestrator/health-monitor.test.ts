@@ -393,7 +393,7 @@ describe('HealthMonitor', () => {
       envelope: '[from: notify-me]: permanent fail',
     });
     for (let i = 0; i < 4; i++) {
-      db.markAttemptStarted(queued.id);
+      db.claimForDelivery(queued.id);
       db.markAttemptFailed(queued.id, `fail ${i + 1}`);
     }
     // Clear next_attempt_at so it's deliverable

@@ -532,10 +532,17 @@ export class Database {
     return rows.map(mapPendingMessageRow);
   }
 
-  markAttemptStarted(id: number): void {
-    this.db.prepare(`
-      UPDATE pending_messages SET last_attempt_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?
+  /**
+   * Atomically claim a message for delivery by transitioning pending → delivering.
+   * Returns true if this caller won the claim, false if another caller already did.
+   */
+  claimForDelivery(id: number): boolean {
+    const result = this.db.prepare(`
+      UPDATE pending_messages
+      SET status = 'delivering', last_attempt_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE id = ? AND status = 'pending'
     `).run(id);
+    return result.changes > 0;
   }
 
   markMessageDelivered(id: number): void {
@@ -554,10 +561,11 @@ export class Database {
       `).run(retryCount, error, id);
     } else {
       // Exponential backoff: 30s, 60s, 120s, 240s, 480s
+      // Reset status to 'pending' so the drain loop can re-claim it
       const backoffSeconds = 30 * Math.pow(2, retryCount - 1);
       this.db.prepare(`
         UPDATE pending_messages
-        SET retry_count = ?, error = ?,
+        SET status = 'pending', retry_count = ?, error = ?,
             next_attempt_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '+' || ? || ' seconds')
         WHERE id = ?
       `).run(retryCount, error, backoffSeconds, id);
@@ -567,14 +575,25 @@ export class Database {
   resetStaleAttempts(timeoutSeconds = 60): number {
     const result = this.db.prepare(`
       UPDATE pending_messages
-      SET retry_count = retry_count + 1,
+      SET status = 'pending', retry_count = retry_count + 1,
           error = 'Delivery attempt timed out',
           next_attempt_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '+30 seconds')
-      WHERE status = 'pending'
+      WHERE status = 'delivering'
         AND last_attempt_at IS NOT NULL
-        AND delivered_at IS NULL
         AND julianday('now') - julianday(last_attempt_at) > ? / 86400.0
     `).run(timeoutSeconds);
+    return result.changes;
+  }
+
+  /**
+   * Reset messages stuck in 'delivering' from a previous process crash.
+   * Called once at startup before the pending message sweep.
+   */
+  resetDeliveringOnStartup(): number {
+    const result = this.db.prepare(`
+      UPDATE pending_messages SET status = 'pending'
+      WHERE status = 'delivering'
+    `).run();
     return result.changes;
   }
 

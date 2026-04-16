@@ -50,6 +50,10 @@ export class ReminderDispatcher {
         }
       }
 
+      // Claim the reminder FIRST to prevent duplicate delivery if the next
+      // tick fires before this one completes (e.g., long processing or restart)
+      this.db.updateReminderDelivery(reminder.id);
+
       const creator = reminder.createdBy || 'system';
       const envelope = `[reminder #${reminder.id} from ${creator}]: ${reminder.prompt}\nMark done when complete: collab reminder done ${reminder.id}`;
 
@@ -67,7 +71,6 @@ export class ReminderDispatcher {
         envelope,
       });
       this.db.linkDashboardMessageToQueue(dashMsg.id, msg.id);
-      this.db.updateReminderDelivery(reminder.id);
 
       if (this.onDashboardMessage) {
         this.onDashboardMessage(dashMsg);

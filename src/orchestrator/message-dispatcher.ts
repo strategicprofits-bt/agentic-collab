@@ -156,13 +156,20 @@ export class MessageDispatcher {
   /**
    * Deliver the next pending message to an agent.
    * One message per call to avoid flooding.
+   *
+   * Uses atomic claim (pending → delivering) to prevent concurrent
+   * callers from delivering the same message twice.
    */
   private async deliverNextMessage(agentName: string): Promise<boolean> {
     const messages = this.db.getDeliverableMessages(agentName);
     if (messages.length === 0) return false;
 
     const message = messages[0]!;
-    this.db.markAttemptStarted(message.id);
+    const claimed = this.db.claimForDelivery(message.id);
+    if (!claimed) {
+      // Another caller already claimed this message — not an error
+      return false;
+    }
 
     const agent = this.db.getAgent(agentName);
     if (!agent || !agent.proxyId) {

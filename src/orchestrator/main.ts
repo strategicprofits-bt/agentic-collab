@@ -480,6 +480,11 @@ server.listen(PORT, '0.0.0.0', async () => {
   // messages from before the restart that were never delivered.
   // Delay 10s to let proxies register and agents come online first.
   setTimeout(() => {
+    // Reset messages stuck in 'delivering' from a previous process crash
+    const resetCount = db.resetDeliveringOnStartup();
+    if (resetCount > 0) {
+      console.log(`[dispatcher] Reset ${resetCount} stale delivering message(s) from previous run`);
+    }
     messageDispatcher.drainPending().catch((err) => {
       console.error('[orchestrator] Startup message sweep failed:', err);
     });

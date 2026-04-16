@@ -118,6 +118,7 @@
     white-space: nowrap;
   }
   .msg-status.pending { color: var(--text-dim); }
+  .msg-status.delivering { color: var(--text-dim); }
   .msg-status.delivered { color: var(--green); }
   .msg-status.failed { color: var(--red); }
   .msg.withdrawn { opacity: 0.5; }
