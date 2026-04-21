@@ -30,6 +30,7 @@ export type HealthMonitorOptions = {
   onQueueUpdate?: (message: PendingMessage) => void;
   onDashboardMessage?: (message: DashboardMessage) => void;
   onIndicatorUpdate?: (agentName: string, indicators: ActiveIndicator[]) => void;
+  onMessageEnqueued?: (targetAgent: string) => void;
   pollIntervalMs?: number;
   idleSuspendMs?: number;        // ms of idle before suspend (default 5 minutes)
 };
@@ -87,8 +88,11 @@ export class HealthMonitor {
   private readonly onQueueUpdate: (message: PendingMessage) => void;
   private readonly onDashboardMessage: (message: DashboardMessage) => void;
   private readonly onIndicatorUpdate: (agentName: string, indicators: ActiveIndicator[]) => void;
+  private readonly onMessageEnqueued: (targetAgent: string) => void;
   private readonly activeIndicators = new Map<string, ActiveIndicator[]>();
   private readonly compiledIndicators = new Map<string, { json: string; entries: Array<{ def: IndicatorDefinition; re: RegExp }> }>();
+  /** Hash of last permission prompt detected per agent, to avoid re-alerting on the same prompt. */
+  private readonly lastPermissionAlert = new Map<string, string>();
 
   constructor(opts: HealthMonitorOptions) {
     this.db = opts.db;
@@ -99,6 +103,7 @@ export class HealthMonitor {
     this.onQueueUpdate = opts.onQueueUpdate ?? (() => {});
     this.onDashboardMessage = opts.onDashboardMessage ?? (() => {});
     this.onIndicatorUpdate = opts.onIndicatorUpdate ?? (() => {});
+    this.onMessageEnqueued = opts.onMessageEnqueued ?? (() => {});
     this.pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_MS;
     this.idleSuspendMs = opts.idleSuspendMs ?? DEFAULT_IDLE_SUSPEND_MS;
   }
@@ -236,6 +241,7 @@ export class HealthMonitor {
         const paneOutput = await this.capturePaneOutput(agent);
         if (paneOutput === null) continue;
         this.evaluateIndicators(agent, paneOutput);
+        this.detectPermissionPrompt(agent, paneOutput);
         const isIdle = this.checkScreenDiff(agent.name, paneOutput);
         this.handleIdleTransitions(agent, isIdle);
       } catch (err) {
@@ -304,6 +310,7 @@ export class HealthMonitor {
 
     this.recordContextPercent(agent, paneOutput);
     this.evaluateIndicators(agent, paneOutput);
+    this.detectPermissionPrompt(agent, paneOutput);
 
     const isIdle = this.checkScreenDiff(agent.name, paneOutput);
     this.handleIdleTransitions(agent, isIdle);
@@ -628,6 +635,7 @@ export class HealthMonitor {
     this.lastActivityTs.delete(name);
     this.activeIndicators.delete(name);
     this.compiledIndicators.delete(name);
+    this.lastPermissionAlert.delete(name);
     // Note: failureSnapshot intentionally NOT deleted here — it's needed
     // by detectCliHealed() after the agent transitions to failed state.
   }
@@ -680,6 +688,70 @@ export class HealthMonitor {
    * Compiles regexes once and caches them, invalidating when the indicators JSON changes.
    * Only fires the onIndicatorUpdate callback when the set of matched indicators changes.
    */
+  /**
+   * Detect Claude Code permission/approval prompts stuck in the pane.
+   * Fires a sev3 dashboard alert and sends a collab message to DrRobby
+   * on topic 'agent-stall-alert' for Telegram escalation.
+   */
+  private detectPermissionPrompt(agent: AgentRecord, paneOutput: string): void {
+    const stripped = HealthMonitor.stripAnsi(paneOutput);
+    const lines = stripped.split('\n');
+
+    // Scan bottom-up for permission prompt patterns.
+    // Claude Code shows: "Allow <tool>? (y/n)" or "Allow tool_name" with Yes/No options
+    for (let i = lines.length - 1; i >= Math.max(0, lines.length - 20); i--) {
+      const line = lines[i]!;
+
+      // Pattern: "Allow <something>" line followed by yes/no options nearby
+      if (/Allow\s+.+\?/i.test(line) || /\bAllow\b.*\b(Yes|No)\b/i.test(line)) {
+        const key = line.trim();
+        if (this.lastPermissionAlert.get(agent.name) === key) return;
+        this.lastPermissionAlert.set(agent.name, key);
+        this.firePermissionAlert(agent.name, key);
+        return;
+      }
+
+      // Pattern: standalone "Yes" / "No" choice block (tool approval UI)
+      if (/^\s*(Yes|No|Allow|Deny|always allow|allow once)/i.test(line)) {
+        const context = lines.slice(Math.max(0, i - 5), i + 1).join('\n');
+        if (/Allow/i.test(context) && /(Yes|No|Deny)/i.test(context)) {
+          const key = context.trim().slice(-120);
+          if (this.lastPermissionAlert.get(agent.name) === key) return;
+          this.lastPermissionAlert.set(agent.name, key);
+          this.firePermissionAlert(agent.name, key);
+          return;
+        }
+      }
+    }
+
+    // No prompt detected — clear the dedup key so a new prompt will fire
+    this.lastPermissionAlert.delete(agent.name);
+  }
+
+  private firePermissionAlert(agentName: string, promptText: string): void {
+    const displayBody = `⚠️ ${agentName} is blocked on a permission prompt: "${promptText.slice(0, 120)}"`;
+
+    // Dashboard alert for operator visibility
+    const dashMsg = this.db.addDashboardMessage(agentName, 'to_agent', displayBody, {
+      topic: 'sev3-permission-prompt',
+      sourceAgent: 'system',
+    });
+    this.onDashboardMessage(dashMsg);
+
+    // Collab message to DrRobby for Telegram escalation
+    const envelope = `[from: system, reply with collab send system --topic agent-stall-alert]: '${agentName} is blocked on a permission prompt: ${promptText.slice(0, 150).replace(/'/g, "\\'")}. Needs operator intervention.'`;
+    const pending = this.db.enqueueMessage({
+      sourceAgent: null,
+      targetAgent: 'DrRobby',
+      envelope,
+    });
+    this.db.linkDashboardMessageToQueue(dashMsg.id, pending.id);
+    this.onQueueUpdate(pending);
+    this.onMessageEnqueued('DrRobby');
+
+    this.db.logEvent(agentName, 'permission_prompt_detected', undefined, { prompt: promptText.slice(0, 200) });
+  }
+
   private evaluateIndicators(agent: AgentRecord, paneOutput: string): void {
     if (!agent.indicators) {
       if (this.activeIndicators.has(agent.name)) {

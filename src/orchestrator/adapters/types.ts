@@ -31,6 +31,7 @@ export type ResumeOptions = {
   cwd: string;
   task?: string;
   appendSystemPrompt?: string;
+  dangerouslySkipPermissions?: boolean;
 };
 
 export interface EngineAdapter {

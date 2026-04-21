@@ -215,6 +215,11 @@ const healthMonitor = new HealthMonitor({
   onIndicatorUpdate: (agentName, indicators) => {
     wss.broadcast(JSON.stringify({ type: 'indicator_update', agentName, indicators }));
   },
+  onMessageEnqueued: (targetAgent) => {
+    messageDispatcher.tryDeliver(targetAgent).catch((err) => {
+      console.error(`[health] Delivery trigger failed for ${targetAgent}:`, (err as Error).message);
+    });
+  },
 });
 healthMonitorRef = healthMonitor;
 

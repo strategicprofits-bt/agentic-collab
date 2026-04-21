@@ -325,6 +325,7 @@ function resolveResumeOrStartHook(params: {
         cwd: params.cwd,
         task: params.resumeTask,
         appendSystemPrompt: params.systemPrompt,
+        dangerouslySkipPermissions: params.permissions === 'skip',
       },
       templateVars: params.templateVars,
     });

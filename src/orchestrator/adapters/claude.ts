@@ -46,6 +46,10 @@ export class ClaudeAdapter implements EngineAdapter {
   buildResumeCommand(opts: ResumeOptions): string {
     const parts = ['claude'];
 
+    if (opts.dangerouslySkipPermissions === true) {
+      parts.push('--dangerously-skip-permissions');
+    }
+
     if (opts.sessionId) {
       parts.push('--resume', opts.sessionId);
     }

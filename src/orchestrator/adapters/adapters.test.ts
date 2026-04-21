@@ -109,6 +109,28 @@ describe('Engine Adapters', () => {
       assert.ok(cmd.includes('abc-123'));
     });
 
+    it('builds resume command with --dangerously-skip-permissions', () => {
+      const cmd = adapter.buildResumeCommand({
+        name: 'test-agent',
+        sessionId: 'abc-123',
+        cwd: '/tmp/test',
+        dangerouslySkipPermissions: true,
+      });
+      assert.ok(cmd.includes('--dangerously-skip-permissions'));
+      assert.ok(cmd.includes('--resume'));
+      assert.ok(cmd.includes('abc-123'));
+    });
+
+    it('resume command omits --dangerously-skip-permissions when false', () => {
+      const cmd = adapter.buildResumeCommand({
+        name: 'test-agent',
+        sessionId: 'abc-123',
+        cwd: '/tmp/test',
+        dangerouslySkipPermissions: false,
+      });
+      assert.ok(!cmd.includes('--dangerously-skip-permissions'));
+    });
+
     it('builds exit command', () => {
       assert.equal(adapter.buildExitCommand(), '/exit');
     });
