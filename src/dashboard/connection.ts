@@ -231,6 +231,11 @@ export function connect() {
         { const sp = document.getElementById('settingsPanel');
           if (sp && sp.style.display !== 'none' && sp.render) sp.render(); }
         break;
+      case 'project_update':
+        state.projects = data.projects;
+        { const bp = document.getElementById('boardPanel');
+          if (bp && bp.style.display !== 'none' && bp.render) bp.render(); }
+        break;
       case 'reminder_update':
         if (state.threadView === 'reminders') {
           const rp = document.getElementById('reminderPanel');

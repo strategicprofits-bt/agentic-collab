@@ -282,6 +282,22 @@ export class Database {
         updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
       )
     `);
+
+    // Create projects table (kanban board)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('in_progress', 'queued', 'awaiting_ben', 'completed', 'archived')),
+        assigned_agent TEXT,
+        description TEXT,
+        response_needed TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        completed_at TEXT,
+        archived_at TEXT
+      )
+    `);
   }
 
   /** Expose raw handle for LockManager (shares same DB connection). */
@@ -1120,6 +1136,55 @@ export class Database {
   deleteDestination(name: string): boolean {
     const result = this.db.prepare('DELETE FROM destinations WHERE name = ?').run(name);
     return result.changes > 0;
+  }
+
+  // ── Projects (Kanban Board) ──
+
+  listProjects(includeArchived = false): any[] {
+    if (includeArchived) {
+      return this.db.prepare('SELECT * FROM projects ORDER BY updated_at DESC').all();
+    }
+    return this.db.prepare("SELECT * FROM projects WHERE status != 'archived' ORDER BY CASE status WHEN 'awaiting_ben' THEN 0 WHEN 'in_progress' THEN 1 WHEN 'queued' THEN 2 WHEN 'completed' THEN 3 END, updated_at DESC").all();
+  }
+
+  getProject(id: number): any {
+    return this.db.prepare('SELECT * FROM projects WHERE id = ?').get(id);
+  }
+
+  createProject(title: string, opts?: { status?: string; assigned_agent?: string; description?: string; response_needed?: string }): any {
+    const status = opts?.status ?? 'queued';
+    const result = this.db.prepare(
+      'INSERT INTO projects (title, status, assigned_agent, description, response_needed) VALUES (?, ?, ?, ?, ?)'
+    ).run(title, status, opts?.assigned_agent ?? null, opts?.description ?? null, opts?.response_needed ?? null);
+    return this.getProject(Number(result.lastInsertRowid));
+  }
+
+  updateProject(id: number, updates: Record<string, any>): any {
+    const allowed = ['title', 'status', 'assigned_agent', 'description', 'response_needed'];
+    const fields: string[] = [];
+    const values: any[] = [];
+    for (const [key, val] of Object.entries(updates)) {
+      if (!allowed.includes(key)) continue;
+      fields.push(`${key} = ?`);
+      values.push(val);
+    }
+    if (updates.status === 'completed') {
+      fields.push("completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')");
+    }
+    if (updates.status === 'archived') {
+      fields.push("archived_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')");
+    }
+    fields.push("updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')");
+    values.push(id);
+    this.db.prepare(`UPDATE projects SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+    return this.getProject(id);
+  }
+
+  archiveOldCompleted(retentionDays = 7): number {
+    const result = this.db.prepare(
+      "UPDATE projects SET status = 'archived', archived_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE status = 'completed' AND completed_at IS NOT NULL AND completed_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)"
+    ).run(`-${retentionDays} days`);
+    return result.changes;
   }
 }
 

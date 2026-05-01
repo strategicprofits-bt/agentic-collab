@@ -1886,6 +1886,83 @@ route('POST', '/api/notify', async (req, res, _match, ctx) => {
   json(res, 200, { ok: true, sent });
 });
 
+// ── Projects (Kanban Board) ──
+
+route('GET', '/api/projects', async (_req, res, _match, ctx) => {
+  ctx.db.archiveOldCompleted(7);
+  const projects = ctx.db.listProjects();
+  json(res, 200, projects);
+});
+
+route('POST', '/api/projects', async (req, res, _match, ctx) => {
+  const body = await readJson(req);
+  if (!body?.title) return json(res, 400, { error: 'title required' });
+  const project = ctx.db.createProject(body.title as string, {
+    status: body.status as string | undefined,
+    assigned_agent: body.assigned_agent as string | undefined,
+    description: body.description as string | undefined,
+    response_needed: body.response_needed as string | undefined,
+  });
+  ctx.wss.broadcast(JSON.stringify({ type: 'project_update', projects: ctx.db.listProjects() }));
+  json(res, 201, project);
+});
+
+route('PATCH', '/api/projects/:id', async (req, res, match, ctx) => {
+  const id = parseInt(match.pathname.groups['id']!, 10);
+  const existing = ctx.db.getProject(id);
+  if (!existing) return json(res, 404, { error: 'project not found' });
+  const body = await readJson(req);
+  const updated = ctx.db.updateProject(id, body);
+  ctx.wss.broadcast(JSON.stringify({ type: 'project_update', projects: ctx.db.listProjects() }));
+  json(res, 200, updated);
+});
+
+route('POST', '/api/projects/:id/respond', async (req, res, match, ctx) => {
+  const id = parseInt(match.pathname.groups['id']!, 10);
+  const project = ctx.db.getProject(id);
+  if (!project) return json(res, 404, { error: 'project not found' });
+  const body = await readJson(req);
+  if (!body?.message) return json(res, 400, { error: 'message required' });
+
+  const messageText = body.message as string;
+
+  // Post response as a dashboard message to the assigned agent
+  if (project.assigned_agent) {
+    const agent = ctx.db.getAgent(project.assigned_agent);
+    if (agent) {
+      const displayText = `[Board → ${project.assigned_agent}] Re: ${project.title}\n\n${messageText}`;
+      enqueueAndDeliver(ctx, {
+        agentName: project.assigned_agent,
+        displayMessage: displayText,
+        envelope: displayText,
+        topic: 'board-response',
+        sourceAgent: 'operator',
+      });
+    }
+  }
+
+  // Post to all enabled Telegram destinations
+  const destinations = ctx.db.listDestinations();
+  for (const dest of destinations) {
+    if (dest.type === 'telegram' && dest.enabled) {
+      const botToken = dest.config.botToken as string;
+      const chatId = dest.config.chatId as string;
+      const text = `📋 Board response — ${project.title}\n\n${messageText}`;
+      ctx.telegramDispatcher.send(botToken, chatId, text).catch((err: any) => {
+        console.error(`[projects] Telegram send failed for dest ${dest.name}:`, err);
+      });
+    }
+  }
+
+  // Auto-move out of awaiting_ben if it was there
+  if (project.status === 'awaiting_ben') {
+    ctx.db.updateProject(id, { status: 'in_progress' });
+    ctx.wss.broadcast(JSON.stringify({ type: 'project_update', projects: ctx.db.listProjects() }));
+  }
+
+  json(res, 200, { ok: true });
+});
+
   return routes;
 }
 
