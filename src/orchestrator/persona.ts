@@ -324,7 +324,7 @@ function parsePipelineSteps(
 
   while (i < lines.length) {
     const line = lines[i]!;
-    if (line.trim() === '') { i++; continue; }
+    if (line.trim() === '' || line.trim().startsWith('#')) { i++; continue; }
 
     const lineIndent = line.length - line.trimStart().length;
     if (lineIndent < baseIndent) break;
@@ -352,7 +352,7 @@ function parsePipelineSteps(
       const actions: SendAction[] = [];
       while (i < lines.length) {
         const subLine = lines[i]!;
-        if (subLine.trim() === '') { i++; continue; }
+        if (subLine.trim() === '' || subLine.trim().startsWith('#')) { i++; continue; }
         const subIndent = subLine.length - subLine.trimStart().length;
         if (subIndent <= lineIndent) break; // back to parent level
         const subContent = subLine.trim();
@@ -367,7 +367,7 @@ function parsePipelineSteps(
         i++;
         while (i < lines.length) {
           const propLine = lines[i]!;
-          if (propLine.trim() === '') { i++; continue; }
+          if (propLine.trim() === '' || propLine.trim().startsWith('#')) { i++; continue; }
           const propIndent = propLine.length - propLine.trimStart().length;
           if (propIndent <= subIndent) break;
           const propContent = propLine.trim();
@@ -388,7 +388,7 @@ function parsePipelineSteps(
       const captureObj: Record<string, unknown> = {};
       while (i < lines.length) {
         const subLine = lines[i]!;
-        if (subLine.trim() === '') { i++; continue; }
+        if (subLine.trim() === '' || subLine.trim().startsWith('#')) { i++; continue; }
         const subIndent = subLine.length - subLine.trimStart().length;
         if (subIndent <= lineIndent) break;
         const subContent = subLine.trim();
@@ -445,7 +445,7 @@ function parseNamedPipelineMap(
 
   while (i < lines.length) {
     const line = lines[i]!;
-    if (line.trim() === '') { i++; continue; }
+    if (line.trim() === '' || line.trim().startsWith('#')) { i++; continue; }
 
     const lineIndent = line.length - line.trimStart().length;
     if (lineIndent < baseIndent) break;
@@ -518,7 +518,7 @@ function parseIndicators(
 
   while (i < lines.length) {
     const line = lines[i]!;
-    if (line.trim() === '') { i++; continue; }
+    if (line.trim() === '' || line.trim().startsWith('#')) { i++; continue; }
 
     const lineIndent = line.length - line.trimStart().length;
     if (lineIndent < baseIndent) break;
@@ -540,7 +540,7 @@ function parseIndicators(
 
       while (i < lines.length) {
         const propLine = lines[i]!;
-        if (propLine.trim() === '') { i++; continue; }
+        if (propLine.trim() === '' || propLine.trim().startsWith('#')) { i++; continue; }
 
         const propLineIndent = propLine.length - propLine.trimStart().length;
         if (propLineIndent < propIndent) break;
@@ -601,7 +601,7 @@ function parseArray(
   while (i < lines.length) {
     const line = lines[i]!;
 
-    if (line.trim() === '') {
+    if (line.trim() === '' || line.trim().startsWith('#')) {
       i++;
       continue;
     }
@@ -628,7 +628,7 @@ function parseArray(
     const itemIndent = baseIndent + 2; // "- " adds 2 chars of content indent
     while (i < lines.length) {
       const nextLine = lines[i]!;
-      if (nextLine.trim() === '') { i++; continue; }
+      if (nextLine.trim() === '' || nextLine.trim().startsWith('#')) { i++; continue; }
       const nextIndent = nextLine.length - nextLine.trimStart().length;
       if (nextIndent < itemIndent) break;
       const nc = nextLine.trim();
@@ -663,7 +663,7 @@ function parseSubObject(
   while (i < lines.length) {
     const line = lines[i]!;
 
-    if (line.trim() === '') {
+    if (line.trim() === '' || line.trim().startsWith('#')) {
       i++;
       continue;
     }

@@ -47,6 +47,8 @@ const RELOAD_TIMEOUT_MS = parseInt(process.env['RELOAD_TIMEOUT_MS'] ?? '90000', 
 const RENAME_DELAY_MS = parseInt(process.env['RENAME_DELAY_MS'] ?? '3000', 10);
 const EXIT_WAIT_MS = parseInt(process.env['EXIT_WAIT_MS'] ?? '10000', 10);
 const POST_SPAWN_ACTIVE_DELAY_MS = parseInt(process.env['POST_SPAWN_ACTIVE_DELAY_MS'] ?? '2000', 10);
+const CLI_READY_TIMEOUT_MS = parseInt(process.env['CLI_READY_TIMEOUT_MS'] ?? '20000', 10);
+const CLI_READY_POLL_MS = parseInt(process.env['CLI_READY_POLL_MS'] ?? '2000', 10);
 const POST_RENAME_TASK_DELAY_MS = parseInt(process.env['POST_RENAME_TASK_DELAY_MS'] ?? '1000', 10);
 const INTERRUPT_KEY_DELAY_MS = parseInt(process.env['INTERRUPT_KEY_DELAY_MS'] ?? '300', 10);
 
@@ -237,6 +239,57 @@ async function injectRename(
       pressEnter: true,
     });
   }
+}
+
+/**
+ * Poll tmux pane until the CLI is idle and ready for input.
+ * Falls back to a fixed delay if the adapter can't detect idle state.
+ */
+async function waitForCliReady(
+  ctx: LifecycleContext,
+  proxyId: string,
+  tmuxSession: string,
+  engine: string,
+  agentName: string,
+): Promise<void> {
+  const adapter = getAdapter(engine);
+  const deadline = Date.now() + CLI_READY_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    const result = await ctx.proxyDispatch(proxyId, {
+      action: 'capture',
+      sessionName: tmuxSession,
+      lines: 20,
+    });
+    if (!result.ok) {
+      await sleep(CLI_READY_POLL_MS);
+      continue;
+    }
+    const output = (result.data as string) ?? '';
+
+    // Handle Claude's folder trust dialog
+    if (/I trust this folder|Enter to confirm/i.test(output)) {
+      await ctx.proxyDispatch(proxyId, {
+        action: 'send_keys',
+        sessionName: tmuxSession,
+        keys: 'Enter',
+      });
+      await sleep(3000);
+      continue;
+    }
+
+    const state = adapter.detectIdleState(output);
+    if (state === 'waiting_for_input') {
+      console.log(`[lifecycle] ${agentName}: CLI ready (idle detected)`);
+      return;
+    }
+
+    await sleep(CLI_READY_POLL_MS);
+  }
+
+  // Timeout — fall back to the legacy fixed delay
+  console.warn(`[lifecycle] ${agentName}: CLI readiness timeout after ${CLI_READY_TIMEOUT_MS}ms, proceeding with fixed delay`);
+  await sleep(POST_SPAWN_ACTIVE_DELAY_MS);
 }
 
 /** Create a tmux session and write a config profile for engines that use one (e.g. Codex). */
@@ -516,8 +569,8 @@ export async function spawnAgent(
     // 5. Wait for CLI init, then inject /rename
     await injectRename(ctx, opts.proxyId, tmuxSession, adapter, opts.name);
 
-    // Let the CLI fully initialize before finalizing state
-    await sleep(POST_SPAWN_ACTIVE_DELAY_MS);
+    // Wait until the CLI is actually ready for input
+    await waitForCliReady(ctx, opts.proxyId, tmuxSession, engine, opts.name);
 
     // ── Phase 3: finalize (lock) ──
     return await finalizeToActive(ctx, opts.name, 'spawning', 'spawn_interrupted', {
@@ -663,7 +716,10 @@ export async function resumeAgent(
     // 4. /rename injection
     await injectRename(ctx, proxyId, tmuxSession, adapter, name);
 
-    // 5. Paste task if provided (and resuming existing session).
+    // 5. Wait until the CLI is actually ready for input
+    await waitForCliReady(ctx, proxyId, tmuxSession, engine, name);
+
+    // 6. Paste task if provided (and resuming existing session).
     // Skip if the engine consumed the task inline via buildResumeCommand.
     if (opts?.task && currentSessionId && !adapter.supportsResumePrompt) {
       await sleep(POST_RENAME_TASK_DELAY_MS);
@@ -976,7 +1032,10 @@ export async function reloadAgent(
     // 6. /rename injection
     await injectRename(ctx, proxyId, tmuxSession, adapter, name);
 
-    // 7. Paste reload task if provided (skip if already passed as inline CLI prompt)
+    // 7. Wait until the CLI is actually ready for input
+    await waitForCliReady(ctx, proxyId, tmuxSession, engine, name);
+
+    // 8. Paste reload task if provided (skip if already passed as inline CLI prompt)
     if (taskText && !inlineTask) {
       await sleep(POST_RENAME_TASK_DELAY_MS);
       await ctx.proxyDispatch(proxyId, {

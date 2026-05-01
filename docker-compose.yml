@@ -25,7 +25,11 @@ services:
       - PERSONAS_HOST_DIR=${PERSONAS_HOST_DIR:-}
       - ORCHESTRATOR_HOST=${ORCHESTRATOR_HOST:-http://localhost:3000}
       - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-}
-      - SPAWN_TIMEOUT_MS=60000
+      # 120000 (was 60000) — Opus 4.6 cold-start + per-call proxy retry budget
+      # (15s × 3 attempts) can blow past 60s on first launch. Watchdog only fires
+      # on actual timeout, so healthy spawns are unaffected. See data/knowledge/
+      # decisions/2026-04-30-eames-spawn-failure.md for the full diagnosis.
+      - SPAWN_TIMEOUT_MS=120000
     labels:
       io.agentic-collab.role: orchestrator
     restart: unless-stopped
