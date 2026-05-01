@@ -690,11 +690,14 @@ describe('API Routes — Personas', () => {
   let port: number;
   let tmpDir: string;
   let personasDir: string;
+  let savedPersonasHostDir: string | undefined;
 
   before(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'agentic-persona-route-test-'));
     personasDir = join(tmpDir, 'personas');
     process.env['PERSONAS_DIR'] = personasDir;
+    savedPersonasHostDir = process.env['PERSONAS_HOST_DIR'];
+    delete process.env['PERSONAS_HOST_DIR'];
     mkdtempSync; // force eval
     const { mkdirSync } = await import('node:fs');
     mkdirSync(personasDir, { recursive: true });
@@ -740,6 +743,9 @@ describe('API Routes — Personas', () => {
 
   after(() => {
     delete process.env['PERSONAS_DIR'];
+    if (savedPersonasHostDir !== undefined) {
+      process.env['PERSONAS_HOST_DIR'] = savedPersonasHostDir;
+    }
     wss.close();
     server.close();
     db.close();
