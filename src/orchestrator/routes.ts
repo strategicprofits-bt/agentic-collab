@@ -1912,6 +1912,8 @@ route('PATCH', '/api/projects/:id', async (req, res, match, ctx) => {
   const existing = ctx.db.getProject(id);
   if (!existing) return json(res, 404, { error: 'project not found' });
   const body = await readJson(req);
+  const validStatuses = ['in_progress', 'queued', 'awaiting_ben', 'completed', 'archived'];
+  if (body.status && !validStatuses.includes(body.status)) return json(res, 400, { error: `invalid status: ${body.status}` });
   const updated = ctx.db.updateProject(id, body);
   ctx.wss.broadcast(JSON.stringify({ type: 'project_update', projects: ctx.db.listProjects() }));
   json(res, 200, updated);
