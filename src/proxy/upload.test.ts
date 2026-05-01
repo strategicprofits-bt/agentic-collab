@@ -88,7 +88,7 @@ describe('Proxy /upload endpoint', () => {
   }
 
   before(async () => {
-    tmpDir = mkdtempSync(join(tmpdir(), 'proxy-upload-test-'));
+    tmpDir = realpathSync(mkdtempSync(join(tmpdir(), 'proxy-upload-test-')));
 
     server = createServer((req, res) => {
       if (req.method === 'POST' && req.url?.startsWith('/upload')) {
