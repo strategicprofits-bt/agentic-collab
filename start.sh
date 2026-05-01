@@ -118,6 +118,14 @@ else
   echo -e "${DIM}  tip: install mise for automatic Node version management: https://mise.jdx.dev${RESET}"
 fi
 
+# ── Write Build Version ──
+
+# Extract version from package.json so both proxy and orchestrator read the same value.
+# .build-version is gitignored — written at launch, not checked in.
+PKG_VERSION=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('package.json','utf8')).version)")
+echo "$PKG_VERSION" > .build-version
+info "Version: $PKG_VERSION"
+
 # ── Prepare Config Directory ──
 
 # Pre-create config dir so Docker bind-mount inherits host user ownership.
@@ -194,17 +202,61 @@ if command -v docker &>/dev/null; then
     # Export UID/GID so docker-compose.yml user: "${UID}:${GID}" runs as the host user.
     # This ensures secret files created inside the container are owned by the host user.
     export UID GID="$(id -g)"
-    # Pass git commit SHA to Docker for version handshake with proxies
-    export COMMIT_SHA
-    COMMIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo '')"
     # Pass host-side personas directory so the API can show real file paths.
     # Resolves symlinks so Docker mounts the real directory (not the symlink).
     export PERSONAS_HOST_DIR
     PERSONAS_HOST_DIR="${PERSONAS_HOST_DIR:-$(realpath ./persistent-agents 2>/dev/null || echo '')}"
+
+    # Build the image first so we can reuse it for the permissions check
+    ORCH_IMAGE=$(docker compose config --images 2>/dev/null | head -1)
+    if ! docker compose ps --status running 2>/dev/null | grep -q orchestrator; then
+      docker compose build
+      info "Orchestrator image built"
+    fi
+
+    # ── Check SQLite DB Permissions ──
+    # The orchestrator runs as the host user (UID:GID) inside Docker.
+    # If the DB was previously created by root (e.g. before the user: directive),
+    # the container can't write to it → SQLITE_READONLY errors.
+    VOLUME_NAME="agentic-collab_orchestrator-data"
+    DB_MOUNT="/data/.agentic-collab"
+
+    if docker volume inspect "$VOLUME_NAME" &>/dev/null; then
+      CURRENT_UID=$(id -u)
+      CURRENT_GID=$(id -g)
+
+      # Check ownership of all files in the volume, not just the directory.
+      # The directory may have correct ownership while files inside (orchestrator.db,
+      # .db-wal, .db-shm) are still owned by root from a previous run.
+      BAD_FILES=$(docker run --rm -v "${VOLUME_NAME}:${DB_MOUNT}" "${ORCH_IMAGE}" \
+        find "${DB_MOUNT}" -not -uid "${CURRENT_UID}" -o -not -gid "${CURRENT_GID}" \
+        2>/dev/null | head -5 || echo "")
+
+      if [ -n "$BAD_FILES" ]; then
+        warn "SQLite data volume has files with wrong ownership (expected ${CURRENT_UID}:${CURRENT_GID}):"
+        echo "$BAD_FILES" | while read -r f; do echo -e "  ${DIM}$f${RESET}"; done
+        warn "This will cause 'access denied' or 'SQLITE_READONLY' errors."
+        echo ""
+        echo -e "  ${BOLD}Fix with:${RESET}"
+        echo -e "    docker run --rm -v ${VOLUME_NAME}:${DB_MOUNT} ${ORCH_IMAGE} chown -R ${CURRENT_UID}:${CURRENT_GID} ${DB_MOUNT}"
+        echo ""
+        read -rp "  Run this fix now? [Y/n] " REPLY
+        REPLY="${REPLY:-Y}"
+        if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+          docker run --rm --user root -v "${VOLUME_NAME}:${DB_MOUNT}" "${ORCH_IMAGE}" \
+            chown -R "${CURRENT_UID}:${CURRENT_GID}" "${DB_MOUNT}"
+          info "Fixed volume ownership to ${CURRENT_UID}:${CURRENT_GID}"
+        else
+          warn "Skipped. The orchestrator may fail to start."
+        fi
+      fi
+    fi
+
+    # Start the container (image already built, skip rebuild)
     if docker compose ps --status running 2>/dev/null | grep -q orchestrator; then
       info "Orchestrator already running"
     else
-      docker compose up -d --build
+      docker compose up -d
       info "Orchestrator starting via Docker Compose"
     fi
   else

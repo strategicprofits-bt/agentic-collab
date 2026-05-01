@@ -6,7 +6,8 @@
  * is unchanged across consecutive polls, the agent is considered idle.
  * This is engine-agnostic — no regex prompt detection needed.
  *
- * Context % parsing still uses engine adapters (each CLI reports usage differently).
+ * Context % parsing prefers engine config contextPattern (from detection config)
+ * over hardcoded adapter patterns. Falls back to adapters when no pattern is configured.
  * Context percentages are recorded to the DB for dashboard display but do NOT
  * trigger automatic compact or reload actions.
  *
@@ -16,10 +17,19 @@
 
 import type { Database } from './database.ts';
 import type { LockManager } from '../shared/lock.ts';
-import type { ProxyCommand, ProxyResponse, AgentRecord, PendingMessage, DashboardMessage, IndicatorDefinition, ActiveIndicator, PipelineStep } from '../shared/types.ts';
+import type { ProxyCommand, ProxyResponse, AgentRecord, PendingMessage, DashboardMessage, IndicatorDefinition, ActiveIndicator, PipelineStep, DetectionConfig } from '../shared/types.ts';
 import { sessionName, canSuspend } from '../shared/agent-entity.ts';
 import { getAdapter } from './adapters/index.ts';
-import { reloadAgent, type LifecycleContext } from './lifecycle.ts';
+import { reloadAgent, recoverAgent, type LifecycleContext } from './lifecycle.ts';
+import { resolveEffectiveConfig } from './engine-config-resolver.ts';
+
+type CompiledDetection = {
+  json: string;
+  config: DetectionConfig;
+  idlePatterns: Array<{ re: RegExp; lines?: number }>;
+  activePatterns: Array<{ re: RegExp; lines?: number }>;
+  contextPattern: RegExp | null;
+};
 
 export type HealthMonitorOptions = {
   db: Database;
@@ -31,6 +41,7 @@ export type HealthMonitorOptions = {
   onDashboardMessage?: (message: DashboardMessage) => void;
   onIndicatorUpdate?: (agentName: string, indicators: ActiveIndicator[]) => void;
   onMessageEnqueued?: (targetAgent: string) => void;
+  onIdleDetected?: (agentName: string) => void;
   pollIntervalMs?: number;
   idleSuspendMs?: number;        // ms of idle before suspend (default 5 minutes)
 };
@@ -89,10 +100,15 @@ export class HealthMonitor {
   private readonly onDashboardMessage: (message: DashboardMessage) => void;
   private readonly onIndicatorUpdate: (agentName: string, indicators: ActiveIndicator[]) => void;
   private readonly onMessageEnqueued: (targetAgent: string) => void;
+  private readonly onIdleDetected: (agentName: string) => void;
   private readonly activeIndicators = new Map<string, ActiveIndicator[]>();
   private readonly compiledIndicators = new Map<string, { json: string; entries: Array<{ def: IndicatorDefinition; re: RegExp }> }>();
+  private readonly compiledDetection = new Map<string, CompiledDetection>();
   /** Hash of last permission prompt detected per agent, to avoid re-alerting on the same prompt. */
   private readonly lastPermissionAlert = new Map<string, string>();
+  /** Timestamp when an agent was healed — used to suppress stale exit-message
+   *  re-detection during the grace period after healing. */
+  private readonly healedAt = new Map<string, number>();
 
   constructor(opts: HealthMonitorOptions) {
     this.db = opts.db;
@@ -104,6 +120,7 @@ export class HealthMonitor {
     this.onDashboardMessage = opts.onDashboardMessage ?? (() => {});
     this.onIndicatorUpdate = opts.onIndicatorUpdate ?? (() => {});
     this.onMessageEnqueued = opts.onMessageEnqueued ?? (() => {});
+    this.onIdleDetected = opts.onIdleDetected ?? (() => {});
     this.pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_MS;
     this.idleSuspendMs = opts.idleSuspendMs ?? DEFAULT_IDLE_SUSPEND_MS;
   }
@@ -113,6 +130,12 @@ export class HealthMonitor {
    * Handles CSI sequences (colors, cursor), OSC sequences (hyperlinks, titles),
    * and single-character escapes.
    */
+  /** Merge engine config defaults into agent record for indicator/detection resolution. */
+  private resolveAgent(agent: AgentRecord): AgentRecord {
+    const engineConfig = this.db.getEngineConfig(agent.engine);
+    return resolveEffectiveConfig(agent, engineConfig);
+  }
+
   static stripAnsi(text: string): string {
     // CSI: \x1b[ ... final byte (letter)
     // OSC: \x1b] ... ST (\x1b\\ or \x07)
@@ -134,28 +157,101 @@ export class HealthMonitor {
   }
 
   /**
-   * Screen-diff idle detection: compare current pane snapshot to previous.
-   * Returns true if the agent appears idle (screen unchanged).
+   * Resolve and cache compiled detection config for an agent's engine.
+   * Returns null if the engine has no detection config.
    */
-  private checkScreenDiff(agentName: string, paneOutput: string): boolean {
-    const snapshot = HealthMonitor.takeSnapshot(paneOutput);
-    const prev = this.lastPaneSnapshot.get(agentName);
-    this.lastPaneSnapshot.set(agentName, snapshot);
+  private getDetection(agent: AgentRecord): CompiledDetection | null {
+    const engineConfig = this.db.getEngineConfig(agent.engine);
+    const detectionJson = engineConfig?.detection ?? null;
+    if (!detectionJson) {
+      this.compiledDetection.delete(agent.engine);
+      return null;
+    }
 
+    const cached = this.compiledDetection.get(agent.engine);
+    if (cached && cached.json === detectionJson) return cached;
+
+    try {
+      const config: DetectionConfig = JSON.parse(detectionJson);
+      const idlePatterns: Array<{ re: RegExp; lines?: number }> = [];
+      const activePatterns: Array<{ re: RegExp; lines?: number }> = [];
+      for (const p of config.idlePatterns ?? []) {
+        const raw = typeof p === 'string' ? p : p.pattern;
+        const lines = typeof p === 'object' ? p.lines : undefined;
+        try { idlePatterns.push({ re: new RegExp(raw), lines }); } catch { /* skip invalid */ }
+      }
+      for (const p of config.activePatterns ?? []) {
+        const raw = typeof p === 'string' ? p : p.pattern;
+        const lines = typeof p === 'object' ? p.lines : undefined;
+        try { activePatterns.push({ re: new RegExp(raw), lines }); } catch { /* skip invalid */ }
+      }
+      let contextPattern: RegExp | null = null;
+      if (config.contextPattern) {
+        try { contextPattern = new RegExp(config.contextPattern); } catch { /* skip */ }
+      }
+      const compiled: CompiledDetection = { json: detectionJson, config, idlePatterns, activePatterns, contextPattern };
+      this.compiledDetection.set(agent.engine, compiled);
+      return compiled;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Screen-diff idle detection, augmented by engine detection patterns.
+   * Pattern match takes priority: idle pattern match → idle, active pattern match → active.
+   * Falls back to screen-diff when no patterns match.
+   * Returns true if the agent appears idle.
+   */
+  private checkScreenDiff(agent: AgentRecord, paneOutput: string): boolean {
+    const detection = this.getDetection(agent);
+    const snapshotLines = detection?.config.snapshotLines ?? HealthMonitor.SNAPSHOT_LINES;
+    const idleThreshold = detection?.config.idleThreshold ?? HealthMonitor.IDLE_THRESHOLD;
+
+    const snapshot = HealthMonitor.takeSnapshot(paneOutput, snapshotLines);
+    const prev = this.lastPaneSnapshot.get(agent.name);
+    this.lastPaneSnapshot.set(agent.name, snapshot);
+
+    // Pattern-based detection takes priority over screen-diff
+    if (detection && (detection.idlePatterns.length > 0 || detection.activePatterns.length > 0)) {
+      const fullStripped = HealthMonitor.stripAnsi(paneOutput);
+      const allLines = fullStripped.split('\n');
+      // Helper: get the text to match — either last N lines or full output
+      const textForPattern = (lines?: number) => {
+        if (lines && lines < allLines.length) return allLines.slice(-lines).join('\n');
+        return fullStripped;
+      };
+      // Check active patterns first — if something indicates work, it's active
+      for (const { re, lines } of detection.activePatterns) {
+        if (re.test(textForPattern(lines))) {
+          this.unchangedCount.set(agent.name, 0);
+          this.lastActivityDetected.set(agent.name, Date.now());
+          return false;
+        }
+      }
+      // Check idle patterns — if something indicates waiting, it's idle
+      for (const { re, lines } of detection.idlePatterns) {
+        if (re.test(textForPattern(lines))) {
+          const count = (this.unchangedCount.get(agent.name) ?? 0) + 1;
+          this.unchangedCount.set(agent.name, count);
+          return count >= idleThreshold;
+        }
+      }
+    }
+
+    // Fallback: screen-diff
     if (prev === undefined) {
-      // First capture — no comparison possible, assume active
-      this.unchangedCount.set(agentName, 0);
+      this.unchangedCount.set(agent.name, 0);
       return false;
     }
 
     if (snapshot === prev) {
-      const count = (this.unchangedCount.get(agentName) ?? 0) + 1;
-      this.unchangedCount.set(agentName, count);
-      return count >= HealthMonitor.IDLE_THRESHOLD;
+      const count = (this.unchangedCount.get(agent.name) ?? 0) + 1;
+      this.unchangedCount.set(agent.name, count);
+      return count >= idleThreshold;
     } else {
-      this.unchangedCount.set(agentName, 0);
-      // Reset grace period — activity detected
-      this.lastActivityDetected.set(agentName, Date.now());
+      this.unchangedCount.set(agent.name, 0);
+      this.lastActivityDetected.set(agent.name, Date.now());
       return false;
     }
   }
@@ -226,23 +322,26 @@ export class HealthMonitor {
           action: 'pane_activity',
           sessionName: sessionName(agent),
         } as ProxyCommand);
+        const resolved = this.resolveAgent(agent);
+        const hasDetectionPatterns = this.getDetection(resolved) !== null;
+
         if (activityResult.ok) {
           const currentTs = activityResult.data as number;
           const prevTs = this.lastActivityTs.get(agent.name);
           this.lastActivityTs.set(agent.name, currentTs);
-          if (prevTs !== undefined && currentTs === prevTs) {
-            // Pane unchanged — definitively idle, skip capture
+          if (prevTs !== undefined && currentTs === prevTs && !hasDetectionPatterns) {
+            // Pane unchanged and no detection patterns — definitively idle, skip capture
             this.handleIdleTransitions(agent, true);
             continue;
           }
         }
 
-        // Window_activity changed — capture to check real content change vs ANSI-only
+        // Capture pane output for detection patterns and/or screen-diff
         const paneOutput = await this.capturePaneOutput(agent);
         if (paneOutput === null) continue;
-        this.evaluateIndicators(agent, paneOutput);
+        this.evaluateIndicators(resolved, paneOutput);
         this.detectPermissionPrompt(agent, paneOutput);
-        const isIdle = this.checkScreenDiff(agent.name, paneOutput);
+        const isIdle = this.checkScreenDiff(resolved, paneOutput);
         this.handleIdleTransitions(agent, isIdle);
       } catch (err) {
         console.error(`[health] Fast poll error for ${agent.name}:`, err);
@@ -284,8 +383,10 @@ export class HealthMonitor {
     const agent = this.db.getAgent(agentSnapshot.name);
     if (!agent || !agent.proxyId || !canSuspend(agent)) return;
 
+    const resolved = this.resolveAgent(agent);
+    const hasDetectionPatterns = this.getDetection(resolved) !== null;
+
     // Fast path: check tmux window_activity timestamp before expensive capture.
-    // If pane hasn't received output since last poll, it's definitively idle.
     const activityResult = await this.proxyDispatch(agent.proxyId, {
       action: 'pane_activity',
       sessionName: sessionName(agent),
@@ -294,8 +395,8 @@ export class HealthMonitor {
       const currentTs = activityResult.data as number;
       const prevTs = this.lastActivityTs.get(agent.name);
       this.lastActivityTs.set(agent.name, currentTs);
-      if (prevTs !== undefined && currentTs === prevTs) {
-        // Pane unchanged — definitively idle, skip expensive capture
+      if (prevTs !== undefined && currentTs === prevTs && !hasDetectionPatterns) {
+        // Pane unchanged and no detection patterns — definitively idle
         this.handleIdleTransitions(agent, true);
         this.checkIdleSuspendTimeout(agent.name);
         return;
@@ -306,13 +407,16 @@ export class HealthMonitor {
     if (paneOutput === null) return;
 
     // Check if the CLI exited back to a bare shell prompt (e.g. session not found)
-    if (this.detectCliExit(agent, paneOutput)) return;
+    if (this.detectCliExit(agent, paneOutput)) {
+      this.maybeAutoRecover(agent);
+      return;
+    }
 
     this.recordContextPercent(agent, paneOutput);
-    this.evaluateIndicators(agent, paneOutput);
+    this.evaluateIndicators(resolved, paneOutput);
     this.detectPermissionPrompt(agent, paneOutput);
 
-    const isIdle = this.checkScreenDiff(agent.name, paneOutput);
+    const isIdle = this.checkScreenDiff(resolved, paneOutput);
     this.handleIdleTransitions(agent, isIdle);
 
     this.checkIdleSuspendTimeout(agent.name);
@@ -359,6 +463,7 @@ export class HealthMonitor {
           reason: captureResult.error,
           consecutiveFailures: failures,
         });
+        this.emitSystemMessage(agent.name, `Failed — health check failed ${failures}x`);
         this.onAgentUpdate(agent.name);
         this.consecutiveFailures.delete(agent.name);
       }
@@ -372,18 +477,48 @@ export class HealthMonitor {
 
   /**
    * Parse context % from pane output and record to DB (read-only — no actions taken).
+   * Prefers engine config's contextPattern over hardcoded adapter patterns.
    */
   private recordContextPercent(agent: AgentRecord, paneOutput: string): void {
-    const adapter = getAdapter(agent.engine);
-    const contextResult = adapter.parseContextPercent(paneOutput);
-    if (contextResult.contextPct === null) return;
+    let contextPct: number | null = null;
+
+    // Try engine config contextPattern first
+    const detection = this.getDetection(agent);
+    if (detection?.contextPattern) {
+      const lines = paneOutput.split('\n');
+      // Search bottom-up through last 20 lines (status bar region)
+      for (let i = lines.length - 1; i >= Math.max(0, lines.length - 20); i--) {
+        const match = lines[i]?.match(detection.contextPattern);
+        if (match?.[1]) {
+          const rawValue = parseInt(match[1].replace(/,/g, ''), 10);
+          // Determine if value is a percentage or token count:
+          // If the matched text contains '%', treat as direct percentage.
+          // Otherwise assume token count and convert (200k context window).
+          if (match[0].includes('%')) {
+            contextPct = Math.min(100, rawValue);
+          } else {
+            contextPct = Math.min(100, Math.round((rawValue / 200_000) * 100));
+          }
+          break;
+        }
+      }
+    }
+
+    // Fall back to adapter if contextPattern didn't match
+    if (contextPct === null) {
+      const adapter = getAdapter(agent.engine);
+      const contextResult = adapter.parseContextPercent(paneOutput);
+      contextPct = contextResult.contextPct;
+    }
+
+    if (contextPct === null) return;
 
     // Re-read the agent to avoid stale version conflicts from the poll snapshot
     const latest = this.db.getAgent(agent.name);
     if (!latest || (latest.state !== 'active' && latest.state !== 'idle')) return;
     try {
       this.db.updateAgentState(agent.name, latest.state, latest.version, {
-        lastContextPct: contextResult.contextPct,
+        lastContextPct: contextPct,
         lastActivity: new Date().toISOString(),
       });
     } catch { /* version conflict — another operation changed the agent, skip this update */ }
@@ -391,19 +526,19 @@ export class HealthMonitor {
   }
 
   /**
-   * Screen-diff idle transitions.
+   * Idle transitions — augmented by engine detection config when available.
    *
-   * - active → idle: screen unchanged for IDLE_THRESHOLD consecutive polls
-   * - idle → active: screen changed (any content diff)
-   *
-   * No regex, no engine-specific patterns, no tmux activity timestamps.
+   * - active → idle: screen unchanged / idle pattern matched
+   * - idle → active: screen changed / active pattern matched
    */
   private handleIdleTransitions(agent: AgentRecord, isIdle: boolean): void {
     if (agent.state === 'active' && isIdle) {
       // Enforce grace period — don't transition to idle if recent activity was detected
+      const detection = this.compiledDetection.get(agent.engine);
+      const graceMs = detection?.config.activeGraceMs ?? HealthMonitor.ACTIVE_GRACE_MS;
       const lastActivity = this.lastActivityDetected.get(agent.name) ?? 0;
       const elapsed = Date.now() - lastActivity;
-      if (elapsed < HealthMonitor.ACTIVE_GRACE_MS) {
+      if (elapsed < graceMs) {
         return; // Still within grace period, stay active
       }
       const current = this.db.getAgent(agent.name);
@@ -414,6 +549,7 @@ export class HealthMonitor {
         });
         this.db.logEvent(agent.name, 'idle_detected');
         this.onAgentUpdate(agent.name);
+        this.onIdleDetected(agent.name);
       }
     } else if (agent.state === 'idle' && !isIdle) {
       const current = this.db.getAgent(agent.name);
@@ -448,6 +584,14 @@ export class HealthMonitor {
     const key = `shell_${agent.name}`;
     const lines = paneOutput.split('\n');
 
+    // Grace period after healing: stale error text may linger in the scrollback
+    // for a few poll cycles. Suppress exit detection for 60s after a heal event.
+    const healed = this.healedAt.get(agent.name);
+    if (healed !== undefined && Date.now() - healed < 60_000) {
+      this.consecutiveFailures.delete(key);
+      return false;
+    }
+
     // Find the last non-empty line
     let lastLine = '';
     for (let i = lines.length - 1; i >= 0; i--) {
@@ -455,8 +599,10 @@ export class HealthMonitor {
       if (trimmed) { lastLine = trimmed; break; }
     }
 
-    // Signal 1: Known CLI exit messages anywhere in the pane output.
-    // These are unambiguous — no CLI prompt would contain them.
+    // Signal 1: Known CLI exit messages in RECENT output only (last 8 lines).
+    // Only scanning recent lines prevents stale error text in tmux scrollback
+    // from re-triggering false positives after an agent heals and restarts.
+    const recentLines = lines.slice(-8).join('\n');
     const exitPatterns = [
       /No conversation found with session ID/,      // claude --resume <stale-id>
       /Session .+ not found/i,                       // generic session lookup failure
@@ -464,7 +610,7 @@ export class HealthMonitor {
       /command not found.*codex/i,                   // codex not installed
       /command not found.*opencode/i,                // opencode not installed
     ];
-    const hasExitMessage = exitPatterns.some(re => re.test(paneOutput));
+    const hasExitMessage = exitPatterns.some(re => re.test(recentLines));
 
     // Signal 2: Bare shell prompt at the bottom of the pane.
     // Covers common shell configurations:
@@ -491,11 +637,11 @@ export class HealthMonitor {
 
     if (count < 2) return false; // need 2 consecutive to confirm
 
-    // Determine reason from pane context
+    // Determine reason from recent pane context
     let reason = 'CLI exited to shell prompt';
-    if (/No conversation found/i.test(paneOutput)) {
+    if (/No conversation found/i.test(recentLines)) {
       reason = 'CLI session not found — resume failed';
-    } else if (/command not found/i.test(paneOutput)) {
+    } else if (/command not found/i.test(recentLines)) {
       reason = 'CLI binary not found';
     } else if (hasExitMessage) {
       reason = 'CLI exited unexpectedly';
@@ -509,6 +655,7 @@ export class HealthMonitor {
       failureReason: reason,
     });
     this.db.logEvent(agent.name, 'cli_exit_detected', undefined, { reason, lastLine });
+    this.emitSystemMessage(agent.name, `Failed — ${reason}`);
     this.onAgentUpdate(agent.name);
     this.cleanupAgent(agent.name);
     return true;
@@ -609,7 +756,17 @@ export class HealthMonitor {
 
     this.consecutiveFailures.delete(key);
     this.failureSnapshot.delete(agent.name);
+    this.healedAt.set(agent.name, Date.now());
     console.log(`[health] ${agent.name}: CLI detected alive in tmux — healing`);
+
+    // Clear tmux scrollback so stale error messages don't re-trigger detectCliExit().
+    if (agent.proxyId) {
+      this.proxyDispatch(agent.proxyId, {
+        action: 'clear_history',
+        sessionName: sessionName(agent),
+      }).catch(() => { /* best-effort — non-fatal if pane is gone */ });
+    }
+
     this.db.updateAgentState(agent.name, 'active', agent.version, {
       failedAt: null,
       failureReason: null,
@@ -618,6 +775,7 @@ export class HealthMonitor {
       reason: 'CLI detected alive in tmux pane',
       lastLine,
     });
+    this.emitSystemMessage(agent.name, 'Healed — CLI detected alive');
     this.onAgentUpdate(agent.name);
     return true;
   }
@@ -633,6 +791,7 @@ export class HealthMonitor {
     this.consecutiveFailures.delete(`shell_${name}`);
     this.consecutiveFailures.delete(`heal_${name}`);
     this.lastActivityTs.delete(name);
+    this.healedAt.delete(name);
     this.activeIndicators.delete(name);
     this.compiledIndicators.delete(name);
     this.lastPermissionAlert.delete(name);
@@ -676,6 +835,40 @@ export class HealthMonitor {
       console.error(`[health] Reload failed for ${agent.name}:`, err);
       this.onAgentUpdate(agent.name);
     }
+  }
+
+  /**
+   * Check if an agent that just failed should be auto-recovered.
+   * Reads the engine's detection config for the autoRecover flag.
+   * Fires asynchronously — does not block the poll cycle.
+   */
+  private maybeAutoRecover(agent: AgentRecord): void {
+    const resolved = this.resolveAgent(agent);
+    const detection = this.getDetection(resolved);
+    if (!detection?.config.autoRecover) return;
+
+    console.log(`[health] ${agent.name}: autoRecover enabled — scheduling recovery`);
+    this.db.logEvent(agent.name, 'auto_recover_triggered');
+    this.emitSystemMessage(agent.name, 'Auto-recovering...');
+
+    // Fire-and-forget — recovery is a full lifecycle operation
+    const lifecycleCtx = this.makeLifecycleCtx();
+    recoverAgent(lifecycleCtx, agent.name).then(() => {
+      console.log(`[health] ${agent.name}: auto-recovery completed`);
+      this.onAgentUpdate(agent.name);
+    }).catch((err) => {
+      console.error(`[health] ${agent.name}: auto-recovery failed:`, err);
+      this.onAgentUpdate(agent.name);
+    });
+  }
+
+  /** Emit a lifecycle event as a system message in the agent's chat thread. */
+  private emitSystemMessage(agentName: string, label: string): void {
+    const msg = this.db.addDashboardMessage(agentName, 'from_agent', `[system] ${label}`, {
+      topic: 'lifecycle',
+      sourceAgent: 'system',
+    });
+    this.onDashboardMessage(msg);
   }
 
   /** Get currently active indicators for an agent. */
@@ -817,7 +1010,8 @@ export class HealthMonitor {
 // ── Indicator capture group interpolation ──
 
 /** Replace $1, $2, etc. in a string with regex match capture groups. */
-function interpolateCaptureGroups(text: string, match: RegExpExecArray): string {
+function interpolateCaptureGroups(text: string | undefined, match: RegExpExecArray): string {
+  if (!text) return '';
   return text.replace(/\$(\d+)/g, (_m, idx) => {
     const i = parseInt(idx, 10);
     return match[i] ?? '';

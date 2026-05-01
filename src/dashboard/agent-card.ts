@@ -12,6 +12,7 @@
  */
 
 import { icon } from '/dashboard/assets/icons.ts';
+import { state } from '/dashboard/assets/state.ts';
 
 // ── Utilities ──
 
@@ -29,14 +30,29 @@ function proxyWarning(proxyId, proxies) {
   return ` <span class="version-mismatch" title="Proxy version${ver} does not match orchestrator. Restart the proxy.">${icon.alertTriangle(12)} stale proxy</span>`;
 }
 
-function buildActionsHtml(agent) {
+function getEngineConfig(engine) {
+  return (state.engineConfigs || []).find(c => c.name === engine) || null;
+}
+
+function hasHook(agent, hookName) {
+  // Check agent-level override first, then engine config
+  if (agent[hookName]) return true;
+  const cfg = getEngineConfig(agent.engine);
+  return cfg && !!cfg[hookName];
+}
+
+export function buildActionsHtml(agent) {
   const activeIdle = agent.state === 'active' || agent.state === 'idle';
   const suspendedFailed = agent.state === 'suspended' || agent.state === 'failed';
   const transitioning = agent.state === 'spawning' || agent.state === 'suspending' || agent.state === 'resuming';
   const isVoid = agent.state === 'void';
   let html = '';
   if (activeIdle) {
-    html = `${agent.engine !== 'codex' ? '<button data-action="compact">Compact</button>' : ''}<button data-action="reload">Reload</button><button data-action="exit">Exit</button><button class="danger" data-action="kill">Kill</button>${agent.tmuxSession ? `<button class="secondary" data-copy-tmux="tmux attach -t ${esc(agent.tmuxSession)}">Copy tmux</button>` : ''}`;
+    if (hasHook(agent, 'hookCompact')) html += '<button data-action="compact">Compact</button>';
+    if (hasHook(agent, 'hookReload')) html += '<button data-action="reload">Reload</button>';
+    if (hasHook(agent, 'hookExit')) html += '<button data-action="exit">Exit</button>';
+    html += `<button class="danger" data-action="kill">Kill</button>`;
+    if (agent.tmuxSession) html += `<button class="secondary" data-copy-tmux="tmux attach -t ${esc(agent.tmuxSession)}">Copy tmux</button>`;
   } else if (suspendedFailed) {
     html = '<button data-action="resume">Resume</button><button class="danger" data-action="destroy">Destroy</button>';
   } else if (transitioning) {
@@ -44,13 +60,22 @@ function buildActionsHtml(agent) {
   } else if (isVoid) {
     html = '<button data-action="spawn">Spawn</button><button class="danger" data-action="destroy">Destroy</button>';
   }
-  if (activeIdle && agent.customButtons) {
-    try {
-      const btns = JSON.parse(agent.customButtons);
-      html += Object.keys(btns).map(b =>
+  if (activeIdle) {
+    // Merge custom buttons from agent record + engine config (agent takes priority)
+    const merged = {};
+    const cfg = getEngineConfig(agent.engine);
+    if (cfg?.customButtons) {
+      try { Object.assign(merged, JSON.parse(cfg.customButtons)); } catch {}
+    }
+    if (agent.customButtons) {
+      try { Object.assign(merged, JSON.parse(agent.customButtons)); } catch {}
+    }
+    const btnNames = Object.keys(merged);
+    if (btnNames.length > 0) {
+      html += btnNames.map(b =>
         `<button class="secondary" data-action="custom/${esc(b)}">${esc(b)}</button>`
       ).join('');
-    } catch {}
+    }
   }
   return html;
 }
@@ -71,10 +96,8 @@ function buildIndicatorsHtml(indicators) {
 
 function buildMetaHtml(agent, proxies) {
   const modelStr = [agent.engine, agent.model, agent.thinking].filter(Boolean).join(' ');
-  const ctxStr = agent.lastContextPct != null ? `${agent.lastContextPct}%` : '--';
-  const permBadge = agent.permissions === 'skip' ? '<span class="perm-badge skip" title="Auto-approves all tool use — no confirmation prompts">unsafe</span>' : '';
   const accountSpan = agent.account ? `<span title="account: ${esc(agent.account)}">acct: ${esc(agent.account)}</span>` : '';
-  return `<span>${esc(modelStr)}</span><span>ctx: ${ctxStr}</span>${permBadge}${accountSpan}${agent.proxyId ? `<span title="proxy: ${esc(agent.proxyId)}">${esc(agent.proxyId)}${proxyWarning(agent.proxyId, proxies)}</span>` : ''}`;
+  return `<span>${esc(modelStr)}</span>${accountSpan}${agent.proxyId ? `<span title="proxy: ${esc(agent.proxyId)}">${esc(agent.proxyId)}${proxyWarning(agent.proxyId, proxies)}</span>` : ''}`;
 }
 
 // ── Component ──
@@ -95,6 +118,11 @@ export class AgentCard extends HTMLElement {
     const starred = JSON.parse(localStorage.getItem('starredAgents') || '{}');
     const isStarred = !!starred[agent.name];
 
+    const indicatorBadges = (ctx.indicators || []).map(ind => {
+      const cls = ind.style || 'info';
+      return `<span class="indicator-badge ${cls}">${esc(ind.badge)}</span>`;
+    }).join('');
+
     this.innerHTML = `
       <div class="agent-header">
         <button class="agent-star${isStarred ? ' starred' : ''}" data-star-agent="${esc(agent.name)}" title="Star agent">
@@ -102,13 +130,11 @@ export class AgentCard extends HTMLElement {
         </button>
         ${agent.icon ? `<span class="agent-icon">${esc(agent.icon)}</span>` : ''}
         <span class="agent-name">${esc(agent.name)}${unreadBadge}</span>
-        <span class="state-badge state-${agent.state}">${agent.state}</span>
+        <span class="agent-badges"><span class="state-badge state-${agent.state}">${agent.state}</span>${indicatorBadges}</span>
       </div>
       <div class="agent-meta">${buildMetaHtml(agent, ctx.proxies)}</div>
       ${failureInfo}
-      ${buildIndicatorsHtml(ctx.indicators)}
       <div class="drag-handle" title="Drag to reorder or move to group">${icon.gripVertical(14)}</div>
-      <div class="agent-actions">${buildActionsHtml(agent)}</div>
     `;
   }
 
@@ -165,24 +191,16 @@ export class AgentCard extends HTMLElement {
     } else if (failEl) {
       failEl.remove();
     }
-    // Indicators
-    let indEl = this.querySelector('.indicator-badges');
-    const inds = ctx.indicators || [];
-    if (inds.length) {
-      const indHtml = buildIndicatorsHtml(inds).replace(/^<div class="indicator-badges">|<\/div>$/g, '');
-      if (!indEl) {
-        indEl = document.createElement('div');
-        indEl.className = 'indicator-badges';
-        const handle = this.querySelector('.drag-handle');
-        if (handle) handle.before(indEl);
-      }
-      indEl.innerHTML = indHtml;
-    } else if (indEl) {
-      indEl.remove();
+    // Badges (state + indicators) — inline in header
+    const badgesEl = this.querySelector('.agent-badges');
+    if (badgesEl) {
+      const inds = ctx.indicators || [];
+      const indicatorHtml = inds.map(ind => {
+        const cls = ind.style || 'info';
+        return `<span class="indicator-badge ${cls}">${esc(ind.badge)}</span>`;
+      }).join('');
+      badgesEl.innerHTML = `<span class="state-badge state-${agent.state}">${agent.state}</span>${indicatorHtml}`;
     }
-    // Actions
-    const actions = this.querySelector('.agent-actions');
-    if (actions) actions.innerHTML = buildActionsHtml(agent);
     // Selected
     this.classList.toggle('selected', !!ctx.selected);
   }

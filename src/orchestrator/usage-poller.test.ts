@@ -90,6 +90,47 @@ describe('parseClaudeUsage', () => {
     const buckets = parseClaudeUsage(output);
     assert.equal(buckets.length, 0);
   });
+
+  it('filters out paths and bare timezones as labels', () => {
+    const output = [
+      '  /tmp',
+      '  ████▌                                              5% used',
+      '  Resets 12pm',
+      '  (America/Chicago)',
+      '',
+      '  Current week (all models)',
+      '  ██████████████████████████                         102% used',
+      '  Resets May 1 (America/Chicago)',
+    ].join('\n');
+    const buckets = parseClaudeUsage(output);
+    // Should only capture "Current week (all models)", not "/tmp" or "(America/Chicago)"
+    assert.equal(buckets.length, 1);
+    assert.equal(buckets[0]!.label, 'Current week (all models)');
+    assert.equal(buckets[0]!.pctUsed, 102);
+  });
+
+  it('parses v2.1.118+ inline format (no labels, just reset times)', () => {
+    const output = [
+      '  Resets 2pm (America/Chicago)████████████████████   96% used',
+      '',
+      '  Resets 5pm (America/Chicago)                       0% used',
+      '',
+      '  $203.22 / $200.00 spent · Resets May 1 (America/Chicago)',
+    ].join('\n');
+    const buckets = parseClaudeUsage(output);
+    assert.equal(buckets.length, 3);
+
+    assert.equal(buckets[0]!.label, 'Resets 2pm');
+    assert.equal(buckets[0]!.pctUsed, 96);
+    assert.equal(buckets[0]!.resetsAt, '2pm (America/Chicago)');
+
+    assert.equal(buckets[1]!.label, 'Resets 5pm');
+    assert.equal(buckets[1]!.pctUsed, 0);
+
+    assert.equal(buckets[2]!.label, 'Extra usage');
+    assert.equal(buckets[2]!.pctUsed, 102); // 203.22/200 = 101.6%
+    assert.equal(buckets[2]!.resetsAt, 'May 1 (America/Chicago)');
+  });
 });
 
 describe('parseCodexStatus', () => {

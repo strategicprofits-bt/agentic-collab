@@ -62,8 +62,8 @@ export class UsagePoller {
   private readonly usageData = new Map<string, EngineUsage>();
   // Track which sessions are booted to avoid re-spawning every cycle
   private readonly activeSessions = new Set<string>();
-  // Track when each session was created for recycling
-  private readonly sessionCreatedAt = new Map<string, number>();
+  // Track session metadata: which proxy owns it and when it was created (for recycling)
+  private readonly sessionInfo = new Map<string, { proxyId: string; createdAt: number }>();
 
   constructor(opts: UsagePollerOptions) {
     this.db = opts.db;
@@ -99,25 +99,36 @@ export class UsagePoller {
 
   /** Tear down dedicated sessions on shutdown. */
   async cleanup(): Promise<void> {
-    const proxyId = this.findProxy();
-    if (!proxyId) return;
     for (const session of this.activeSessions) {
+      const info = this.sessionInfo.get(session);
+      if (!info) continue;
       try {
-        await this.proxyDispatch(proxyId, { action: 'kill_session', sessionName: session });
+        await this.proxyDispatch(info.proxyId, { action: 'kill_session', sessionName: session });
         console.log(`[usage] Killed session ${session}`);
       } catch { /* best effort */ }
     }
     this.activeSessions.clear();
-    this.sessionCreatedAt.clear();
+    this.sessionInfo.clear();
   }
 
   getUsageData(): Record<string, EngineUsage> {
     return Object.fromEntries(this.usageData);
   }
 
+  /**
+   * Find the best proxy for usage polling.
+   * Prefers proxies with host.docker.internal (local to orchestrator container)
+   * or localhost, as those minimize latency for tmux operations.
+   */
   private findProxy(): string | null {
     const proxies = this.db.listProxies();
-    return proxies.length > 0 ? proxies[0]!.proxyId : null;
+    if (proxies.length === 0) return null;
+
+    // Prefer local proxy (host.docker.internal or localhost)
+    const local = proxies.find(p =>
+      p.host.includes('host.docker.internal') || p.host.startsWith('localhost')
+    );
+    return local?.proxyId ?? proxies[0]!.proxyId;
   }
 
   private getEngineConfigs(): EngineConfig[] {
@@ -194,12 +205,16 @@ export class UsagePoller {
   /**
    * Ensure the dedicated session exists and is responsive, then query usage.
    */
-  private async pollEngine(proxyId: string, config: EngineConfig): Promise<void> {
+  private async pollEngine(newProxyId: string, config: EngineConfig): Promise<void> {
     // Recycle session if older than 8 hours
-    await this.recycleIfStale(proxyId, config);
+    await this.recycleIfStale(config);
 
-    // Ensure session exists
-    await this.ensureSession(proxyId, config);
+    // Ensure session exists (may create on newProxyId or reuse existing)
+    await this.ensureSession(newProxyId, config);
+
+    // Use the stored proxy for this session (may differ from newProxyId if session already existed)
+    const info = this.sessionInfo.get(config.sessionName);
+    const proxyId = info?.proxyId ?? newProxyId;
 
     // Check if the CLI is at a prompt (idle)
     const ready = await this.waitForIdle(proxyId, config);
@@ -217,7 +232,9 @@ export class UsagePoller {
     });
 
     // Poll capture until we see usage data or timeout
+    // Use 80 lines to capture full dialog (includes header, all buckets, extra usage)
     let buckets: UsageBucket[] = [];
+    let bestBuckets: UsageBucket[] = [];
     const deadline = Date.now() + CAPTURE_TIMEOUT_MS;
     while (Date.now() < deadline) {
       await sleep(CAPTURE_POLL_MS);
@@ -225,19 +242,27 @@ export class UsagePoller {
       const result = await this.proxyDispatch(proxyId, {
         action: 'capture',
         sessionName: config.sessionName,
-        lines: 40,
+        lines: 80,
       });
       if (!result.ok) break;
       const output = (result.data as string) ?? '';
 
       buckets = config.parser(output);
-      if (buckets.length > 0) break;
+      // Keep the best result (most buckets) seen so far
+      if (buckets.length > bestBuckets.length) bestBuckets = buckets;
 
-      // Claude-specific: stop if dialog was dismissed without data
-      if (config.engine === 'claude') {
+      // For Claude, wait for at least 2 buckets (weekly + extra) to ensure full dialog capture
+      if (config.engine === 'claude' && buckets.length >= 2) break;
+      if (config.engine !== 'claude' && buckets.length > 0) break;
+
+      // Claude-specific: stop if dialog was dismissed AND we have at least some data
+      // Don't break on dismissed if we haven't found anything yet (scrollback noise)
+      if (config.engine === 'claude' && bestBuckets.length > 0) {
         if (/Status dialog dismissed|Error loading/i.test(output) && !/Loading usage/i.test(output)) break;
       }
     }
+    // Use the best result we captured
+    buckets = bestBuckets;
 
     // Dismiss dialog
     await this.proxyDispatch(proxyId, {
@@ -267,22 +292,42 @@ export class UsagePoller {
 
   /**
    * Ensure the dedicated tmux session exists with the CLI running.
-   * Creates and spawns if needed.
+   * Creates and spawns if needed. Stores the proxyId used so subsequent
+   * commands go to the same proxy.
    */
   private async ensureSession(proxyId: string, config: EngineConfig): Promise<void> {
-    // Check if session exists
+    // If we already track this session, it exists on its stored proxy
+    const existing = this.sessionInfo.get(config.sessionName);
+    if (existing) {
+      // Verify the session still exists on the stored proxy
+      const hasResult = await this.proxyDispatch(existing.proxyId, {
+        action: 'has_session',
+        sessionName: config.sessionName,
+      });
+      if (hasResult.ok && hasResult.data === true) {
+        return; // Session still running on the original proxy
+      }
+      // Session was killed externally — clear tracking and recreate
+      this.activeSessions.delete(config.sessionName);
+      this.sessionInfo.delete(config.sessionName);
+    }
+
+    // Check if session exists on the new proxy (may have been created before orchestrator restart)
     const hasResult = await this.proxyDispatch(proxyId, {
       action: 'has_session',
       sessionName: config.sessionName,
     });
 
     if (hasResult.ok && hasResult.data === true) {
-      return; // Session already running
+      // Session exists but we weren't tracking it — adopt it
+      this.activeSessions.add(config.sessionName);
+      this.sessionInfo.set(config.sessionName, { proxyId, createdAt: Date.now() });
+      return;
     }
 
     // Create session and spawn CLI
     const label = config.account ? `${config.engine}:${config.account}` : config.engine;
-    console.log(`[usage] Spawning dedicated ${label} session: ${config.sessionName}`);
+    console.log(`[usage] Spawning dedicated ${label} session: ${config.sessionName} on ${proxyId}`);
     await this.proxyDispatch(proxyId, {
       action: 'create_session',
       sessionName: config.sessionName,
@@ -302,7 +347,7 @@ export class UsagePoller {
     });
 
     this.activeSessions.add(config.sessionName);
-    this.sessionCreatedAt.set(config.sessionName, Date.now());
+    this.sessionInfo.set(config.sessionName, { proxyId, createdAt: Date.now() });
 
     // Wait for CLI to boot
     await sleep(SESSION_BOOT_MS);
@@ -312,38 +357,33 @@ export class UsagePoller {
    * Kill and forget a session if it was created more than RECYCLE_MS ago.
    * The next ensureSession() call will recreate it fresh.
    */
-  private async recycleIfStale(proxyId: string, config: EngineConfig): Promise<void> {
-    const createdAt = this.sessionCreatedAt.get(config.sessionName);
-    // If we have no timestamp but the session exists in tmux, it predates this
-    // process (e.g. survived an orchestrator restart). Kill it unconditionally.
-    const isOrphan = !createdAt && this.activeSessions.has(config.sessionName);
+  private async recycleIfStale(config: EngineConfig): Promise<void> {
+    const info = this.sessionInfo.get(config.sessionName);
+    const createdAt = info?.createdAt;
+    const storedProxyId = info?.proxyId;
+
+    // If we have no tracking but it's in activeSessions, it's orphaned
+    const isOrphan = !info && this.activeSessions.has(config.sessionName);
     const isStale = createdAt != null && (Date.now() - createdAt) >= RECYCLE_MS;
 
     if (!isOrphan && !isStale) {
-      // Also check for sessions that exist in tmux but aren't tracked by us
-      if (createdAt == null && !this.activeSessions.has(config.sessionName)) {
-        const hasResult = await this.proxyDispatch(proxyId, {
-          action: 'has_session',
-          sessionName: config.sessionName,
-        });
-        if (hasResult.ok && hasResult.data === true) {
-          // Untracked session from a previous process — kill it
-          console.log(`[usage] Recycling untracked session ${config.sessionName}`);
-          try {
-            await this.proxyDispatch(proxyId, { action: 'kill_session', sessionName: config.sessionName });
-          } catch { /* best effort */ }
-          return;
-        }
-      }
+      // Untracked sessions from a previous orchestrator process are handled in ensureSession
+      return;
+    }
+
+    if (!storedProxyId) {
+      // Can't kill without knowing which proxy owns it — just clear local state
+      this.activeSessions.delete(config.sessionName);
+      this.sessionInfo.delete(config.sessionName);
       return;
     }
 
     console.log(`[usage] Recycling ${isOrphan ? 'orphaned' : 'stale'} session ${config.sessionName} (age: ${createdAt ? Math.round((Date.now() - createdAt) / 3600000) + 'h' : 'unknown'})`);
     try {
-      await this.proxyDispatch(proxyId, { action: 'kill_session', sessionName: config.sessionName });
+      await this.proxyDispatch(storedProxyId, { action: 'kill_session', sessionName: config.sessionName });
     } catch { /* best effort */ }
     this.activeSessions.delete(config.sessionName);
-    this.sessionCreatedAt.delete(config.sessionName);
+    this.sessionInfo.delete(config.sessionName);
   }
 
   /**
@@ -400,59 +440,135 @@ export class UsagePoller {
 }
 
 /**
- * Parse Claude /usage output. Format:
+ * Parse Claude /usage output.
  *
+ * v2.1.118+ format (no labels, just reset times with progress bars):
+ *   Resets 2pm (America/Chicago)████████████████████   96% used
+ *   Resets 5pm (America/Chicago)                       0% used
+ *
+ * Labeled format (earlier v2.1.x):
+ *   Current week (all models)
+ *   Resets Apr 21, 8pm (America/Chicago)               26% used
+ *
+ * Old format (v2.0.x):
  *   Current session
  *   ████▌                                              9% used
  *   Resets 12pm (America/Chicago)
  *
- *   Current week (all models)
- *   ███████████                                        22% used
- *   Resets Mar 13, 12am (America/Chicago)
+ * Extra usage format:
+ *   $189.67 / $200.00 spent · Resets May 1 (America/Chicago)
  */
 const PROGRESS_BAR_RE = /[█▌▊▋▍▎▏░]/;
 
 export function parseClaudeUsage(output: string): UsageBucket[] {
   const buckets: UsageBucket[] = [];
+  const seen = new Set<string>();
   const lines = output.split('\n');
 
+  // Filter out UI chrome lines that look like labels but aren't usage categories
+  const isUIChrome = (s: string) =>
+    /\d+[KMG]?\s+context\)?$/i.test(s) ||           // "Opus 4.6 (1M context)"
+    /^using\s+(standard|extra)\s+usage/i.test(s) || // "using standard usage"
+    /^[A-Z][a-z]+\s+\d+(\.\d+)?$/i.test(s) ||       // "Opus 4.6", "Sonnet 3.5"
+    /Status.*Config.*Usage/i.test(s) ||             // Dialog tab bar "Status   Config   Usage   Stats"
+    /^─+$/.test(s) ||                               // Horizontal rules
+    /^[❯›>]\s*\//.test(s) ||                        // Prompt lines "❯ /usage", "> /usage"
+    /^\/[a-z]/i.test(s) ||                          // Paths like "/tmp", "/home/..."
+    /^\([A-Za-z_]+\/[A-Za-z_]+\)$/.test(s) ||       // Bare timezone "(America/Chicago)"
+    /^Resets\s/.test(s) ||                          // Lines starting with "Resets" (v2.1.118+ uses these as inline)
+    /^Usage:\s/.test(s) ||                          // "Usage: 0 input, 0 output..."
+    /^Total\s+(cost|duration)/i.test(s);            // "Total cost:", "Total duration:"
+
+  const isValidLabel = (s: string) =>
+    s.length > 0 && !isUIChrome(s);
+
   for (let i = 0; i < lines.length; i++) {
-    // Match lines where "NN% used" appears alongside a progress bar
     const line = lines[i]!;
-    const pctMatch = line.match(/(\d+)%\s+used/);
-    if (!pctMatch) continue;
 
-    // Require a progress bar on the same line or the line immediately above
-    const hasBarOnLine = PROGRESS_BAR_RE.test(line);
-    const hasBarAbove = i > 0 && PROGRESS_BAR_RE.test(lines[i - 1]!);
-    if (!hasBarOnLine && !hasBarAbove) continue;
-
-    const pctUsed = parseInt(pctMatch[1]!, 10);
-
-    // Look backwards for the label (skip bar lines and blank lines)
-    let label = '';
-    for (let j = i - 1; j >= 0; j--) {
-      const l = lines[j]!.trim();
-      if (!l) continue;
-      // Skip progress bar lines (contain block characters)
-      if (/^[█▌▊▋▍▎▏\s░]+$/.test(l)) continue;
-      // Skip lines that are just the percentage
-      if (/^\d+%/.test(l)) continue;
-      label = l;
-      break;
-    }
-
-    // Look forwards for reset info
-    let resetsAt = '';
-    for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
-      const resetMatch = lines[j]!.match(/Resets\s+(.+)/);
-      if (resetMatch) {
-        resetsAt = resetMatch[1]!.trim();
-        break;
+    // v2.1.118+ format: "Resets <time>██████...   NN% used" (no separate label)
+    // Extract reset time by stripping progress bar chars and "NN% used"
+    const inlineMatch = line.match(/Resets\s+(\d+[ap]m)\s+\([^)]+\).*?(\d+)%\s+used/);
+    if (inlineMatch) {
+      const resetTime = inlineMatch[1]!;
+      const pctUsed = parseInt(inlineMatch[2]!, 10);
+      // Use reset time as label since there's no semantic label
+      const label = `Resets ${resetTime}`;
+      if (!seen.has(label)) {
+        seen.add(label);
+        // Extract full reset info (time + timezone)
+        const fullResetMatch = line.match(/Resets\s+([\d]+[ap]m\s+\([^)]+\))/);
+        const resetsAt = fullResetMatch ? fullResetMatch[1]! : resetTime;
+        buckets.push({ label, pctUsed, resetsAt });
       }
+      continue;
     }
 
-    buckets.push({ label: label || 'Unknown', pctUsed, resetsAt });
+    // Match "NN% used" lines (labeled formats)
+    const pctMatch = line.match(/(\d+)%\s+used/);
+    if (pctMatch) {
+      const pctUsed = parseInt(pctMatch[1]!, 10);
+
+      // Labeled format: "Resets Apr 21, 8pm ... NN% used" with label above
+      const resetOnLine = line.match(/Resets\s+([^█]+?)\s+\d+%/);
+      if (resetOnLine) {
+        // Look backwards for valid usage label
+        let label = '';
+        for (let j = i - 1; j >= 0; j--) {
+          const l = lines[j]!.trim();
+          if (!l) continue;
+          if (isValidLabel(l)) {
+            label = l;
+            break;
+          }
+        }
+        if (label && !seen.has(label)) {
+          seen.add(label);
+          buckets.push({ label, pctUsed, resetsAt: resetOnLine[1]!.trim() });
+        }
+        continue;
+      }
+
+      // Old format: progress bar on same line or line above, reset info below
+      const hasBarOnLine = PROGRESS_BAR_RE.test(line);
+      const hasBarAbove = i > 0 && PROGRESS_BAR_RE.test(lines[i - 1]!);
+      if (hasBarOnLine || hasBarAbove) {
+        let label = '';
+        for (let j = i - 1; j >= 0; j--) {
+          const l = lines[j]!.trim();
+          if (!l) continue;
+          if (/^[█▌▊▋▍▎▏\s░]+$/.test(l)) continue;
+          if (/^\d+%/.test(l)) continue;
+          if (isValidLabel(l)) {
+            label = l;
+            break;
+          }
+        }
+        let resetsAt = '';
+        for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
+          const resetMatch = lines[j]!.match(/Resets\s+(.+)/);
+          if (resetMatch) {
+            resetsAt = resetMatch[1]!.trim();
+            break;
+          }
+        }
+        if (label && !seen.has(label)) {
+          seen.add(label);
+          buckets.push({ label, pctUsed, resetsAt });
+        }
+      }
+      continue;
+    }
+
+    // Extra usage format: "$X / $Y spent · Resets ..."
+    const extraMatch = line.match(/\$[\d.]+\s*\/\s*\$([\d.]+)\s+spent.*Resets\s+(.+)/);
+    if (extraMatch && !seen.has('Extra usage')) {
+      seen.add('Extra usage');
+      const limit = parseFloat(extraMatch[1]!);
+      const spentMatch = line.match(/\$([\d.]+)\s*\//);
+      const spent = spentMatch ? parseFloat(spentMatch[1]!) : 0;
+      const pctUsed = limit > 0 ? Math.round((spent / limit) * 100) : 0;
+      buckets.push({ label: 'Extra usage', pctUsed, resetsAt: extraMatch[2]!.trim() });
+    }
   }
 
   return buckets;

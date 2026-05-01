@@ -45,6 +45,15 @@ export function killSession(sessionName: string): void {
   }
 }
 
+export function clearHistory(sessionName: string): void {
+  validateSessionName(sessionName);
+  try {
+    exec(`tmux clear-history -t '${esc(sessionName)}'`);
+  } catch {
+    // Session may be gone — non-fatal
+  }
+}
+
 export function listSessions(): string[] {
   try {
     const output = exec("tmux list-sessions -F '#{session_name}'");
@@ -66,6 +75,12 @@ function pasteEnterDelay(textLength: number): number {
 
 export async function pasteText(sessionName: string, text: string, pressEnter: boolean): Promise<void> {
   validateSessionName(sessionName);
+  // Verify tmux is responsive before pasting — catches locked/overloaded sessions
+  try {
+    execSync(`tmux capture-pane -t '${esc(sessionName)}' -p -S -1`, { ...EXEC_OPTS, timeout: 5000 });
+  } catch {
+    throw new Error(`tmux session "${sessionName}" is not responsive (capture-pane timed out)`);
+  }
   // Pass text via stdin (input option) to avoid all shell escaping issues
   execSync('tmux load-buffer -', { ...EXEC_OPTS, input: text });
   exec(`tmux paste-buffer -t '${esc(sessionName)}'`);

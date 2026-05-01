@@ -1,0 +1,10 @@
+{
+  "_comment": "Agents expected to stay reachable. Long-idle (>24h) entries are flagged in the 3x/day status report. Edit freely.",
+  "agents": [
+    "DrRobby",
+    "CoachBeard",
+    "ChloeOBrian",
+    "Gilfoyle",
+    "JessicaJones"
+  ]
+}

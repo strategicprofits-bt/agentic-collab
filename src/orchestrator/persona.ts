@@ -878,30 +878,29 @@ export function composeSystemPrompt(opts: {
   }
 
   // Messaging instructions — collab CLI (standalone binary, not a pnpm script)
-  parts.push(`Messages from other agents arrive as text in your tmux pane
-formatted as: [from: <sender>, reply with collab send operator --topic <topic>]: '<message>'
+  parts.push(`You have the \`collab\` CLI on your PATH (standalone binary, not a pnpm script).
+Your agent name: COLLAB_AGENT=${opts.agentName}
 
-You have the \`collab\` CLI on your PATH. It is a standalone binary — run it directly (e.g. \`collab send ...\`), NOT via pnpm or any repo skill.
-IMPORTANT: Do NOT use \`pnpm collaboration\` or any other wrapper. Always use the bare \`collab\` command.
-It auto-discovers auth and the orchestrator.
-Your agent name is set via COLLAB_AGENT=${opts.agentName}.
+Incoming messages appear as: [from: <sender>, reply with collab send <sender> --topic <topic>]: '<message>'
 
-Send a message to the operator (dashboard):
-  collab send operator --topic <topic> <message>
+Core commands:
+  collab send operator --topic <t> <msg>      # message the human operator
+  collab send <agent> --topic <t> <msg>       # message a peer agent
+  collab agents                               # list all agents + status
+  collab queue [--agent X] [--status S] [--limit N]  # message history
 
-Send a message to another agent:
-  collab send <agent> --topic <topic> <message>
+Tmux (routed through orchestrator to the correct proxy):
+  collab tmux <agent> -- capture-pane         # read agent's terminal output
+  collab tmux <agent> -- send-keys '/compact' Enter  # type /compact and press Enter
+  collab tmux <agent> -- send-keys Enter      # press Enter
+  collab tmux <agent> -- display-message -p '#{pane_pid}'  # query tmux variables
 
-List all agents:
-  collab list-agents
+Reminders:
+  collab reminder add <agent> "prompt" --cadence 30m
+  collab reminder list
+  collab reminder done <id>
 
-Create an agent from a persona file:
-  collab create-agent <persona-file>
-
-Constrained tmux passthrough:
-  collab tmux <agent> -- <tmux-subcommand> [args...]
-
-Run \`collab help\` for full usage.`);
+Run \`collab help\` for full command reference.`);
 
   if (opts.peers && opts.peers.length > 0) {
     parts.push(`\n\nKnown peers: ${opts.peers.join(', ')}`);
@@ -909,9 +908,10 @@ Run \`collab help\` for full usage.`);
 
   parts.push(`
 
+Your terminal output, tool calls, and reasoning are invisible to the operator — only messages you send via \`collab send operator\` appear on the dashboard.
+
 Use /compact proactively when your context grows large.
-Keep context light — delegate to sub-agents when appropriate.
-When you finish a task or have results, report back to the orchestrator.`);
+Keep context light — delegate to sub-agents when appropriate.`);
 
   return parts.join('\n');
 }
@@ -961,7 +961,10 @@ function serializeIndicators(value?: IndicatorDefinition[]): string | null {
 
 import type { Database } from './database.ts';
 
-const VALID_ENGINES = new Set<string>(['claude', 'codex', 'opencode']);
+/** Any non-empty engine string is valid. Engine configs provide defaults but are not required. */
+function isValidEngine(engine: string | undefined | null): engine is string {
+  return typeof engine === 'string' && engine.length > 0;
+}
 
 function buildUpsertOpts(name: string, fm: PersonaFrontmatter): Parameters<Database['upsertAgentFromPersona']>[0] {
   return buildUpsertOptsFromFrontmatter(name, fm) as Parameters<Database['upsertAgentFromPersona']>[0];
@@ -988,7 +991,7 @@ export function syncSinglePersona(db: Database, name: string, personasDir?: stri
   const cwd = fm.cwd;
 
   const resolvedEngine = fm.engine;
-  if (!resolvedEngine || !VALID_ENGINES.has(resolvedEngine) || !cwd) return false;
+  if (!resolvedEngine || !isValidEngine(resolvedEngine) || !cwd) return false;
 
   const upsertOpts = buildUpsertOpts(name, fm);
   db.upsertAgentFromPersona(upsertOpts);
@@ -1012,7 +1015,7 @@ export function syncPersonasToDb(db: Database, personasDir?: string): number {
     const resolvedEngine = frontmatter.engine;
 
     // engine and cwd are required for an agent to be valid
-    if (!resolvedEngine || !VALID_ENGINES.has(resolvedEngine) || !cwd) {
+    if (!resolvedEngine || !isValidEngine(resolvedEngine) || !cwd) {
       console.warn(`[persona-sync] Skipping "${name}.md": engine and cwd are required (got engine=${resolvedEngine ?? 'undefined'}, cwd=${cwd ?? 'undefined'})`);
       continue;
     }
@@ -1066,7 +1069,7 @@ export function syncPersonasWithDiff(db: Database, personasDir?: string): SyncDi
 
     const resolvedEngine = frontmatter.engine;
 
-    if (!resolvedEngine || !VALID_ENGINES.has(resolvedEngine) || !cwd) {
+    if (!resolvedEngine || !isValidEngine(resolvedEngine) || !cwd) {
       result.skipped.push(name);
       continue;
     }
@@ -1113,7 +1116,7 @@ export function createPersonaAndAgent(
   const cwd = fm.cwd;
 
   const resolvedEngine = fm.engine;
-  if (!resolvedEngine || !VALID_ENGINES.has(resolvedEngine) || !cwd) {
+  if (!resolvedEngine || !isValidEngine(resolvedEngine) || !cwd) {
     throw new Error(`engine and cwd are required in frontmatter (got engine=${resolvedEngine ?? 'undefined'}, cwd=${cwd ?? 'undefined'})`);
   }
   validateFrontmatter(name, fm);

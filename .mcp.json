@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "sevalla": {
+      "type": "http",
+      "url": "https://mcp.sevalla.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${SEVALLA_API_KEY}"
+      }
+    },
+    "sevalla-readonly": {
+      "type": "http",
+      "url": "https://mcp.sevalla.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${SEVALLA_API_KEY_READ}"
+      }
+    }
+  }
+}

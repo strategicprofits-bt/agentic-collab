@@ -1,5 +1,8 @@
   /* ── Settings Panel ── */
   .settings-panel { padding: 20px; overflow-y: auto; }
+  .settings-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .settings-header h2 { margin: 0; font-size: 14px; font-weight: 600; color: var(--text); }
+  .settings-header button { font-size: 18px; line-height: 1; padding: 2px 8px; }
   .settings-section { margin-bottom: 24px; }
   .settings-section h3 {
     margin-bottom: 8px;
@@ -102,6 +105,13 @@
     outline: none;
   }
   .config-yaml-editor:focus { border-color: var(--accent); }
+  .config-details summary {
+    font-size: 11px;
+    color: var(--text-dim);
+    cursor: pointer;
+    padding: 4px 0;
+  }
+  .config-details summary:hover { color: var(--accent); }
   .config-name-input {
     padding: 4px 8px;
     border: 1px solid var(--border);
@@ -139,15 +149,25 @@
   }
   .settings-btn-save:hover { opacity: 0.9; color: #fff; }
   .settings-btn-new { margin-top: 4px; }
+  .config-btn-row { display: flex; gap: 8px; margin-top: 4px; }
   .pref-row {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 8px 0;
-    font-size: 13px;
+    gap: 12px;
+    padding: 6px 0;
+    font-size: 12px;
     flex-wrap: wrap;
   }
-  .pref-row label { cursor: pointer; color: var(--text); }
+  .pref-row + .pref-row { border-top: 1px solid var(--border); padding-top: 8px; margin-top: 2px; }
+  .pref-label {
+    font-weight: 600;
+    color: var(--text-dim);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    min-width: 80px;
+  }
+  .pref-option { cursor: pointer; color: var(--text); }
   .pref-row input[type="radio"],
   .pref-row input[type="checkbox"] {
     accent-color: var(--accent);

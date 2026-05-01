@@ -18,6 +18,9 @@ import type {
   ProxyRegistration,
   Reminder,
   ReminderStatus,
+  PageRecord,
+  DataStoreRecord,
+  DestinationRecord,
 } from '../shared/types.ts';
 import {
   configColumnMap,
@@ -124,8 +127,20 @@ const SCHEMA = `
     hook_exit      TEXT,
     hook_interrupt TEXT,
     hook_submit    TEXT,
+    indicators     TEXT,
+    detection      TEXT,
     launch_env     TEXT,
     created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS pages (
+    slug           TEXT PRIMARY KEY,
+    title          TEXT,
+    agent          TEXT,
+    file_count     INTEGER NOT NULL DEFAULT 0,
+    total_bytes    INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
   );
 `;
 
@@ -199,6 +214,15 @@ export class Database {
       this.db.exec('ALTER TABLE proxies ADD COLUMN version TEXT');
     }
 
+    // Add custom_buttons and hook_reload columns to engine_configs if not present
+    const ecCols = this.db.prepare('PRAGMA table_info(engine_configs)').all() as Array<Record<string, unknown>>;
+    if (!ecCols.some((c) => c['name'] === 'custom_buttons')) {
+      this.db.exec('ALTER TABLE engine_configs ADD COLUMN custom_buttons TEXT');
+    }
+    if (!ecCols.some((c) => c['name'] === 'hook_reload')) {
+      this.db.exec('ALTER TABLE engine_configs ADD COLUMN hook_reload TEXT');
+    }
+
     // Create reminders table
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS reminders (
@@ -225,6 +249,39 @@ export class Database {
     if (!reminderColumns.some((c) => c['name'] === 'deliver_at')) {
       this.db.exec('ALTER TABLE reminders ADD COLUMN deliver_at TEXT');
     }
+
+    // Add indicators and detection columns to engine_configs if not present
+    const ecColumns = this.db.prepare('PRAGMA table_info(engine_configs)').all() as Array<Record<string, unknown>>;
+    if (ecColumns.length > 0) {
+      if (!ecColumns.some((c) => c['name'] === 'indicators')) {
+        this.db.exec('ALTER TABLE engine_configs ADD COLUMN indicators TEXT');
+      }
+      if (!ecColumns.some((c) => c['name'] === 'detection')) {
+        this.db.exec('ALTER TABLE engine_configs ADD COLUMN detection TEXT');
+      }
+    }
+
+    // Create data_stores table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS data_stores (
+        name       TEXT PRIMARY KEY,
+        agent      TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      )
+    `);
+
+    // Create destinations table (telegram, etc.)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS destinations (
+        name       TEXT PRIMARY KEY,
+        type       TEXT NOT NULL,
+        config     TEXT NOT NULL,
+        enabled    INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      )
+    `);
   }
 
   /** Expose raw handle for LockManager (shares same DB connection). */
@@ -424,14 +481,12 @@ export class Database {
     return mapDashboardMessageRow(row);
   }
 
-  getDashboardThreads(agentName?: string, opts?: { archived?: boolean }): Record<string, DashboardMessage[]> {
-    const showArchived = opts?.archived ?? false;
-    const archiveFilter = showArchived ? 'dm.archived_at IS NOT NULL' : 'dm.archived_at IS NULL';
+  getDashboardThreads(agentName?: string): Record<string, DashboardMessage[]> {
     const query = `
       SELECT dm.*, pm.status AS delivery_status
       FROM dashboard_messages dm
       LEFT JOIN pending_messages pm ON dm.queue_id = pm.id
-      WHERE ${archiveFilter}${agentName ? ' AND dm.agent = ?' : ''}
+      WHERE 1=1${agentName ? ' AND dm.agent = ?' : ''}
       ORDER BY dm.created_at ASC
     `;
     const rows = agentName
@@ -445,6 +500,24 @@ export class Database {
       threads[msg.agent]!.push(msg);
     }
     return threads;
+  }
+
+  searchMessages(query: string, agent?: string): DashboardMessage[] {
+    const pattern = `%${query}%`;
+    let sql = `
+      SELECT dm.*, pm.status AS delivery_status
+      FROM dashboard_messages dm
+      LEFT JOIN pending_messages pm ON dm.queue_id = pm.id
+      WHERE dm.message LIKE ?
+    `;
+    const params: unknown[] = [pattern];
+    if (agent) {
+      sql += ' AND dm.agent = ?';
+      params.push(agent);
+    }
+    sql += ' ORDER BY dm.created_at DESC LIMIT 200';
+    const rows = this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+    return rows.map(mapDashboardMessageRow);
   }
 
   // ── Proxies ──
@@ -476,6 +549,14 @@ export class Database {
   listProxies(): ProxyRegistration[] {
     const rows = this.db.prepare('SELECT * FROM proxies ORDER BY proxy_id').all() as Array<Record<string, unknown>>;
     return rows.map(mapProxyRow);
+  }
+
+  /** Migrate all agents from one proxy to another. Returns count migrated. */
+  migrateAgentsToProxy(fromProxyId: string, toProxyId: string): number {
+    const result = this.db.prepare(
+      'UPDATE agents SET proxy_id = ? WHERE proxy_id = ?'
+    ).run(toProxyId, fromProxyId);
+    return result.changes;
   }
 
   updateProxyHeartbeat(proxyId: string): boolean {
@@ -543,6 +624,23 @@ export class Database {
       WHERE id = ? AND status = 'pending'
     `).run(id);
     return result.changes > 0;
+  }
+
+  /**
+   * Check if an agent has any pending messages (including those with future next_attempt_at).
+   * Used by the dispatcher to decide whether to schedule a drain loop.
+   */
+  hasPendingMessages(agentName: string): boolean {
+    const row = this.db.prepare(`
+      SELECT 1 FROM pending_messages WHERE target_agent = ? AND status = 'pending' LIMIT 1
+    `).get(agentName);
+    return row !== undefined;
+  }
+
+  markAttemptStarted(id: number): void {
+    this.db.prepare(`
+      UPDATE pending_messages SET last_attempt_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?
+    `).run(id);
   }
 
   markMessageDelivered(id: number): void {
@@ -620,10 +718,6 @@ export class Database {
     this.db.prepare("UPDATE pending_messages SET status = 'failed', error = 'Withdrawn by sender' WHERE id = ? AND status = 'pending'").run(id);
   }
 
-  clearDashboardMessages(agentName: string): void {
-    this.db.prepare("UPDATE dashboard_messages SET archived_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE agent = ? AND archived_at IS NULL").run(agentName);
-  }
-
   // ── Dashboard Read Cursors ──
 
   updateReadCursor(agent: string): void {
@@ -640,8 +734,7 @@ export class Database {
       SELECT dm.agent, COUNT(*) AS cnt
       FROM dashboard_messages dm
       LEFT JOIN dashboard_read_cursors rc ON dm.agent = rc.agent
-      WHERE dm.archived_at IS NULL
-        AND dm.id > COALESCE(rc.last_read_msg_id, 0)
+      WHERE dm.id > COALESCE(rc.last_read_msg_id, 0)
       GROUP BY dm.agent
     `).all() as Array<Record<string, unknown>>;
 
@@ -650,10 +743,6 @@ export class Database {
       counts[row['agent'] as string] = row['cnt'] as number;
     }
     return counts;
-  }
-
-  unarchiveDashboardMessages(agentName: string): void {
-    this.db.prepare('UPDATE dashboard_messages SET archived_at = NULL WHERE agent = ? AND archived_at IS NOT NULL').run(agentName);
   }
 
   clearPendingMessages(agentName: string): void {
@@ -666,7 +755,7 @@ export class Database {
     return mapPendingMessageRow(row);
   }
 
-  listPendingMessages(agent?: string, status?: string): PendingMessage[] {
+  listPendingMessages(agent?: string, status?: string, limit?: number): PendingMessage[] {
     let sql = 'SELECT * FROM pending_messages WHERE 1=1';
     const params: unknown[] = [];
     if (agent) {
@@ -677,7 +766,8 @@ export class Database {
       sql += ' AND status = ?';
       params.push(status);
     }
-    sql += ' ORDER BY id DESC LIMIT 100';
+    const cap = Math.min(limit ?? 100, 500);
+    sql += ` ORDER BY id DESC LIMIT ${cap}`;
     const rows = this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
     return rows.map(mapPendingMessageRow);
   }
@@ -845,11 +935,13 @@ export class Database {
     hookExit?: string | null;
     hookInterrupt?: string | null;
     hookSubmit?: string | null;
+    indicators?: string | null;
+    detection?: string | null;
     launchEnv?: Record<string, string> | null;
   }): EngineConfigRecord {
     this.db.prepare(`
-      INSERT INTO engine_configs (name, engine, model, thinking, permissions, hook_start, hook_resume, hook_compact, hook_exit, hook_interrupt, hook_submit, launch_env)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO engine_configs (name, engine, model, thinking, permissions, hook_start, hook_resume, hook_compact, hook_exit, hook_interrupt, hook_submit, indicators, detection, launch_env)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       opts.name,
       opts.engine,
@@ -862,6 +954,8 @@ export class Database {
       opts.hookExit ?? null,
       opts.hookInterrupt ?? null,
       opts.hookSubmit ?? null,
+      opts.indicators ?? null,
+      opts.detection ?? null,
       opts.launchEnv ? JSON.stringify(opts.launchEnv) : null,
     );
     return this.getEngineConfig(opts.name)!;
@@ -888,7 +982,11 @@ export class Database {
     hookCompact?: string | null;
     hookExit?: string | null;
     hookInterrupt?: string | null;
+    hookReload?: string | null;
     hookSubmit?: string | null;
+    indicators?: string | null;
+    detection?: string | null;
+    customButtons?: string | null;
     launchEnv?: Record<string, string> | null;
   }): EngineConfigRecord | null {
     const sets: string[] = [];
@@ -902,7 +1000,11 @@ export class Database {
     if (opts.hookCompact !== undefined) { sets.push('hook_compact = ?'); params.push(opts.hookCompact); }
     if (opts.hookExit !== undefined) { sets.push('hook_exit = ?'); params.push(opts.hookExit); }
     if (opts.hookInterrupt !== undefined) { sets.push('hook_interrupt = ?'); params.push(opts.hookInterrupt); }
+    if (opts.hookReload !== undefined) { sets.push('hook_reload = ?'); params.push(opts.hookReload); }
     if (opts.hookSubmit !== undefined) { sets.push('hook_submit = ?'); params.push(opts.hookSubmit); }
+    if (opts.indicators !== undefined) { sets.push('indicators = ?'); params.push(opts.indicators); }
+    if (opts.detection !== undefined) { sets.push('detection = ?'); params.push(opts.detection); }
+    if (opts.customButtons !== undefined) { sets.push('custom_buttons = ?'); params.push(opts.customButtons); }
     if (opts.launchEnv !== undefined) { sets.push('launch_env = ?'); params.push(opts.launchEnv ? JSON.stringify(opts.launchEnv) : null); }
     if (sets.length === 0) return this.getEngineConfig(name);
     params.push(name);
@@ -912,6 +1014,111 @@ export class Database {
 
   deleteEngineConfig(name: string): boolean {
     const result = this.db.prepare('DELETE FROM engine_configs WHERE name = ?').run(name);
+    return result.changes > 0;
+  }
+
+  // ── Pages ──
+
+  createPage(opts: { slug: string; title?: string; agent?: string; fileCount: number; totalBytes: number }): PageRecord {
+    this.db.prepare(`
+      INSERT INTO pages (slug, title, agent, file_count, total_bytes)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(slug) DO UPDATE SET
+        title = excluded.title,
+        agent = excluded.agent,
+        file_count = excluded.file_count,
+        total_bytes = excluded.total_bytes,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+    `).run(opts.slug, opts.title ?? null, opts.agent ?? null, opts.fileCount, opts.totalBytes);
+    return this.getPage(opts.slug)!;
+  }
+
+  getPage(slug: string): PageRecord | null {
+    const row = this.db.prepare('SELECT * FROM pages WHERE slug = ?').get(slug) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return mapPageRow(row);
+  }
+
+  listPages(): PageRecord[] {
+    const rows = this.db.prepare('SELECT * FROM pages ORDER BY updated_at DESC').all() as Array<Record<string, unknown>>;
+    return rows.map(mapPageRow);
+  }
+
+  deletePage(slug: string): boolean {
+    const result = this.db.prepare('DELETE FROM pages WHERE slug = ?').run(slug);
+    return result.changes > 0;
+  }
+
+  // ── Data Stores ──
+
+  createStore(opts: { name: string; agent?: string }): DataStoreRecord {
+    this.db.prepare(`
+      INSERT INTO data_stores (name, agent)
+      VALUES (?, ?)
+      ON CONFLICT(name) DO UPDATE SET
+        agent = excluded.agent,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+    `).run(opts.name, opts.agent ?? null);
+    return this.getStore(opts.name)!;
+  }
+
+  getStore(name: string): DataStoreRecord | null {
+    const row = this.db.prepare('SELECT * FROM data_stores WHERE name = ?').get(name) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return mapStoreRow(row);
+  }
+
+  listStores(): DataStoreRecord[] {
+    const rows = this.db.prepare('SELECT * FROM data_stores ORDER BY updated_at DESC').all() as Array<Record<string, unknown>>;
+    return rows.map(mapStoreRow);
+  }
+
+  touchStore(name: string): void {
+    this.db.prepare("UPDATE data_stores SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE name = ?").run(name);
+  }
+
+  deleteStore(name: string): boolean {
+    const result = this.db.prepare('DELETE FROM data_stores WHERE name = ?').run(name);
+    return result.changes > 0;
+  }
+
+  // ── Destinations ──
+
+  createDestination(opts: { name: string; type: string; config: Record<string, unknown> }): DestinationRecord {
+    this.db.prepare(`
+      INSERT INTO destinations (name, type, config)
+      VALUES (?, ?, ?)
+    `).run(opts.name, opts.type, JSON.stringify(opts.config));
+    return this.getDestination(opts.name)!;
+  }
+
+  getDestination(name: string): DestinationRecord | null {
+    const row = this.db.prepare('SELECT * FROM destinations WHERE name = ?').get(name) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return mapDestinationRow(row);
+  }
+
+  listDestinations(): DestinationRecord[] {
+    const rows = this.db.prepare('SELECT * FROM destinations ORDER BY created_at ASC').all() as Array<Record<string, unknown>>;
+    return rows.map(mapDestinationRow);
+  }
+
+  updateDestination(name: string, updates: { config?: Record<string, unknown>; enabled?: boolean }): DestinationRecord | null {
+    const existing = this.getDestination(name);
+    if (!existing) return null;
+    if (updates.config !== undefined) {
+      this.db.prepare("UPDATE destinations SET config = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE name = ?")
+        .run(JSON.stringify(updates.config), name);
+    }
+    if (updates.enabled !== undefined) {
+      this.db.prepare("UPDATE destinations SET enabled = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE name = ?")
+        .run(updates.enabled ? 1 : 0, name);
+    }
+    return this.getDestination(name);
+  }
+
+  deleteDestination(name: string): boolean {
+    const result = this.db.prepare('DELETE FROM destinations WHERE name = ?').run(name);
     return result.changes > 0;
   }
 }
@@ -969,7 +1176,6 @@ function mapDashboardMessageRow(row: Record<string, unknown>): DashboardMessage 
     deliveryStatus: (row['delivery_status'] as string | null) ?? null,
     withdrawn: (row['withdrawn'] as number) === 1,
     createdAt: row['created_at'] as string,
-    archivedAt: (row['archived_at'] as string | null) ?? null,
   };
 }
 
@@ -1044,9 +1250,47 @@ function mapEngineConfigRow(row: Record<string, unknown>): EngineConfigRecord {
     hookCompact: (row['hook_compact'] as string | null) ?? null,
     hookExit: (row['hook_exit'] as string | null) ?? null,
     hookInterrupt: (row['hook_interrupt'] as string | null) ?? null,
+    hookReload: (row['hook_reload'] as string | null) ?? null,
     hookSubmit: (row['hook_submit'] as string | null) ?? null,
+    indicators: (row['indicators'] as string | null) ?? null,
+    detection: (row['detection'] as string | null) ?? null,
+    customButtons: (row['custom_buttons'] as string | null) ?? null,
     launchEnv,
     createdAt: row['created_at'] as string,
+  };
+}
+
+function mapPageRow(row: Record<string, unknown>): PageRecord {
+  return {
+    slug: row['slug'] as string,
+    title: (row['title'] as string | null) ?? null,
+    agent: (row['agent'] as string | null) ?? null,
+    fileCount: (row['file_count'] as number) ?? 0,
+    totalBytes: (row['total_bytes'] as number) ?? 0,
+    createdAt: row['created_at'] as string,
+    updatedAt: row['updated_at'] as string,
+  };
+}
+
+function mapStoreRow(row: Record<string, unknown>): DataStoreRecord {
+  return {
+    name: row['name'] as string,
+    agent: (row['agent'] as string | null) ?? null,
+    createdAt: row['created_at'] as string,
+    updatedAt: row['updated_at'] as string,
+  };
+}
+
+function mapDestinationRow(row: Record<string, unknown>): DestinationRecord {
+  let config: Record<string, unknown> = {};
+  try { config = JSON.parse(row['config'] as string); } catch { /* empty */ }
+  return {
+    name: row['name'] as string,
+    type: row['type'] as string,
+    config,
+    enabled: (row['enabled'] as number) === 1,
+    createdAt: row['created_at'] as string,
+    updatedAt: row['updated_at'] as string,
   };
 }
 

@@ -125,7 +125,7 @@ describe('Persona', () => {
       assert.ok(prompt.includes('test-agent'));
       assert.ok(prompt.includes('collab send operator'));
       assert.ok(prompt.includes('collab send <agent>'));
-      assert.ok(prompt.includes('collab list-agents'));
+      assert.ok(prompt.includes('collab agents'));
       assert.ok(prompt.includes('COLLAB_AGENT=test-agent'));
     });
 
@@ -612,10 +612,10 @@ describe('Persona', () => {
       assert.equal(agent.hookCompact, 'echo noop');
     });
 
-    it('throws for invalid engine', () => {
+    it('throws for missing engine', () => {
       const personasDir = join(createDir, 'personas');
       assert.throws(
-        () => createPersonaAndAgent(createDb, 'bad-agent', '---\nengine: gpt\ncwd: /tmp\n---\nBody', personasDir),
+        () => createPersonaAndAgent(createDb, 'bad-agent', '---\ncwd: /tmp\n---\nBody', personasDir),
         /engine and cwd are required/,
       );
     });

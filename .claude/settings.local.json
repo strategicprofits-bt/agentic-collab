@@ -1,0 +1,11 @@
+{
+  "enabledMcpjsonServers": [
+    "gohighlevel",
+    "whop",
+    "google-analytics",
+    "n8n-admin",
+    "facebook-ads",
+    "sevalla",
+    "sevalla-readonly"
+  ]
+}

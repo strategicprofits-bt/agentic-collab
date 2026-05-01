@@ -24,9 +24,11 @@ let _handleMessageWithdrawn = () => {};
 let _handleQueueUpdate = () => {};
 let _patchAgentCard = () => {};
 
+let _onInit = () => {};
+
 export function setup({ renderAgents, renderThread, updatePageTitle, updateAgent,
                          addMessage, handleMessageWithdrawn, handleQueueUpdate,
-                         patchAgentCard }) {
+                         patchAgentCard, onInit }) {
   _renderAgents = renderAgents;
   _renderThread = renderThread;
   _updatePageTitle = updatePageTitle;
@@ -35,6 +37,7 @@ export function setup({ renderAgents, renderThread, updatePageTitle, updateAgent
   _handleMessageWithdrawn = handleMessageWithdrawn;
   _handleQueueUpdate = handleQueueUpdate;
   _patchAgentCard = patchAgentCard;
+  if (onInit) _onInit = onInit;
 }
 
 // ── Module-scoped connection state ──
@@ -144,6 +147,9 @@ export function connect() {
         state.accounts = data.accounts || [];
         state.engineConfigs = data.engineConfigs || [];
         state.indicators = data.indicators || {};
+        state.pages = data.pages || [];
+        state.stores = data.stores || [];
+        state.destinations = data.destinations || [];
         // Restore unread counts from server, preserving any live increments
         if (data.unreadCounts) {
           for (const [agent, count] of Object.entries(data.unreadCounts)) {
@@ -156,6 +162,12 @@ export function connect() {
         _renderAgents();
         _renderThread();
         _updatePageTitle();
+        _onInit();
+        break;
+      case 'agents_update':
+        state.agents = data.agents;
+        if (data.engineConfigs) state.engineConfigs = data.engineConfigs;
+        _renderAgents();
         break;
       case 'agent_update':
         _updateAgent(data.agent);
@@ -206,10 +218,31 @@ export function connect() {
       case 'engine_config_deleted':
         state.engineConfigs = state.engineConfigs.filter(c => c.name !== data.name);
         break;
+      case 'pages_update':
+        state.pages = data.pages || [];
+        { const sp = document.getElementById('settingsPanel');
+          if (sp && sp.style.display !== 'none' && sp.render) sp.render(); }
+        break;
+      case 'stores_update':
+        state.stores = data.stores || [];
+        break;
+      case 'destinations_update':
+        state.destinations = data.destinations || [];
+        { const sp = document.getElementById('settingsPanel');
+          if (sp && sp.style.display !== 'none' && sp.render) sp.render(); }
+        break;
       case 'reminder_update':
         if (state.threadView === 'reminders') {
           const rp = document.getElementById('reminderPanel');
           if (rp && rp.load && state.selected) rp.load(state.selected);
+        }
+        break;
+      case 'notification':
+        if (document.hidden && 'Notification' in window && Notification.permission === 'granted') {
+          const title = data.agent ? `[${data.agent}]` : 'Agentic Collab';
+          new Notification(title, { body: data.message, tag: 'collab-notify' });
+        } else if ('Notification' in window && Notification.permission === 'default') {
+          Notification.requestPermission();
         }
         break;
     }
@@ -239,4 +272,21 @@ export async function fetchEngineUsage() {
       _renderAgents();
     }
   } catch { /* ignore */ }
+}
+
+/**
+ * Trigger a fresh usage poll (may recycle tmux sessions).
+ * Shows loading state during the operation.
+ */
+export async function pollEngineUsage() {
+  const resp = await fetch('/api/engines/poll', {
+    method: 'POST',
+    headers: getToken() ? { 'Authorization': `Bearer ${getToken()}` } : {},
+  });
+  if (!resp.ok) throw new Error(`Poll failed: ${resp.status}`);
+  const data = await resp.json();
+  if (data.usage) {
+    state.engineUsage = data.usage;
+    _renderAgents();
+  }
 }

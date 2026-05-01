@@ -15,9 +15,12 @@
  */
 
 import { state, authHeaders, getToken } from '/dashboard/assets/state.ts';
+import { fetchEngineUsage, pollEngineUsage } from '/dashboard/assets/connection.ts';
 import { esc, renderMarkdown, timeAgo, showToast, promptInput } from '/dashboard/assets/utils.ts';
 import { agentAction, openCreateAgentModal } from '/dashboard/assets/agent-lifecycle.ts';
 import { icon } from '/dashboard/assets/icons.ts';
+import { pushUrlState } from '/dashboard/assets/url-state.ts';
+import { voiceState, stopVoice } from '/dashboard/assets/voice-palette.ts';
 
 // ── Dependencies injected via setup() ──
 let _renderThread = () => {};
@@ -71,7 +74,16 @@ export function updateAgent(agent) {
 
 export function addMessage(msg) {
   if (!state.threads[msg.agent]) state.threads[msg.agent] = [];
-  state.threads[msg.agent].push(msg);
+  const thread = state.threads[msg.agent];
+  // Dedup: if this message ID already exists (from HTTP fallback), skip.
+  // Also replace any optimistic message (negative ID) for the same content.
+  if (thread.some(m => m.id === msg.id)) return;
+  const optimisticIdx = thread.findIndex(m => m.id < 0 && m.message === msg.message && m.agent === msg.agent);
+  if (optimisticIdx >= 0) {
+    thread[optimisticIdx] = msg;
+    return; // DOM already has the optimistic render — WS dedup, no re-render needed
+  }
+  thread.push(msg);
   if (state.selected === msg.agent && state.threadView === 'messages') {
     // Append single message via component — no full re-render
     const messages = document.getElementById('threadMessages');
@@ -140,6 +152,9 @@ export function renderAgents() {
   document.querySelectorAll('.filter-chip').forEach(c => {
     c.classList.toggle('active', c.dataset.filter === state.quickFilter);
   });
+
+  // Toggle filtered class on agent list — disables drag handles via CSS
+  list.classList.toggle('filtered', isFiltered());
 
   // Group agents
   const groups = new Map();
@@ -271,7 +286,7 @@ export function renderAgents() {
     else if (a.state === 'idle') engineCounts[a.engine].idle++;
     else if (a.state === 'failed') engineCounts[a.engine].failed++;
   }
-  let engineHtml = '<div style="font-weight:600;margin-bottom:6px;color:var(--text)">Engines</div>';
+  let engineHtml = '<div style="font-weight:600;margin-bottom:6px;color:var(--text);display:flex;align-items:center;justify-content:space-between">Engines <button id="refreshUsageBtn" style="background:none;border:1px solid var(--border);border-radius:var(--radius);cursor:pointer;padding:2px 6px;font-size:11px;color:var(--text-dim)" title="Refresh usage stats">↻</button></div>';
   for (const engine of ['claude', 'codex', 'opencode']) {
     const c = engineCounts[engine];
     if (!c) {
@@ -310,6 +325,28 @@ export function renderAgents() {
   engineSummary.innerHTML = engineHtml;
   list.appendChild(engineSummary);
 
+  engineSummary.querySelector('#refreshUsageBtn')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    const originalText = btn.textContent;
+    btn.textContent = 'loading...';
+    btn.disabled = true;
+    btn.style.opacity = '0.6';
+    btn.style.cursor = 'wait';
+    state.engineUsage = {};
+    renderAgents();
+    try {
+      await pollEngineUsage();
+    } catch (err) {
+      console.error('[usage] poll failed:', err);
+      await fetchEngineUsage();
+    } finally {
+      btn.textContent = originalText;
+      btn.disabled = false;
+      btn.style.opacity = '';
+      btn.style.cursor = '';
+    }
+  });
+
   // Re-apply search/quick filter after full rebuild
   if (state.searchFilter || state.quickFilter) applySearchFilter();
 }
@@ -317,6 +354,10 @@ export function renderAgents() {
 // ── Select Agent ──
 
 export function selectAgent(name) {
+  // Stop voice recording if active to prevent state corruption
+  if (voiceState.recording) {
+    stopVoice();
+  }
   state.editingPersona = false;
   // Save draft for previous agent via component
   const prevInput = document.getElementById('threadInput');
@@ -346,6 +387,7 @@ export function selectAgent(name) {
   // Preserve current tab (messages/persona/watch) when switching agents
   renderAgents();
   _renderThread();
+  pushUrlState();
   // Restore draft and focus via component
   const freshInput = document.getElementById('threadInput');
   if (freshInput && freshInput.setDraft) {
@@ -461,6 +503,8 @@ function handleAgentListEvent(e) {
 }
 
 // ── Drag-Drop ──
+
+function isFiltered() { return !!(state.quickFilter || state.searchFilter); }
 
 let draggedAgent = null;
 let draggedGroup = null;
@@ -597,6 +641,7 @@ export function initAgentListEvents() {
   // ── Desktop Drag-Drop ──
 
   agentListEl.addEventListener('dragstart', (e) => {
+    if (isFiltered()) { e.preventDefault(); return; }
     const card = e.target.closest('.agent-card[data-agent]');
     const header = e.target.closest('.agent-group-header[data-group]');
     if (card) {
@@ -721,6 +766,7 @@ export function initAgentListEvents() {
   // ── Touch Drag (mobile) ──
 
   agentListEl.addEventListener('touchstart', (e) => {
+    if (isFiltered()) return;
     const handle = e.target.closest('.drag-handle');
     if (!handle) return;
     const card = handle.closest('.agent-card[data-agent]');
