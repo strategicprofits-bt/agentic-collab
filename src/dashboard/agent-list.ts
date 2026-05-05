@@ -127,26 +127,10 @@ export function renderAgents() {
   // Clear agent list (search and create form are outside the scroll container)
   list.innerHTML = '';
 
-  const filter = state.searchFilter.toLowerCase();
-  let filtered = filter
-    ? state.agents.filter(a => a.name.toLowerCase().includes(filter) || a.engine.toLowerCase().includes(filter) || a.state.toLowerCase().includes(filter) || (a.agentGroup || '').toLowerCase().includes(filter))
-    : state.agents;
-
-  // Apply quick filter chip
-  if (state.quickFilter === 'active') {
-    filtered = filtered.filter(a => a.state === 'active');
-  } else if (state.quickFilter === 'idle') {
-    filtered = filtered.filter(a => a.state === 'idle');
-  } else if (state.quickFilter === 'unread') {
-    filtered = filtered.filter(a => (state.unread[a.name] || 0) > 0);
-  } else if (state.quickFilter === 'recent') {
-    filtered = filtered.filter(a => a.lastActivity).sort((a, b) =>
-      new Date(b.lastActivity).getTime() - new Date(a.lastActivity).getTime()
-    ).slice(0, 7);
-  } else if (state.quickFilter === 'starred') {
-    const starred = JSON.parse(localStorage.getItem('starredAgents') || '{}');
-    filtered = filtered.filter(a => starred[a.name]);
-  }
+  // Always build ALL agents — applySearchFilter() handles visibility.
+  // Pre-filtering here would destroy cards that become unreachable when
+  // the search/filter changes without a full rebuild.
+  const filtered = state.agents;
 
   // Update chip active states
   document.querySelectorAll('.filter-chip').forEach(c => {
@@ -164,7 +148,7 @@ export function renderAgents() {
     groups.get(g).push(agent);
   }
   // Include empty groups created via "+ New Group" (only when no filter active)
-  if (state.emptyGroups && !state.quickFilter && !filter) {
+  if (state.emptyGroups && !state.quickFilter && !state.searchFilter) {
     for (const g of state.emptyGroups) {
       if (!groups.has(g)) groups.set(g, []);
     }
@@ -196,7 +180,7 @@ export function renderAgents() {
   for (const groupName of sortedGroups) {
     const groupAgents = groups.get(groupName);
     // Hide empty groups when a filter is active
-    if ((state.quickFilter || filter) && (!groupAgents || groupAgents.length === 0)) continue;
+    if ((state.quickFilter || state.searchFilter) && (!groupAgents || groupAgents.length === 0)) continue;
     const isCollapsed = collapsedGroups.includes(groupName);
     const showHeader = sortedGroups.length > 1 || groupName !== 'General';
     if (showHeader) {
@@ -249,7 +233,10 @@ export function renderAgents() {
   } // end group loop
 
   // Hide New Group button + Engine summary when filtering
-  if (state.quickFilter || filter) return;
+  if (state.quickFilter || state.searchFilter) {
+    applySearchFilter();
+    return;
+  }
 
   // New Group button
   const newGroupBtn = document.createElement('button');
@@ -593,6 +580,18 @@ export function applySearchFilter() {
   const cards = list.querySelectorAll('.agent-card[data-agent]');
   const groupCounts = new Map(); // groupHeader element → visible count
   const starred = JSON.parse(localStorage.getItem('starredAgents') || '{}');
+
+  // Build the "recent" top-7 set once if needed
+  let recentNames = null;
+  if (state.quickFilter === 'recent') {
+    recentNames = new Set(
+      state.agents.filter(a => a.lastActivity)
+        .sort((a, b) => new Date(b.lastActivity).getTime() - new Date(a.lastActivity).getTime())
+        .slice(0, 7)
+        .map(a => a.name)
+    );
+  }
+
   // First pass: show/hide cards
   for (const card of cards) {
     const name = card.dataset.agent;
@@ -608,7 +607,7 @@ export function applySearchFilter() {
       if (state.quickFilter === 'active') visible = agent && agent.state === 'active';
       else if (state.quickFilter === 'idle') visible = agent && agent.state === 'idle';
       else if (state.quickFilter === 'unread') visible = agent && (state.unread[agent.name] || 0) > 0;
-      else if (state.quickFilter === 'recent') visible = agent && !!agent.lastActivity;
+      else if (state.quickFilter === 'recent') visible = agent && recentNames.has(agent.name);
       else if (state.quickFilter === 'starred') visible = agent && !!starred[agent.name];
     }
     card.style.display = visible ? '' : 'none';
