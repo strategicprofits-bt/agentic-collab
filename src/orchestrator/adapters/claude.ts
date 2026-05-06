@@ -125,7 +125,7 @@ export class ClaudeAdapter implements EngineAdapter {
         const tokens = parseInt(tokenMatch[1]!.replace(/,/g, ''), 10);
         const maxTokens = 200_000; // Claude's context window
         const pct = Math.min(100, Math.round((tokens / maxTokens) * 100));
-        return { contextPct: pct, confident: true };
+        return { contextPct: pct, totalTokens: tokens, confident: true };
       }
     }
 

@@ -298,6 +298,19 @@ export class Database {
         archived_at TEXT
       )
     `);
+
+    // Create agent_token_snapshots table (per-agent token usage time series)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_token_snapshots (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_name  TEXT NOT NULL,
+        total_tokens INTEGER NOT NULL,
+        context_pct INTEGER,
+        captured_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      )
+    `);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_ats_agent_time ON agent_token_snapshots(agent_name, captured_at)`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_ats_time ON agent_token_snapshots(captured_at)`);
   }
 
   /** Expose raw handle for LockManager (shares same DB connection). */
@@ -1183,6 +1196,45 @@ export class Database {
   archiveOldCompleted(retentionDays = 7): number {
     const result = this.db.prepare(
       "UPDATE projects SET status = 'archived', archived_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE status = 'completed' AND completed_at IS NOT NULL AND completed_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)"
+    ).run(`-${retentionDays} days`);
+    return result.changes;
+  }
+
+  // ── Token Snapshots ──
+
+  recordTokenSnapshot(agentName: string, totalTokens: number, contextPct: number | null): void {
+    this.db.prepare(
+      'INSERT INTO agent_token_snapshots (agent_name, total_tokens, context_pct) VALUES (?, ?, ?)'
+    ).run(agentName, totalTokens, contextPct);
+  }
+
+  getTokenSnapshots(agentName: string, opts?: { since?: string; limit?: number }): Array<{
+    id: number; agentName: string; totalTokens: number; contextPct: number | null; capturedAt: string;
+  }> {
+    let sql = 'SELECT id, agent_name, total_tokens, context_pct, captured_at FROM agent_token_snapshots WHERE agent_name = ?';
+    const params: unknown[] = [agentName];
+    if (opts?.since) {
+      sql += ' AND captured_at >= ?';
+      params.push(opts.since);
+    }
+    sql += ' ORDER BY captured_at DESC';
+    if (opts?.limit) {
+      sql += ' LIMIT ?';
+      params.push(opts.limit);
+    }
+    const rows = this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+    return rows.map(r => ({
+      id: r['id'] as number,
+      agentName: r['agent_name'] as string,
+      totalTokens: r['total_tokens'] as number,
+      contextPct: r['context_pct'] as number | null,
+      capturedAt: r['captured_at'] as string,
+    }));
+  }
+
+  pruneTokenSnapshots(retentionDays = 7): number {
+    const result = this.db.prepare(
+      "DELETE FROM agent_token_snapshots WHERE captured_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)"
     ).run(`-${retentionDays} days`);
     return result.changes;
   }

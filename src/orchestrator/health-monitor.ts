@@ -117,6 +117,8 @@ export class HealthMonitor {
   /** Pending 2-minute watchdog timers for agents that transitioned to failed. */
   private readonly stateWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>();
   static readonly STATE_WATCHDOG_MS = 2 * 60 * 1000; // 2 minutes
+  /** Last recorded total token count per agent — used to skip duplicate snapshots. */
+  private readonly lastTokenCount = new Map<string, number>();
 
   constructor(opts: HealthMonitorOptions) {
     this.db = opts.db;
@@ -503,6 +505,7 @@ export class HealthMonitor {
    */
   private recordContextPercent(agent: AgentRecord, paneOutput: string): void {
     let contextPct: number | null = null;
+    let totalTokens: number | undefined;
 
     // Try engine config contextPattern first
     const detection = this.getDetection(agent);
@@ -519,6 +522,7 @@ export class HealthMonitor {
           if (match[0].includes('%')) {
             contextPct = Math.min(100, rawValue);
           } else {
+            totalTokens = rawValue;
             contextPct = Math.min(100, Math.round((rawValue / 200_000) * 100));
           }
           break;
@@ -531,9 +535,19 @@ export class HealthMonitor {
       const adapter = getAdapter(agent.engine);
       const contextResult = adapter.parseContextPercent(paneOutput);
       contextPct = contextResult.contextPct;
+      totalTokens = contextResult.totalTokens;
     }
 
     if (contextPct === null) return;
+
+    // Record token snapshot for usage time series (skip duplicates — only record when count changes)
+    if (totalTokens !== undefined) {
+      const lastCount = this.lastTokenCount.get(agent.name);
+      if (lastCount !== totalTokens) {
+        this.lastTokenCount.set(agent.name, totalTokens);
+        try { this.db.recordTokenSnapshot(agent.name, totalTokens, contextPct); } catch { /* non-critical */ }
+      }
+    }
 
     // Re-read the agent to avoid stale version conflicts from the poll snapshot
     const latest = this.db.getAgent(agent.name);

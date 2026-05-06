@@ -1053,4 +1053,54 @@ describe('Database', () => {
       assert.equal(after.status, 'completed');
     });
   });
+
+  describe('token snapshots', () => {
+    let tsDb: Database;
+    let tsTmpDir: string;
+
+    before(() => {
+      tsTmpDir = mkdtempSync(join(tmpdir(), 'agentic-collab-ts-test-'));
+      tsDb = new Database(join(tsTmpDir, 'test.db'));
+      tsDb.createAgent({ name: 'test-agent', engine: 'claude', cwd: '/tmp' });
+    });
+
+    after(() => {
+      tsDb.close();
+      rmSync(tsTmpDir, { recursive: true, force: true });
+    });
+
+    it('records and retrieves token snapshots', () => {
+      tsDb.recordTokenSnapshot('test-agent', 10000, 5);
+      tsDb.recordTokenSnapshot('test-agent', 25000, 13);
+      const snaps = tsDb.getTokenSnapshots('test-agent');
+      assert.equal(snaps.length, 2);
+      assert.equal(snaps[0].totalTokens, 25000);
+      assert.equal(snaps[1].totalTokens, 10000);
+    });
+
+    it('filters snapshots by since parameter', () => {
+      const all = tsDb.getTokenSnapshots('test-agent');
+      assert.ok(all.length >= 2);
+      const future = tsDb.getTokenSnapshots('test-agent', { since: '2099-01-01T00:00:00Z' });
+      assert.equal(future.length, 0);
+    });
+
+    it('respects limit parameter', () => {
+      const limited = tsDb.getTokenSnapshots('test-agent', { limit: 1 });
+      assert.equal(limited.length, 1);
+    });
+
+    it('returns empty array for unknown agent', () => {
+      const snaps = tsDb.getTokenSnapshots('nonexistent');
+      assert.equal(snaps.length, 0);
+    });
+
+    it('prunes old snapshots', () => {
+      tsDb.rawDb.prepare(
+        "INSERT INTO agent_token_snapshots (agent_name, total_tokens, context_pct, captured_at) VALUES (?, ?, ?, '2020-01-01T00:00:00Z')"
+      ).run('test-agent', 1000, 1);
+      const pruned = tsDb.pruneTokenSnapshots(7);
+      assert.ok(pruned >= 1);
+    });
+  });
 });

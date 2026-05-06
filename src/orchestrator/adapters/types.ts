@@ -10,6 +10,7 @@ export const SPINNER_REGEX = /^⠋|^⠙|^⠹|^⠸|^⠼|^⠴|^⠦|^⠧|^⠇|^⠏/
 
 export type ContextResult = {
   contextPct: number | null;
+  totalTokens?: number;
   confident: boolean;
 };
 
