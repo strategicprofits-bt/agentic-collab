@@ -109,6 +109,14 @@ export class HealthMonitor {
   /** Timestamp when an agent was healed — used to suppress stale exit-message
    *  re-detection during the grace period after healing. */
   private readonly healedAt = new Map<string, number>();
+  /** Agents for which a session-death alert has already been fired (prevents duplicates). */
+  private readonly sessionDeathAlerted = new Set<string>();
+  /** Liveness sweep timer — periodic audit of all agent states. */
+  private livenessSweepTimer: ReturnType<typeof setInterval> | null = null;
+  static readonly LIVENESS_SWEEP_MS = 10 * 60 * 1000; // 10 minutes
+  /** Pending 2-minute watchdog timers for agents that transitioned to failed. */
+  private readonly stateWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  static readonly STATE_WATCHDOG_MS = 2 * 60 * 1000; // 2 minutes
 
   constructor(opts: HealthMonitorOptions) {
     this.db = opts.db;
@@ -258,7 +266,7 @@ export class HealthMonitor {
 
   start(): void {
     if (this.timer) return;
-    console.log(`[health] Starting monitor (poll every ${this.pollIntervalMs}ms, fast-poll every ${HealthMonitor.FAST_POLL_MS}ms for active agents)`);
+    console.log(`[health] Starting monitor (poll every ${this.pollIntervalMs}ms, fast-poll every ${HealthMonitor.FAST_POLL_MS}ms for active agents, liveness sweep every ${HealthMonitor.LIVENESS_SWEEP_MS / 1000}s)`);
     this.timer = setInterval(() => {
       this.pollAll().catch((err) => {
         console.error('[health] Poll error:', err);
@@ -269,12 +277,19 @@ export class HealthMonitor {
         console.error('[health] Fast poll error:', err);
       });
     }, HealthMonitor.FAST_POLL_MS);
+    this.livenessSweepTimer = setInterval(() => {
+      this.livenessSweep();
+    }, HealthMonitor.LIVENESS_SWEEP_MS);
   }
 
   stop(): void {
     if (this.fastTimer) {
       clearInterval(this.fastTimer);
       this.fastTimer = null;
+    }
+    if (this.livenessSweepTimer) {
+      clearInterval(this.livenessSweepTimer);
+      this.livenessSweepTimer = null;
     }
     if (this.timer) {
       clearInterval(this.timer);
@@ -285,6 +300,10 @@ export class HealthMonitor {
       clearTimeout(timer);
     }
     this.quickPollTimers.clear();
+    for (const timer of this.stateWatchdogTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.stateWatchdogTimers.clear();
   }
 
   /**
@@ -464,6 +483,9 @@ export class HealthMonitor {
           consecutiveFailures: failures,
         });
         this.emitSystemMessage(agent.name, `Failed — health check failed ${failures}x`);
+        const failReason = `Health check failed ${failures}x: ${captureResult.error}`;
+        this.fireSessionDeathAlert(agent.name, failReason);
+        this.scheduleStateWatchdog(agent.name, failReason);
         this.onAgentUpdate(agent.name);
         this.consecutiveFailures.delete(agent.name);
       }
@@ -656,6 +678,8 @@ export class HealthMonitor {
     });
     this.db.logEvent(agent.name, 'cli_exit_detected', undefined, { reason, lastLine });
     this.emitSystemMessage(agent.name, `Failed — ${reason}`);
+    this.fireSessionDeathAlert(agent.name, reason);
+    this.scheduleStateWatchdog(agent.name, reason);
     this.onAgentUpdate(agent.name);
     this.cleanupAgent(agent.name);
     return true;
@@ -776,6 +800,8 @@ export class HealthMonitor {
       lastLine,
     });
     this.emitSystemMessage(agent.name, 'Healed — CLI detected alive');
+    this.sessionDeathAlerted.delete(agent.name);
+    this.cancelStateWatchdog(agent.name);
     this.onAgentUpdate(agent.name);
     return true;
   }
@@ -795,8 +821,9 @@ export class HealthMonitor {
     this.activeIndicators.delete(name);
     this.compiledIndicators.delete(name);
     this.lastPermissionAlert.delete(name);
-    // Note: failureSnapshot intentionally NOT deleted here — it's needed
-    // by detectCliHealed() after the agent transitions to failed state.
+    // Note: failureSnapshot and sessionDeathAlerted intentionally NOT deleted
+    // here — they're needed by detectCliHealed() / livenessSweep() after the
+    // agent transitions to failed state.
   }
 
   private checkIdleSuspendTimeout(agentName: string): void {
@@ -1014,6 +1041,82 @@ export class HealthMonitor {
     this.activeIndicators.set(agent.name, active);
     if (fingerprint(prev) !== fingerprint(active)) {
       this.onIndicatorUpdate(agent.name, active);
+    }
+  }
+
+  /**
+   * Alert SydneyAdamu (sev3 monitoring) and CoachBeard (roster) when an agent session dies.
+   * Deduplicates: only fires once per agent until healed.
+   */
+  private fireSessionDeathAlert(agentName: string, reason: string): void {
+    if (this.sessionDeathAlerted.has(agentName)) return;
+    this.sessionDeathAlerted.add(agentName);
+
+    const body = `${agentName} session died: ${reason.slice(0, 200)}`;
+    const targets = ['SydneyAdamu', 'CoachBeard'];
+    for (const target of targets) {
+      const envelope = `[from: system, reply with collab send system --topic session-death-alert]: '${body.replace(/'/g, "\\'")}'`;
+      const pending = this.db.enqueueMessage({
+        sourceAgent: null,
+        targetAgent: target,
+        envelope,
+      });
+      this.onQueueUpdate(pending);
+      this.onMessageEnqueued(target);
+    }
+    this.db.logEvent(agentName, 'session_death_alert_sent', undefined, {
+      targets: targets.join(','),
+      reason: reason.slice(0, 200),
+    });
+  }
+
+  /**
+   * Schedule a 2-minute watchdog: if the agent is still failed after 2 minutes,
+   * escalate to DrRobby for operator intervention.
+   */
+  private scheduleStateWatchdog(agentName: string, reason: string): void {
+    this.cancelStateWatchdog(agentName);
+    const timer = setTimeout(() => {
+      this.stateWatchdogTimers.delete(agentName);
+      const agent = this.db.getAgent(agentName);
+      if (!agent || agent.state !== 'failed') return;
+
+      console.warn(`[health] ${agentName}: still failed after 2min watchdog — escalating`);
+      const body = `⚠️ ${agentName} still failed after 2 minutes (no auto-recovery). Reason: ${reason.slice(0, 150)}. Needs operator intervention.`;
+      const envelope = `[from: system, reply with collab send system --topic session-death-escalation]: '${body.replace(/'/g, "\\'")}'`;
+      const pending = this.db.enqueueMessage({
+        sourceAgent: null,
+        targetAgent: 'DrRobby',
+        envelope,
+      });
+      this.onQueueUpdate(pending);
+      this.onMessageEnqueued('DrRobby');
+      this.db.logEvent(agentName, 'session_death_escalated', undefined, { reason: reason.slice(0, 200) });
+    }, HealthMonitor.STATE_WATCHDOG_MS);
+    this.stateWatchdogTimers.set(agentName, timer);
+  }
+
+  private cancelStateWatchdog(agentName: string): void {
+    const timer = this.stateWatchdogTimers.get(agentName);
+    if (timer) {
+      clearTimeout(timer);
+      this.stateWatchdogTimers.delete(agentName);
+    }
+  }
+
+  /**
+   * Liveness sweep: every 10 minutes, audit all agents and alert for any
+   * in failed state that haven't been alerted yet (catches detection gaps).
+   */
+  private livenessSweep(): void {
+    const agents = this.db.listAgents();
+    for (const agent of agents) {
+      if (agent.state === 'failed' && !this.sessionDeathAlerted.has(agent.name)) {
+        const reason = agent.failureReason ?? 'unknown (detected by liveness sweep)';
+        console.warn(`[health] Liveness sweep: ${agent.name} is failed but no alert was sent — firing now`);
+        this.fireSessionDeathAlert(agent.name, reason);
+        this.scheduleStateWatchdog(agent.name, reason);
+      }
     }
   }
 
