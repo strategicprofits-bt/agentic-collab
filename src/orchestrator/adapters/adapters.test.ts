@@ -221,18 +221,27 @@ describe('Engine Adapters', () => {
     it('parses context percent from token count format', () => {
       const result = adapter.parseContextPercent('some output\n                                                                  15048 tokens');
       assert.equal(result.contextPct, 8); // 15048/200000 ≈ 7.5% rounds to 8%
+      assert.equal(result.totalTokens, 15048);
       assert.equal(result.confident, true);
     });
 
     it('parses context percent from large token count', () => {
       const result = adapter.parseContextPercent('  160000 tokens');
       assert.equal(result.contextPct, 80);
+      assert.equal(result.totalTokens, 160000);
+      assert.equal(result.confident, true);
+    });
+
+    it('returns totalTokens with comma-formatted counts', () => {
+      const result = adapter.parseContextPercent('  ⏵⏵ bypass permissions on                     155,377 tokens');
+      assert.equal(result.totalTokens, 155377);
       assert.equal(result.confident, true);
     });
 
     it('returns null context for no match', () => {
       const result = adapter.parseContextPercent('no context info here');
       assert.equal(result.contextPct, null);
+      assert.equal(result.totalTokens, undefined);
       assert.equal(result.confident, false);
     });
   });
