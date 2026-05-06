@@ -68,9 +68,33 @@ export function listSessions(): string[] {
  * Optionally press Enter after pasting.
  */
 // Delay between paste and Enter: 1ms per character (terminal ingestion rate),
-// with a 500ms floor so short messages still get a comfortable flush window.
+// with a 1500ms floor. The Claude Code 2.x Ink-based TUI briefly drops input
+// while finalizing a prior response ("Cooked for Ns" / "Crunched for Ns"
+// transition) and the previous 500ms floor lost the Enter under that state.
+// Bumping the floor and adding a verified retry below catches both cases.
 function pasteEnterDelay(textLength: number): number {
-  return Math.max(500, textLength);
+  return Math.max(1500, textLength);
+}
+
+// Detect "input prompt has un-submitted text". Last lines look like
+// "❯ <something>" when our Enter was eaten; an empty input prompt is "❯ "
+// with nothing after.
+function inputStillHasUnsubmittedText(sessionName: string): boolean {
+  try {
+    const pane = execSync(`tmux capture-pane -t '${esc(sessionName)}' -p -S -8`, EXEC_OPTS) as string;
+    const lines = pane.split('\n').reverse();
+    for (const raw of lines) {
+      const line = raw.replace(/\s+$/, '');
+      if (!line) continue;
+      const m = line.match(/^[❯>]\s+(.+)$/);
+      if (m && m[1].trim().length > 0) return true;
+      // First non-empty, non-prompt-related line ends the scan
+      if (!line.startsWith('❯') && !line.startsWith('>') && !line.startsWith('─') && !line.startsWith('⏵')) return false;
+    }
+  } catch {
+    /* capture failed — be conservative and don't retry */
+  }
+  return false;
 }
 
 export async function pasteText(sessionName: string, text: string, pressEnter: boolean): Promise<void> {
@@ -88,6 +112,14 @@ export async function pasteText(sessionName: string, text: string, pressEnter: b
   if (pressEnter) {
     await new Promise<void>((r) => setTimeout(r, pasteEnterDelay(text.length)));
     exec(`tmux send-keys -t '${esc(sessionName)}' Enter`);
+
+    // Verify the input cleared. If text still sits in the prompt after 800ms,
+    // the TUI was busy and the Enter was eaten — retry up to 2 times.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await new Promise<void>((r) => setTimeout(r, 800));
+      if (!inputStillHasUnsubmittedText(sessionName)) return;
+      exec(`tmux send-keys -t '${esc(sessionName)}' Enter`);
+    }
   }
 }
 
