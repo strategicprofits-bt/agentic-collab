@@ -665,7 +665,7 @@ route('GET', '/api/agents/:name/usage', async (req, res, match, ctx) => {
 
   const url = new URL(req.url!, `http://${req.headers.host}`);
   const since = url.searchParams.get('since') ?? undefined;
-  const limit = parseInt(url.searchParams.get('limit') ?? '500', 10);
+  const limit = parseInt(url.searchParams.get('limit') ?? '500', 10) || 500;
 
   const snapshots = ctx.db.getTokenSnapshots(name, { since, limit: Math.min(limit, 5000) });
 
