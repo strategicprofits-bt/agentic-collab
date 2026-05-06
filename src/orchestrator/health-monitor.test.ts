@@ -1,4 +1,4 @@
-import { describe, it, before, after, beforeEach } from 'node:test';
+import { describe, it, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -14,6 +14,7 @@ describe('HealthMonitor', () => {
   let tmpDir: string;
   let proxyCommands: ProxyCommand[];
   let captureOutput: string;
+  const monitors: HealthMonitor[] = [];
 
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'health-test-'));
@@ -31,6 +32,11 @@ describe('HealthMonitor', () => {
     captureOutput = '> \n';
   });
 
+  afterEach(() => {
+    for (const m of monitors) m.stop();
+    monitors.length = 0;
+  });
+
   function makeMonitor(overrides?: Partial<ConstructorParameters<typeof HealthMonitor>[0]>): HealthMonitor {
     const dispatch = overrides?.proxyDispatch ?? (async (_proxyId: string, command: ProxyCommand): Promise<ProxyResponse> => {
       proxyCommands.push(command);
@@ -45,7 +51,7 @@ describe('HealthMonitor', () => {
 
     const locks = new LockManager(db.rawDb);
 
-    return new HealthMonitor({
+    const monitor = new HealthMonitor({
       db,
       locks,
       proxyDispatch: dispatch,
@@ -53,6 +59,8 @@ describe('HealthMonitor', () => {
       pollIntervalMs: 100,
       ...overrides,
     });
+    monitors.push(monitor);
+    return monitor;
   }
 
   /** Ensure an agent is in active state for testing. */
@@ -149,14 +157,7 @@ describe('HealthMonitor', () => {
     });
 
     const failDispatch = async () => ({ ok: false as const, error: 'Session not found' });
-    const failLocks = new LockManager(db.rawDb);
-    const failMonitor = new HealthMonitor({
-      db,
-      locks: failLocks,
-      proxyDispatch: failDispatch,
-      orchestratorHost: 'http://localhost:3000',
-      pollIntervalMs: 100,
-    });
+    const failMonitor = makeMonitor({ proxyDispatch: failDispatch });
 
     // Requires 3 consecutive failures before marking as failed
     await failMonitor.pollAll();
@@ -197,13 +198,8 @@ describe('HealthMonitor', () => {
 
     const updates: string[] = [];
     const cbFailDispatch = async () => ({ ok: false as const, error: 'Session not found' });
-    const cbFailLocks = new LockManager(db.rawDb);
-    const failMonitor = new HealthMonitor({
-      db,
-      locks: cbFailLocks,
+    const failMonitor = makeMonitor({
       proxyDispatch: cbFailDispatch,
-      orchestratorHost: 'http://localhost:3000',
-      pollIntervalMs: 100,
       onAgentUpdate: (name) => updates.push(name),
     });
 
@@ -494,12 +490,7 @@ describe('HealthMonitor', () => {
       return { ok: true };
     };
 
-    const healLocks = new LockManager(db.rawDb);
-    const healMonitor = new HealthMonitor({
-      db, locks: healLocks, proxyDispatch: healDispatch,
-      orchestratorHost: 'http://localhost:3000',
-      pollIntervalMs: 100,
-    });
+    const healMonitor = makeMonitor({ proxyDispatch: healDispatch });
 
     // First poll establishes baseline
     await healMonitor.pollAll();
@@ -853,6 +844,7 @@ describe('HealthMonitor indicators', () => {
   let tmpDir: string;
   let captureOutput: string;
   let indicatorUpdates: Array<{ agentName: string; indicators: unknown[] }>;
+  const indMonitors: HealthMonitor[] = [];
 
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'health-ind-'));
@@ -870,6 +862,11 @@ describe('HealthMonitor indicators', () => {
     indicatorUpdates = [];
   });
 
+  afterEach(() => {
+    for (const m of indMonitors) m.stop();
+    indMonitors.length = 0;
+  });
+
   function makeMonitorWithIndicators(): HealthMonitor {
     const dispatch = async (_proxyId: string, command: ProxyCommand): Promise<ProxyResponse> => {
       if (command.action === 'capture') {
@@ -883,7 +880,7 @@ describe('HealthMonitor indicators', () => {
 
     const locks = new LockManager(db.rawDb);
 
-    return new HealthMonitor({
+    const monitor = new HealthMonitor({
       db,
       locks,
       proxyDispatch: dispatch,
@@ -893,6 +890,8 @@ describe('HealthMonitor indicators', () => {
         indicatorUpdates.push({ agentName, indicators });
       },
     });
+    indMonitors.push(monitor);
+    return monitor;
   }
 
   it('evaluates indicators against pane output', async () => {

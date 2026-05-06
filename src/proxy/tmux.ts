@@ -68,9 +68,58 @@ export function listSessions(): string[] {
  * Optionally press Enter after pasting.
  */
 // Delay between paste and Enter: 1ms per character (terminal ingestion rate),
-// with a 500ms floor so short messages still get a comfortable flush window.
+// with a 1500ms floor. The Claude Code 2.x Ink-based TUI briefly drops input
+// while finalizing a prior response ("Cooked for Ns" / "Crunched for Ns"
+// transition) and the previous 500ms floor lost the Enter under that state.
+// Bumping the floor and adding a verified retry below catches both cases.
 function pasteEnterDelay(textLength: number): number {
-  return Math.max(500, textLength);
+  return Math.max(1500, textLength);
+}
+
+// Detect "input prompt has un-submitted text". Last lines look like
+// "❯ <something>" when our Enter was eaten; an empty input prompt is "❯ "
+// with nothing after.
+function inputStillHasUnsubmittedText(sessionName: string): boolean {
+  try {
+    const pane = execSync(`tmux capture-pane -t '${esc(sessionName)}' -p -S -8`, EXEC_OPTS) as string;
+    const lines = pane.split('\n').reverse();
+    for (const raw of lines) {
+      const line = raw.replace(/\s+$/, '');
+      if (!line) continue;
+      const m = line.match(/^[❯>]\s+(.+)$/);
+      if (m && m[1].trim().length > 0) return true;
+      // First non-empty, non-prompt-related line ends the scan
+      if (!line.startsWith('❯') && !line.startsWith('>') && !line.startsWith('─') && !line.startsWith('⏵')) return false;
+    }
+  } catch {
+    /* capture failed — be conservative and don't retry */
+  }
+  return false;
+}
+
+// Dismiss any blocking modal Claude TUI shows (currently: feedback survey,
+// trust dialog). These steal all keystrokes, so a paste lands in the prompt
+// but Enter does nothing. Returns true if a modal was found and dismissed.
+function dismissBlockingModal(sessionName: string): boolean {
+  try {
+    const pane = execSync(`tmux capture-pane -t '${esc(sessionName)}' -p -S -25`, EXEC_OPTS) as string;
+    // "How is Claude doing this session? (optional)" — feedback survey.
+    // Keys: 1 Bad, 2 Fine, 3 Good, 0 Dismiss. Send "0".
+    if (/How is Claude doing this session/.test(pane) && /0:\s*Dismiss/.test(pane)) {
+      execSync(`tmux send-keys -t '${esc(sessionName)}' '0'`, EXEC_OPTS);
+      return true;
+    }
+    // Trust dialog ("Is this a project you trust?"). Default cursor on
+    // "No, exit" — send Up + Enter to choose Yes. We pre-trust folders in
+    // ~/.claude.json so this should rarely fire, but defensive.
+    if (/Is this a project you (created or one you )?trust/.test(pane)) {
+      execSync(`tmux send-keys -t '${esc(sessionName)}' Up Enter`, EXEC_OPTS);
+      return true;
+    }
+  } catch {
+    /* capture failed — give up silently */
+  }
+  return false;
 }
 
 export async function pasteText(sessionName: string, text: string, pressEnter: boolean): Promise<void> {
@@ -81,6 +130,14 @@ export async function pasteText(sessionName: string, text: string, pressEnter: b
   } catch {
     throw new Error(`tmux session "${sessionName}" is not responsive (capture-pane timed out)`);
   }
+
+  // If a blocking modal is up (feedback survey, trust dialog), dismiss it
+  // first — otherwise the modal eats every keystroke and the paste/Enter
+  // both go nowhere visible.
+  if (dismissBlockingModal(sessionName)) {
+    await new Promise<void>((r) => setTimeout(r, 500));
+  }
+
   // Pass text via stdin (input option) to avoid all shell escaping issues
   execSync('tmux load-buffer -', { ...EXEC_OPTS, input: text });
   exec(`tmux paste-buffer -t '${esc(sessionName)}'`);
@@ -88,6 +145,18 @@ export async function pasteText(sessionName: string, text: string, pressEnter: b
   if (pressEnter) {
     await new Promise<void>((r) => setTimeout(r, pasteEnterDelay(text.length)));
     exec(`tmux send-keys -t '${esc(sessionName)}' Enter`);
+
+    // Verify the input cleared. If text still sits in the prompt after 800ms,
+    // the TUI was busy and the Enter was eaten — retry up to 2 times. If a
+    // modal popped up between paste and Enter, dismiss + retry.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await new Promise<void>((r) => setTimeout(r, 800));
+      if (!inputStillHasUnsubmittedText(sessionName)) return;
+      if (dismissBlockingModal(sessionName)) {
+        await new Promise<void>((r) => setTimeout(r, 400));
+      }
+      exec(`tmux send-keys -t '${esc(sessionName)}' Enter`);
+    }
   }
 }
 
