@@ -10,3 +10,9 @@ src/test/ui/snapshots/
 .DS_Store
 *.log
 .build-version
+
+# Doppler-token-named dirs from misconfigured env vars
+dp.st.*
+
+# Agent scratch dir — work belongs in agent-team/data, not agentic-collab/
+data/
