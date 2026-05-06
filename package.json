@@ -14,5 +14,8 @@
     "test:watch": "node --test --watch 'src/**/*.test.ts'",
     "typecheck": "tsc --noEmit",
     "screenshot": "node scripts/capture-screenshots.ts"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
   }
 }
