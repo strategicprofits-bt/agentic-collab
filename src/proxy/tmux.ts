@@ -146,11 +146,13 @@ export async function pasteText(sessionName: string, text: string, pressEnter: b
     await new Promise<void>((r) => setTimeout(r, pasteEnterDelay(text.length)));
     exec(`tmux send-keys -t '${esc(sessionName)}' Enter`);
 
-    // Verify the input cleared. If text still sits in the prompt after 800ms,
-    // the TUI was busy and the Enter was eaten — retry up to 2 times. If a
-    // modal popped up between paste and Enter, dismiss + retry.
-    for (let attempt = 0; attempt < 2; attempt++) {
-      await new Promise<void>((r) => setTimeout(r, 800));
+    // Verify the input cleared. If text still sits in the prompt, retry up
+    // to 5 times with progressively longer delays. The Claude Code 2.x TUI
+    // can take several seconds to transition out of "Cooked"/"Crunched"
+    // states. Total retry window: ~10s before we hand off to the watchdog.
+    const retryDelays = [800, 1200, 1500, 2000, 2500];
+    for (const delay of retryDelays) {
+      await new Promise<void>((r) => setTimeout(r, delay));
       if (!inputStillHasUnsubmittedText(sessionName)) return;
       if (dismissBlockingModal(sessionName)) {
         await new Promise<void>((r) => setTimeout(r, 400));
