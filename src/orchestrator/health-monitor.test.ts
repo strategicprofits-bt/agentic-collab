@@ -783,6 +783,150 @@ describe('HealthMonitor', () => {
     const healEvent = events.find(e => e.event === 'cli_healed');
     assert.ok(healEvent, 'should log cli_healed event');
   });
+
+  it('auto-suspends idle agent after timeout with no messages or reminders', async () => {
+    const name = 'health-autosuspend';
+    db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent(name)!;
+    db.updateAgentState(name, 'active', a.version, {
+      tmuxSession: `agent-${name}`,
+      proxyId: 'p1',
+    });
+
+    captureOutput = 'idle prompt\n> \n';
+    const suspendCalls: string[] = [];
+
+    const monitor = makeMonitor({
+      idleSuspendMs: 50,
+      proxyDispatch: async (_proxyId: string, command: ProxyCommand): Promise<ProxyResponse> => {
+        proxyCommands.push(command);
+        if (command.action === 'capture') return { ok: true, data: captureOutput };
+        if (command.action === 'has_session') return { ok: true, data: true };
+        if (command.action === 'paste') {
+          suspendCalls.push(('text' in command && command.text) as string ?? 'paste');
+        }
+        if (command.action === 'pane_activity') return { ok: true, data: 1 };
+        return { ok: true };
+      },
+    });
+
+    // First poll: baseline snapshot
+    await monitor.pollAll();
+    // Second poll: screen unchanged → idle
+    await monitor.pollAll();
+
+    const afterIdle = db.getAgent(name);
+    assert.equal(afterIdle?.state, 'idle', 'should be idle after 2 unchanged polls');
+
+    // Set lastActivity far in the past to trigger timeout
+    db.updateAgentState(name, 'idle', afterIdle!.version, {
+      lastActivity: new Date(Date.now() - 10_000).toISOString(),
+    });
+
+    // Third poll: should trigger auto-suspend
+    await monitor.pollAll();
+    // Give the async suspendAgent a tick to start
+    await new Promise(r => setTimeout(r, 200));
+
+    const afterSuspend = db.getAgent(name);
+    // Should be suspending or suspended (depending on timing)
+    assert.ok(
+      afterSuspend?.state === 'suspending' || afterSuspend?.state === 'suspended',
+      `expected suspending/suspended, got ${afterSuspend?.state}`,
+    );
+
+    const events = db.getEvents(name, 10);
+    assert.ok(events.some(e => e.event === 'auto_suspend'), 'should log auto_suspend event');
+    monitor.stop();
+  });
+
+  it('does not auto-suspend agent with pending messages', async () => {
+    const name = 'health-nosuspend-msg';
+    db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent(name)!;
+    db.updateAgentState(name, 'active', a.version, {
+      tmuxSession: `agent-${name}`,
+      proxyId: 'p1',
+    });
+
+    captureOutput = 'idle prompt\n> \n';
+    const monitor = makeMonitor({
+      idleSuspendMs: 50,
+      proxyDispatch: async (_proxyId: string, command: ProxyCommand): Promise<ProxyResponse> => {
+        proxyCommands.push(command);
+        if (command.action === 'capture') return { ok: true, data: captureOutput };
+        if (command.action === 'has_session') return { ok: true, data: true };
+        if (command.action === 'pane_activity') return { ok: true, data: 1 };
+        return { ok: true };
+      },
+    });
+
+    // Poll twice to reach idle via screen-diff
+    await monitor.pollAll();
+    await monitor.pollAll();
+    const idled = db.getAgent(name);
+    assert.equal(idled?.state, 'idle', 'should be idle after 2 unchanged polls');
+
+    // Set lastActivity far in the past to trigger timeout
+    db.updateAgentState(name, 'idle', idled!.version, {
+      lastActivity: new Date(Date.now() - 10_000).toISOString(),
+    });
+
+    // Enqueue a message so hasPendingMessages returns true
+    db.enqueueMessage({ sourceAgent: null, targetAgent: name, envelope: 'test message' });
+
+    // Poll again — should NOT auto-suspend due to pending message
+    await monitor.pollAll();
+    await new Promise(r => setTimeout(r, 200));
+
+    const after = db.getAgent(name);
+    assert.equal(after?.state, 'idle', 'should remain idle when messages pending');
+    monitor.stop();
+  });
+
+  it('does not auto-suspend agent with active reminders', async () => {
+    const name = 'health-nosuspend-rem';
+    db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent(name)!;
+    db.updateAgentState(name, 'active', a.version, {
+      tmuxSession: `agent-${name}`,
+      proxyId: 'p1',
+    });
+
+    captureOutput = 'idle prompt\n> \n';
+    const monitor = makeMonitor({
+      idleSuspendMs: 50,
+      proxyDispatch: async (_proxyId: string, command: ProxyCommand): Promise<ProxyResponse> => {
+        proxyCommands.push(command);
+        if (command.action === 'capture') return { ok: true, data: captureOutput };
+        if (command.action === 'has_session') return { ok: true, data: true };
+        if (command.action === 'pane_activity') return { ok: true, data: 1 };
+        return { ok: true };
+      },
+    });
+
+    // Poll twice to reach idle via screen-diff
+    await monitor.pollAll();
+    await monitor.pollAll();
+    const idled = db.getAgent(name);
+    assert.equal(idled?.state, 'idle', 'should be idle after 2 unchanged polls');
+
+    // Set lastActivity far in the past to trigger timeout
+    db.updateAgentState(name, 'idle', idled!.version, {
+      lastActivity: new Date(Date.now() - 10_000).toISOString(),
+    });
+
+    // Create an active reminder
+    db.createReminder({ agentName: name, prompt: 'check something', cadenceMinutes: 10 });
+
+    // Poll again — should NOT auto-suspend due to active reminder
+    await monitor.pollAll();
+    await new Promise(r => setTimeout(r, 200));
+
+    const after = db.getAgent(name);
+    assert.equal(after?.state, 'idle', 'should remain idle when reminders active');
+    monitor.stop();
+  });
 });
 
 describe('HealthMonitor.stripAnsi', () => {

@@ -860,6 +860,13 @@ export class Database {
     return result.changes > 0;
   }
 
+  hasActiveReminders(agentName: string): boolean {
+    const row = this.db.prepare(
+      "SELECT 1 FROM reminders WHERE agent_name = ? AND status = 'pending' LIMIT 1"
+    ).get(agentName);
+    return row !== undefined;
+  }
+
   swapReminderOrder(id1: number, id2: number): boolean {
     const r1 = this.getReminder(id1);
     const r2 = this.getReminder(id2);
