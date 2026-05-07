@@ -20,7 +20,7 @@ import type { LockManager } from '../shared/lock.ts';
 import type { ProxyCommand, ProxyResponse, AgentRecord, PendingMessage, DashboardMessage, IndicatorDefinition, ActiveIndicator, PipelineStep, DetectionConfig } from '../shared/types.ts';
 import { sessionName, canSuspend } from '../shared/agent-entity.ts';
 import { getAdapter } from './adapters/index.ts';
-import { reloadAgent, recoverAgent, type LifecycleContext } from './lifecycle.ts';
+import { reloadAgent, recoverAgent, suspendAgent, type LifecycleContext } from './lifecycle.ts';
 import { resolveEffectiveConfig } from './engine-config-resolver.ts';
 
 type CompiledDetection = {
@@ -117,6 +117,8 @@ export class HealthMonitor {
   /** Pending 2-minute watchdog timers for agents that transitioned to failed. */
   private readonly stateWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>();
   static readonly STATE_WATCHDOG_MS = 2 * 60 * 1000; // 2 minutes
+  /** Agents currently being auto-suspended — prevents duplicate concurrent attempts. */
+  private readonly autoSuspending = new Set<string>();
 
   constructor(opts: HealthMonitorOptions) {
     this.db = opts.db;
@@ -587,9 +589,45 @@ export class HealthMonitor {
   }
 
   /**
-   * Check if an idle agent has exceeded the suspend timeout.
-   * Currently logs only — auto-suspend is not implemented yet.
+   * Auto-suspend an idle agent that has exceeded the suspend timeout,
+   * provided it has no pending messages and no active reminders.
    */
+  private autoSuspendIfEligible(agentName: string): void {
+    if (this.autoSuspending.has(agentName)) return;
+
+    const agent = this.db.getAgent(agentName);
+    if (!agent || agent.state !== 'idle' || !agent.lastActivity) return;
+
+    const idleDuration = Date.now() - new Date(agent.lastActivity).getTime();
+    if (idleDuration <= this.idleSuspendMs) return;
+
+    if (this.db.hasPendingMessages(agentName)) {
+      return;
+    }
+
+    if (this.db.hasActiveReminders(agentName)) {
+      return;
+    }
+
+    this.autoSuspending.add(agentName);
+    console.log(`[health] ${agent.name}: auto-suspending after ${Math.round(idleDuration / 1000)}s idle (threshold: ${Math.round(this.idleSuspendMs / 1000)}s)`);
+    this.db.logEvent(agent.name, 'auto_suspend', undefined, {
+      idleDurationMs: idleDuration,
+      thresholdMs: this.idleSuspendMs,
+    });
+
+    const lifecycleCtx = this.makeLifecycleCtx();
+    suspendAgent(lifecycleCtx, agent.name).then((updated) => {
+      console.log(`[health] ${agent.name}: auto-suspended (state=${updated.state})`);
+      this.onAgentUpdate(agent.name);
+      this.emitSystemMessage(agent.name, `Auto-suspended after ${Math.round(idleDuration / 1000)}s idle`);
+    }).catch((err) => {
+      console.error(`[health] ${agent.name}: auto-suspend failed:`, (err as Error).message);
+    }).finally(() => {
+      this.autoSuspending.delete(agentName);
+    });
+  }
+
   /**
    * Detect if the CLI has exited back to a bare shell prompt.
    * This happens when `claude --resume <id>` fails (e.g. "No conversation found")
@@ -821,23 +859,14 @@ export class HealthMonitor {
     this.activeIndicators.delete(name);
     this.compiledIndicators.delete(name);
     this.lastPermissionAlert.delete(name);
+    this.autoSuspending.delete(name);
     // Note: failureSnapshot and sessionDeathAlerted intentionally NOT deleted
     // here — they're needed by detectCliHealed() / livenessSweep() after the
     // agent transitions to failed state.
   }
 
   private checkIdleSuspendTimeout(agentName: string): void {
-    const agent = this.db.getAgent(agentName);
-    if (!agent || agent.state !== 'idle' || !agent.lastActivity) return;
-
-    const idleDuration = Date.now() - new Date(agent.lastActivity).getTime();
-    if (idleDuration > this.idleSuspendMs) {
-      console.log(`[health] ${agent.name} idle for ${Math.round(idleDuration / 1000)}s (exceeds ${Math.round(this.idleSuspendMs / 1000)}s threshold)`);
-      this.db.logEvent(agent.name, 'idle_timeout_exceeded', undefined, {
-        idleDurationMs: idleDuration,
-        thresholdMs: this.idleSuspendMs,
-      });
-    }
+    this.autoSuspendIfEligible(agentName);
   }
 
   /**

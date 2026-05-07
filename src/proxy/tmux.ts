@@ -7,6 +7,32 @@ import { execSync, execFileSync, type ExecSyncOptions } from 'node:child_process
 
 const EXEC_OPTS: ExecSyncOptions = { encoding: 'utf-8', timeout: 10_000 };
 
+// Per-session paste serialization. Multiple pastes to the same tmux session
+// (e.g. concurrent inbound messages from several agents) used to race their
+// paste-then-Enter sequences, leaving text stuck in the input prompt because
+// a second paste arrived before the first paste's Enter-retry could finish.
+//
+// We chain pastes per-sessionName so only one runs at a time. Pastes to
+// different sessions remain concurrent. The chain stores a never-rejecting
+// promise so a thrown paste doesn't block subsequent ones.
+const sessionLocks = new Map<string, Promise<unknown>>();
+
+function serializePerSession<T>(sessionName: string, fn: () => Promise<T>): Promise<T> {
+  const prev = sessionLocks.get(sessionName) ?? Promise.resolve();
+  const next = prev.then(fn, fn); // run fn whether prev resolved or threw
+  const guard = next.catch(() => {}); // never-reject for chaining
+  sessionLocks.set(sessionName, guard);
+  // Cleanup map entry once this paste settles AND nothing else is queued
+  // behind it. If something is queued, the map already points at a later
+  // promise — we leave it alone.
+  guard.then(() => {
+    if (sessionLocks.get(sessionName) === guard) {
+      sessionLocks.delete(sessionName);
+    }
+  });
+  return next;
+}
+
 function exec(cmd: string): string {
   try {
     return (execSync(cmd, EXEC_OPTS) as string).trim();
@@ -124,40 +150,46 @@ function dismissBlockingModal(sessionName: string): boolean {
 
 export async function pasteText(sessionName: string, text: string, pressEnter: boolean): Promise<void> {
   validateSessionName(sessionName);
-  // Verify tmux is responsive before pasting — catches locked/overloaded sessions
-  try {
-    execSync(`tmux capture-pane -t '${esc(sessionName)}' -p -S -1`, { ...EXEC_OPTS, timeout: 5000 });
-  } catch {
-    throw new Error(`tmux session "${sessionName}" is not responsive (capture-pane timed out)`);
-  }
-
-  // If a blocking modal is up (feedback survey, trust dialog), dismiss it
-  // first — otherwise the modal eats every keystroke and the paste/Enter
-  // both go nowhere visible.
-  if (dismissBlockingModal(sessionName)) {
-    await new Promise<void>((r) => setTimeout(r, 500));
-  }
-
-  // Pass text via stdin (input option) to avoid all shell escaping issues
-  execSync('tmux load-buffer -', { ...EXEC_OPTS, input: text });
-  exec(`tmux paste-buffer -t '${esc(sessionName)}'`);
-
-  if (pressEnter) {
-    await new Promise<void>((r) => setTimeout(r, pasteEnterDelay(text.length)));
-    exec(`tmux send-keys -t '${esc(sessionName)}' Enter`);
-
-    // Verify the input cleared. If text still sits in the prompt after 800ms,
-    // the TUI was busy and the Enter was eaten — retry up to 2 times. If a
-    // modal popped up between paste and Enter, dismiss + retry.
-    for (let attempt = 0; attempt < 2; attempt++) {
-      await new Promise<void>((r) => setTimeout(r, 800));
-      if (!inputStillHasUnsubmittedText(sessionName)) return;
-      if (dismissBlockingModal(sessionName)) {
-        await new Promise<void>((r) => setTimeout(r, 400));
-      }
-      exec(`tmux send-keys -t '${esc(sessionName)}' Enter`);
+  // Serialize concurrent pastes to the same session so paste-then-Enter
+  // sequences can't interleave and leave text stuck in the prompt.
+  return serializePerSession(sessionName, async () => {
+    // Verify tmux is responsive before pasting — catches locked/overloaded sessions
+    try {
+      execSync(`tmux capture-pane -t '${esc(sessionName)}' -p -S -1`, { ...EXEC_OPTS, timeout: 5000 });
+    } catch {
+      throw new Error(`tmux session "${sessionName}" is not responsive (capture-pane timed out)`);
     }
-  }
+
+    // If a blocking modal is up (feedback survey, trust dialog), dismiss it
+    // first — otherwise the modal eats every keystroke and the paste/Enter
+    // both go nowhere visible.
+    if (dismissBlockingModal(sessionName)) {
+      await new Promise<void>((r) => setTimeout(r, 500));
+    }
+
+    // Pass text via stdin (input option) to avoid all shell escaping issues
+    execSync('tmux load-buffer -', { ...EXEC_OPTS, input: text });
+    exec(`tmux paste-buffer -t '${esc(sessionName)}'`);
+
+    if (pressEnter) {
+      await new Promise<void>((r) => setTimeout(r, pasteEnterDelay(text.length)));
+      exec(`tmux send-keys -t '${esc(sessionName)}' Enter`);
+
+      // Verify the input cleared. If text still sits in the prompt, retry up
+      // to 5 times with progressively longer delays. The Claude Code 2.x TUI
+      // can take several seconds to transition out of "Cooked"/"Crunched"
+      // states. Total retry window: ~10s before we hand off to the watchdog.
+      const retryDelays = [800, 1200, 1500, 2000, 2500];
+      for (const delay of retryDelays) {
+        await new Promise<void>((r) => setTimeout(r, delay));
+        if (!inputStillHasUnsubmittedText(sessionName)) return;
+        if (dismissBlockingModal(sessionName)) {
+          await new Promise<void>((r) => setTimeout(r, 400));
+        }
+        exec(`tmux send-keys -t '${esc(sessionName)}' Enter`);
+      }
+    }
+  });
 }
 
 /**
