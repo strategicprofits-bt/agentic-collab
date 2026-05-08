@@ -40,6 +40,11 @@ describe('ReminderDispatcher', () => {
       cadenceMinutes: 5,
     });
 
+    // Backdate so cadence has elapsed since creation
+    db.rawDb.prepare(
+      "UPDATE reminders SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 minutes') WHERE id = ?"
+    ).run(r.id);
+
     const queued: unknown[] = [];
     const mock = mockMessageDispatcher();
     const dispatcher = new ReminderDispatcher({
@@ -88,12 +93,39 @@ describe('ReminderDispatcher', () => {
     db.deleteReminder(r.id);
   });
 
+  it('tick does not fire freshly created reminders', () => {
+    const r = db.createReminder({
+      agentName: 'dispatch-agent',
+      prompt: 'Fresh reminder',
+      cadenceMinutes: 30,
+    });
+
+    const queued: unknown[] = [];
+    const dispatcher = new ReminderDispatcher({
+      db,
+      messageDispatcher: mockMessageDispatcher(),
+      onQueueUpdate: (msg) => queued.push(msg),
+    });
+
+    dispatcher.tick();
+
+    const pending = db.getDeliverableMessages('dispatch-agent');
+    assert.ok(!pending.some(m => m.envelope.includes('Fresh reminder')));
+
+    db.deleteReminder(r.id);
+  });
+
   it('tick updates last_delivered_at after delivery', () => {
     const r = db.createReminder({
       agentName: 'dispatch-agent',
       prompt: 'Track delivery time',
       cadenceMinutes: 5,
     });
+
+    // Backdate so cadence has elapsed since creation
+    db.rawDb.prepare(
+      "UPDATE reminders SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 minutes') WHERE id = ?"
+    ).run(r.id);
 
     assert.equal(db.getReminder(r.id)!.lastDeliveredAt, null);
 
@@ -137,6 +169,14 @@ describe('ReminderDispatcher', () => {
       cadenceMinutes: 5,
     });
 
+    // Backdate both so cadence has elapsed since creation
+    db.rawDb.prepare(
+      "UPDATE reminders SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 minutes') WHERE id = ?"
+    ).run(r1.id);
+    db.rawDb.prepare(
+      "UPDATE reminders SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 minutes') WHERE id = ?"
+    ).run(r2.id);
+
     // First tick should deliver r1 (top reminder)
     const dispatcher = new ReminderDispatcher({ db, messageDispatcher: mockMessageDispatcher() });
     dispatcher.tick();
@@ -151,7 +191,7 @@ describe('ReminderDispatcher', () => {
     // Complete r1 — now r2 becomes the top reminder
     db.completeReminder(r1.id);
 
-    // r2 has never been delivered, so it should be due now
+    // r2 was created 10m ago with 5m cadence — should be due after promotion
     const due = db.listDueReminders();
     assert.ok(due.some(d => d.id === r2.id));
 

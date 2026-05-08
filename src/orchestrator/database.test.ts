@@ -741,7 +741,7 @@ describe('Database', () => {
       assert.equal(top!.prompt, 'First');
     });
 
-    it('listDueReminders returns reminders where cadence elapsed', () => {
+    it('listDueReminders returns reminders where cadence elapsed since creation', () => {
       rDb.createAgent({ name: 'rem-agent-due', engine: 'claude', cwd: '/tmp' });
       const r = rDb.createReminder({
         agentName: 'rem-agent-due',
@@ -749,7 +749,15 @@ describe('Database', () => {
         cadenceMinutes: 5,
       });
 
-      // Never delivered → should be due
+      // Freshly created → cadence not elapsed → not due
+      const notDue = rDb.listDueReminders();
+      assert.ok(!notDue.some(d => d.id === r.id));
+
+      // Backdate created_at so cadence has elapsed
+      rDb.rawDb.prepare(
+        "UPDATE reminders SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 minutes') WHERE id = ?"
+      ).run(r.id);
+
       const due = rDb.listDueReminders();
       assert.ok(due.some(d => d.id === r.id));
     });
@@ -780,6 +788,51 @@ describe('Database', () => {
 
       const due = rDb.listDueReminders();
       assert.ok(!due.some(d => d.id === r.id));
+    });
+
+    it('hasImminentReminder returns false with no reminders', () => {
+      rDb.createAgent({ name: 'rem-imm-none', engine: 'claude', cwd: '/tmp' });
+      assert.equal(rDb.hasImminentReminder('rem-imm-none', 300_000), false);
+    });
+
+    it('hasImminentReminder returns true when reminder fires within window', () => {
+      rDb.createAgent({ name: 'rem-imm-soon', engine: 'claude', cwd: '/tmp' });
+      const r = rDb.createReminder({
+        agentName: 'rem-imm-soon',
+        prompt: 'Soon',
+        cadenceMinutes: 5,
+      });
+      // Backdate created_at to 4 minutes ago — fires in ~1 minute
+      rDb.rawDb.prepare(
+        "UPDATE reminders SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-4 minutes') WHERE id = ?"
+      ).run(r.id);
+      // Window of 5 minutes: 1 min remaining <= 5 min window → imminent
+      assert.equal(rDb.hasImminentReminder('rem-imm-soon', 300_000), true);
+    });
+
+    it('hasImminentReminder returns false when reminder fires outside window', () => {
+      rDb.createAgent({ name: 'rem-imm-far', engine: 'claude', cwd: '/tmp' });
+      const r = rDb.createReminder({
+        agentName: 'rem-imm-far',
+        prompt: 'Far away',
+        cadenceMinutes: 1440,
+      });
+      // Just created with 24h cadence — fires in ~24h, well outside 5-min window
+      assert.equal(rDb.hasImminentReminder('rem-imm-far', 300_000), false);
+    });
+
+    it('hasImminentReminder returns true when reminder is overdue', () => {
+      rDb.createAgent({ name: 'rem-imm-overdue', engine: 'claude', cwd: '/tmp' });
+      const r = rDb.createReminder({
+        agentName: 'rem-imm-overdue',
+        prompt: 'Overdue',
+        cadenceMinutes: 5,
+      });
+      // Backdate created_at to 10 minutes ago — already overdue
+      rDb.rawDb.prepare(
+        "UPDATE reminders SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 minutes') WHERE id = ?"
+      ).run(r.id);
+      assert.equal(rDb.hasImminentReminder('rem-imm-overdue', 300_000), true);
     });
   });
 
