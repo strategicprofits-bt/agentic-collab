@@ -867,6 +867,28 @@ export class Database {
     return row !== undefined;
   }
 
+  hasImminentReminder(agentName: string, windowMs: number): boolean {
+    const reminder = this.getTopReminder(agentName);
+    if (!reminder) return false;
+
+    const now = Date.now();
+
+    if (reminder.deliverAt) {
+      if (reminder.lastDeliveredAt) {
+        const lastDate = new Date(reminder.lastDeliveredAt).toDateString();
+        if (lastDate === new Date().toDateString()) return false;
+      }
+      const [h, m] = reminder.deliverAt.split(':').map(Number);
+      const target = new Date();
+      target.setHours(h, m, 0, 0);
+      return target.getTime() - now <= windowMs;
+    }
+
+    const anchor = reminder.lastDeliveredAt || reminder.createdAt;
+    const nextFireAt = new Date(anchor).getTime() + reminder.cadenceMinutes * 60_000;
+    return nextFireAt - now <= windowMs;
+  }
+
   swapReminderOrder(id1: number, id2: number): boolean {
     const r1 = this.getReminder(id1);
     const r2 = this.getReminder(id2);
@@ -935,9 +957,8 @@ export class Database {
               AND (r.last_delivered_at IS NULL
                    OR date(r.last_delivered_at, 'localtime') < date('now', 'localtime'))
             ELSE
-              -- Cadence mode: enough time has elapsed
-              r.last_delivered_at IS NULL
-              OR (julianday('now') - julianday(r.last_delivered_at)) * 86400.0 >= r.cadence_minutes * 60
+              -- Cadence mode: enough time has elapsed since last delivery (or creation)
+              (julianday('now') - julianday(COALESCE(r.last_delivered_at, r.created_at))) * 86400.0 >= r.cadence_minutes * 60
           END
         )
     `).all() as Array<Record<string, unknown>>;

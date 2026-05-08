@@ -916,15 +916,60 @@ describe('HealthMonitor', () => {
       lastActivity: new Date(Date.now() - 10_000).toISOString(),
     });
 
-    // Create an active reminder
-    db.createReminder({ agentName: name, prompt: 'check something', cadenceMinutes: 10 });
+    // Create an imminent reminder (cadence nearly elapsed — fires within idle window)
+    const rem = db.createReminder({ agentName: name, prompt: 'check something', cadenceMinutes: 5 });
+    db.rawDb.prepare(
+      "UPDATE reminders SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-5 minutes') WHERE id = ?"
+    ).run(rem.id);
 
-    // Poll again — should NOT auto-suspend due to active reminder
+    // Poll again — should NOT auto-suspend due to imminent reminder
     await monitor.pollAll();
     await new Promise(r => setTimeout(r, 200));
 
     const after = db.getAgent(name);
-    assert.equal(after?.state, 'idle', 'should remain idle when reminders active');
+    assert.equal(after?.state, 'idle', 'should remain idle when imminent reminder exists');
+    monitor.stop();
+  });
+
+  it('auto-suspends agent with distant reminder', async () => {
+    const name = 'health-suspend-dist-rem';
+    db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent(name)!;
+    db.updateAgentState(name, 'active', a.version, {
+      tmuxSession: `agent-${name}`,
+      proxyId: 'p1',
+    });
+
+    captureOutput = 'idle prompt\n> \n';
+    const monitor = makeMonitor({
+      idleSuspendMs: 50,
+      proxyDispatch: async (_proxyId: string, command: ProxyCommand): Promise<ProxyResponse> => {
+        proxyCommands.push(command);
+        if (command.action === 'capture') return { ok: true, data: captureOutput };
+        if (command.action === 'has_session') return { ok: true, data: true };
+        if (command.action === 'pane_activity') return { ok: true, data: 1 };
+        if (command.action === 'suspend') return { ok: true };
+        return { ok: true };
+      },
+    });
+
+    await monitor.pollAll();
+    await monitor.pollAll();
+    const idled = db.getAgent(name);
+    assert.equal(idled?.state, 'idle', 'should be idle after 2 unchanged polls');
+
+    db.updateAgentState(name, 'idle', idled!.version, {
+      lastActivity: new Date(Date.now() - 10_000).toISOString(),
+    });
+
+    // Create a distant reminder (24h cadence, just created — not imminent)
+    db.createReminder({ agentName: name, prompt: 'daily check', cadenceMinutes: 1440 });
+
+    await monitor.pollAll();
+    await new Promise(r => setTimeout(r, 200));
+
+    const after = db.getAgent(name);
+    assert.equal(after?.state, 'suspending', 'should auto-suspend with distant reminder');
     monitor.stop();
   });
 });
