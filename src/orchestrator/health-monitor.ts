@@ -590,7 +590,7 @@ export class HealthMonitor {
 
   /**
    * Auto-suspend an idle agent that has exceeded the suspend timeout,
-   * provided it has no pending messages and no active reminders.
+   * provided it has no pending messages and no imminent reminders.
    */
   private autoSuspendIfEligible(agentName: string): void {
     if (this.autoSuspending.has(agentName)) return;
@@ -605,7 +605,7 @@ export class HealthMonitor {
       return;
     }
 
-    if (this.db.hasActiveReminders(agentName)) {
+    if (this.db.hasImminentReminder(agentName, this.idleSuspendMs)) {
       return;
     }
 
