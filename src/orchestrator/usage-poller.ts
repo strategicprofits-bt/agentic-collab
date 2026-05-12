@@ -401,7 +401,10 @@ export class UsagePoller {
         sessionName: config.sessionName,
         lines: 20,
       });
-      if (!result.ok) return false;
+      if (!result.ok) {
+        console.warn(`[usage] ${config.engine} capture failed: ${result.error}`);
+        return false;
+      }
       const output = (result.data as string) ?? '';
 
       // Handle Claude's folder trust dialog ("Yes, I trust this folder")
@@ -431,6 +434,12 @@ export class UsagePoller {
 
       const state = adapter.detectIdleState(output);
       if (state === 'waiting_for_input') return true;
+
+      // Log on last attempt before timeout for diagnosis
+      if (Date.now() + 2500 >= deadline) {
+        const lastLines = output.split('\n').filter(l => l.trim()).slice(-3).map(l => l.trim().slice(0, 80));
+        console.warn(`[usage] ${config.engine} idle-check timeout: state=${state} tail=${JSON.stringify(lastLines)}`);
+      }
 
       await sleep(2000);
     }
