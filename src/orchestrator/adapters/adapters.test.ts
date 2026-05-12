@@ -171,6 +171,18 @@ describe('Engine Adapters', () => {
       assert.equal(adapter.detectIdleState('some output\n❯'), 'waiting_for_input');
     });
 
+    it('detects idle state from prompt with placeholder hints (v2.1.139+)', () => {
+      const pane = [
+        '  What would you like to work on?',
+        '',
+        '──────────── ▪▪▪ ─',
+        '❯ Try "how do I log an error?"',
+        '────────────────────────',
+        '  ⏵⏵ bypass permissions on (shift+tab to cycle)              ◉',
+      ].join('\n');
+      assert.equal(adapter.detectIdleState(pane), 'waiting_for_input');
+    });
+
     it('detects idle state skipping context-left and Remote Control status bar', () => {
       const pane = [
         '  Standing by for new tasks.',
