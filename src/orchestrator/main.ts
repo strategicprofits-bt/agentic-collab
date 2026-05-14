@@ -155,11 +155,19 @@ const messageDispatcher = new MessageDispatcher({
 
 // ── Health Monitor ──
 
+// Idle auto-suspend threshold. Default in HealthMonitor is 5 min; when our
+// fleet runs in "always-on" mode that auto-suspend fights the watchdog's
+// auto-revive endlessly. Set IDLE_SUSPEND_MS very high (24h) to effectively
+// disable it for always-on agents while still letting truly stale ones get
+// cleaned up after a day. Lower this if you want the original behavior.
+const IDLE_SUSPEND_MS = parseInt(process.env['IDLE_SUSPEND_MS'] ?? `${24 * 60 * 60 * 1000}`, 10);
+
 const healthMonitor = new HealthMonitor({
   db,
   locks,
   proxyDispatch,
   orchestratorHost: ORCHESTRATOR_HOST,
+  idleSuspendMs: IDLE_SUSPEND_MS,
   onAgentUpdate: (agentName) => {
     const agent = db.getAgent(agentName);
     if (agent) {
