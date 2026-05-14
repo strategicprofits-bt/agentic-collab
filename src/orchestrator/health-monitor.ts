@@ -360,6 +360,11 @@ export class HealthMonitor {
         // Capture pane output for detection patterns and/or screen-diff
         const paneOutput = await this.capturePaneOutput(agent);
         if (paneOutput === null) continue;
+        // Check for CLI exit even on fast poll (GAP-005)
+        if (this.detectCliExit(agent, paneOutput)) {
+          this.maybeAutoRecover(agent);
+          continue;
+        }
         this.evaluateIndicators(resolved, paneOutput);
         this.detectPermissionPrompt(agent, paneOutput);
         const isIdle = this.checkScreenDiff(resolved, paneOutput);
@@ -407,7 +412,12 @@ export class HealthMonitor {
     const resolved = this.resolveAgent(agent);
     const hasDetectionPatterns = this.getDetection(resolved) !== null;
 
-    // Fast path: check tmux window_activity timestamp before expensive capture.
+    // Check tmux window_activity to skip expensive indicator evaluation when
+    // pane is unchanged. We still ALWAYS capture and run detectCliExit to
+    // prevent silent death masking (GAP-005): a dead CLI at a shell prompt
+    // produces no new output, so pane_activity stays frozen — without this
+    // guard the fast path would mask the death as idle indefinitely.
+    let paneUnchanged = false;
     const activityResult = await this.proxyDispatch(agent.proxyId, {
       action: 'pane_activity',
       sessionName: sessionName(agent),
@@ -417,32 +427,34 @@ export class HealthMonitor {
       const prevTs = this.lastActivityTs.get(agent.name);
       this.lastActivityTs.set(agent.name, currentTs);
       if (prevTs !== undefined && currentTs === prevTs && !hasDetectionPatterns) {
-        // Pane unchanged and no detection patterns — definitively idle
-        this.handleIdleTransitions(agent, true);
-        this.checkIdleSuspendTimeout(agent.name);
-        return;
+        paneUnchanged = true;
       }
     }
 
     const paneOutput = await this.capturePaneOutput(agent);
     if (paneOutput === null) return;
 
-    // Check if the CLI exited back to a bare shell prompt (e.g. session not found)
+    // Always check for CLI exit — even when pane is unchanged
     if (this.detectCliExit(agent, paneOutput)) {
       this.maybeAutoRecover(agent);
       return;
     }
 
-    this.recordContextPercent(agent, paneOutput);
-    this.evaluateIndicators(resolved, paneOutput);
-    this.detectPermissionPrompt(agent, paneOutput);
+    if (paneUnchanged) {
+      this.handleIdleTransitions(agent, true);
+    } else {
+      this.recordContextPercent(agent, paneOutput);
+      this.evaluateIndicators(resolved, paneOutput);
+      this.detectPermissionPrompt(agent, paneOutput);
 
-    const isIdle = this.checkScreenDiff(resolved, paneOutput);
-    this.handleIdleTransitions(agent, isIdle);
+      const isIdle = this.checkScreenDiff(resolved, paneOutput);
+      this.handleIdleTransitions(agent, isIdle);
+    }
 
     this.checkIdleSuspendTimeout(agent.name);
 
-    if (isIdle) {
+    const currentAgent = this.db.getAgent(agent.name);
+    if (currentAgent?.state === 'idle') {
       await this.handleQueuedReload(agent.name);
     }
 
