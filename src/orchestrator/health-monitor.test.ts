@@ -644,6 +644,45 @@ describe('HealthMonitor', () => {
     assert.notEqual(db.getAgent(agentName)!.state, 'failed');
   });
 
+  // ── GAP-005: Silent death masking ──
+
+  it('detects CLI exit even when pane_activity is unchanged (GAP-005)', async () => {
+    const agentName = 'health-gap005';
+    db.createAgent({ name: agentName, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent(agentName)!;
+    db.updateAgentState(agentName, 'active', a.version, {
+      tmuxSession: `agent-${agentName}`,
+      proxyId: 'p1',
+    });
+
+    // Dead CLI: shell prompt with frozen pane_activity timestamp
+    const shellPrompt = 'sammons@crankshaft:~/Desktop/claude_home$ \n';
+    let activityTs = 1000;
+    const monitor = makeMonitor({
+      proxyDispatch: async (_proxyId: string, command: ProxyCommand): Promise<ProxyResponse> => {
+        proxyCommands.push(command);
+        if (command.action === 'pane_activity') {
+          return { ok: true, data: activityTs };
+        }
+        if (command.action === 'capture') {
+          return { ok: true, data: shellPrompt };
+        }
+        return { ok: true };
+      },
+    });
+
+    // First poll: establishes baseline pane_activity, detects shell prompt (count=1)
+    await monitor.pollAgent(db.getAgent(agentName)!);
+    assert.equal(db.getAgent(agentName)!.state, 'active', 'still active after first detection');
+
+    // Second poll: pane_activity unchanged (same timestamp) — old code would
+    // take fast path and return without detecting exit. Fixed code still captures
+    // and runs detectCliExit, confirming the death (count=2).
+    ensureActive(agentName);
+    await monitor.pollAgent(db.getAgent(agentName)!);
+    assert.equal(db.getAgent(agentName)!.state, 'failed', 'must detect death despite unchanged pane_activity');
+  });
+
   // ── CLI Recovery Detection ──
 
   it('heals failed agent when CLI is detected alive in tmux', async () => {
