@@ -41,6 +41,8 @@ const CAPTURE_TIMEOUT_MS = 30_000; // max time to wait for usage data to load
 const SESSION_BOOT_MS = 5_000; // time to wait for CLI to boot after spawn
 const SESSION_PREFIX = 'usage-';
 const RECYCLE_MS = 8 * 60 * 60 * 1000; // 8 hours — kill and recreate stale sessions
+const EMPTY_RECYCLE_THRESHOLD = 3; // consecutive empty polls before forced session recycle
+const MAX_RECYCLES_PER_HOUR = 2; // cap recycle attempts to avoid spin-loops on persistent failures
 
 type EngineConfig = {
   engine: 'claude' | 'codex';
@@ -64,6 +66,10 @@ export class UsagePoller {
   private readonly activeSessions = new Set<string>();
   // Track session metadata: which proxy owns it and when it was created (for recycling)
   private readonly sessionInfo = new Map<string, { proxyId: string; createdAt: number }>();
+  // Consecutive polls that returned no usage data — triggers forced recycle at threshold
+  private readonly consecutiveEmpty = new Map<string, number>();
+  // Timestamps of recent recycles per session — used to enforce MAX_RECYCLES_PER_HOUR
+  private readonly recycleTimestamps = new Map<string, number[]>();
 
   constructor(opts: UsagePollerOptions) {
     this.db = opts.db;
@@ -220,6 +226,7 @@ export class UsagePoller {
     const ready = await this.waitForIdle(proxyId, config);
     if (!ready) {
       console.warn(`[usage] ${config.engine} session not ready, skipping`);
+      await this.trackEmptyPoll(config);
       return;
     }
 
@@ -272,6 +279,7 @@ export class UsagePoller {
     });
 
     if (buckets.length > 0) {
+      this.consecutiveEmpty.delete(config.sessionName);
       // Key by engine:account for per-account usage, or just engine for non-account
       const key = config.account && config.account !== 'default'
         ? `${config.engine}:${config.account}` : config.engine;
@@ -287,6 +295,7 @@ export class UsagePoller {
     } else {
       const label = config.account ? `${config.engine}:${config.account}` : config.engine;
       console.warn(`[usage] ${label}: no usage data found within ${CAPTURE_TIMEOUT_MS / 1000}s`);
+      await this.trackEmptyPoll(config);
     }
   }
 
@@ -384,6 +393,56 @@ export class UsagePoller {
     } catch { /* best effort */ }
     this.activeSessions.delete(config.sessionName);
     this.sessionInfo.delete(config.sessionName);
+  }
+
+  /**
+   * Track a poll that returned no data. When consecutive empty polls hit the
+   * threshold, force-recycle the session so ensureSession() recreates it fresh.
+   * Capped at MAX_RECYCLES_PER_HOUR to prevent spin-loops on persistent failures.
+   */
+  private async trackEmptyPoll(config: EngineConfig): Promise<void> {
+    const count = (this.consecutiveEmpty.get(config.sessionName) ?? 0) + 1;
+    this.consecutiveEmpty.set(config.sessionName, count);
+
+    if (count < EMPTY_RECYCLE_THRESHOLD) return;
+
+    const now = Date.now();
+    const hourAgo = now - 3600_000;
+    const recent = (this.recycleTimestamps.get(config.sessionName) ?? []).filter(t => t > hourAgo);
+
+    if (recent.length >= MAX_RECYCLES_PER_HOUR) {
+      const label = config.account ? `${config.engine}:${config.account}` : config.engine;
+      const msg = `${label}: ${count} consecutive empty polls, recycle cap reached (${MAX_RECYCLES_PER_HOUR}/hr) — session may need manual intervention`;
+      console.warn(`[usage] ${msg}`);
+      this.db.logEvent('_usage-poller', 'recycle_cap_reached', undefined, {
+        engine: config.engine,
+        account: config.account,
+        session: config.sessionName,
+        consecutiveEmpty: count,
+        recyclesInLastHour: recent.length,
+      });
+      return;
+    }
+
+    const label = config.account ? `${config.engine}:${config.account}` : config.engine;
+    console.warn(`[usage] ${label}: ${count} consecutive empty polls — recycling session`);
+    const info = this.sessionInfo.get(config.sessionName);
+    if (info) {
+      try {
+        await this.proxyDispatch(info.proxyId, { action: 'kill_session', sessionName: config.sessionName });
+      } catch { /* best effort */ }
+    }
+    this.activeSessions.delete(config.sessionName);
+    this.sessionInfo.delete(config.sessionName);
+    this.consecutiveEmpty.delete(config.sessionName);
+    recent.push(now);
+    this.recycleTimestamps.set(config.sessionName, recent);
+    this.db.logEvent('_usage-poller', 'session_recycled', undefined, {
+      engine: config.engine,
+      account: config.account,
+      session: config.sessionName,
+      consecutiveEmpty: count,
+    });
   }
 
   /**
