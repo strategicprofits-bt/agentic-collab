@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseClaudeUsage, parseCodexStatus } from './usage-poller.ts';
+import { parseClaudeUsage, parseCodexStatus, UsagePoller, type UsageBucket } from './usage-poller.ts';
 
 describe('parseClaudeUsage', () => {
   it('parses typical /usage output with two buckets', () => {
@@ -179,5 +179,119 @@ describe('parseCodexStatus', () => {
   it('returns empty for no usage data', () => {
     const buckets = parseCodexStatus('no status info here');
     assert.equal(buckets.length, 0);
+  });
+});
+
+function makePoller(): UsagePoller {
+  const stubDb = {
+    listProxies: () => [],
+    listAgents: () => [],
+    logEvent: () => {},
+  } as any;
+  return new UsagePoller({ db: stubDb, proxyDispatch: async () => ({ ok: true }) as any });
+}
+
+function bucket(pctUsed: number, resetsAt = 'May 19 (America/Chicago)'): UsageBucket {
+  return { label: 'Current week (all models)', pctUsed, resetsAt };
+}
+
+describe('assessBucketQuality', () => {
+  it('returns normal on first reading (no history)', () => {
+    const poller = makePoller();
+    const b = bucket(18);
+    const q = poller.assessBucketQuality('claude', undefined, b);
+    assert.equal(q, 'normal');
+    assert.equal(b.quality, undefined);
+    assert.equal(b.baselinePct, undefined);
+  });
+
+  it('returns normal when pct increases', () => {
+    const poller = makePoller();
+    poller.assessBucketQuality('claude', undefined, bucket(10), 1000);
+    poller.assessBucketQuality('claude', undefined, bucket(15), 2000);
+    const b = bucket(20);
+    const q = poller.assessBucketQuality('claude', undefined, b, 3000);
+    assert.equal(q, 'normal');
+    assert.equal(b.quality, undefined);
+  });
+
+  it('returns normal for small drop within threshold', () => {
+    const poller = makePoller();
+    poller.assessBucketQuality('claude', undefined, bucket(18), 1000);
+    const b = bucket(14); // 4 point drop, within 5-point threshold
+    const q = poller.assessBucketQuality('claude', undefined, b, 2000);
+    assert.equal(q, 'normal');
+  });
+
+  it('returns suspect when drop exceeds threshold', () => {
+    const poller = makePoller();
+    poller.assessBucketQuality('claude', undefined, bucket(18), 1000);
+    const b = bucket(2); // 16 point drop
+    const q = poller.assessBucketQuality('claude', undefined, b, 2000);
+    assert.equal(q, 'suspect');
+    assert.equal(b.quality, 'suspect');
+    assert.equal(b.baselinePct, 18);
+  });
+
+  it('returns suspect at exactly threshold + 1', () => {
+    const poller = makePoller();
+    poller.assessBucketQuality('claude', undefined, bucket(20), 1000);
+    const b = bucket(14); // 6 point drop > 5 threshold
+    const q = poller.assessBucketQuality('claude', undefined, b, 2000);
+    assert.equal(q, 'suspect');
+    assert.equal(b.baselinePct, 20);
+  });
+
+  it('returns normal at exactly threshold boundary', () => {
+    const poller = makePoller();
+    poller.assessBucketQuality('claude', undefined, bucket(20), 1000);
+    const b = bucket(15); // exactly 5 point drop = threshold, not exceeded
+    const q = poller.assessBucketQuality('claude', undefined, b, 2000);
+    assert.equal(q, 'normal');
+  });
+
+  it('clears history when resetsAt changes (new billing period)', () => {
+    const poller = makePoller();
+    poller.assessBucketQuality('claude', undefined, bucket(50, 'May 19'), 1000);
+    poller.assessBucketQuality('claude', undefined, bucket(55, 'May 19'), 2000);
+    // New billing period — drop from 55 to 5 is expected
+    const b = bucket(5, 'May 26');
+    const q = poller.assessBucketQuality('claude', undefined, b, 3000);
+    assert.equal(q, 'normal');
+  });
+
+  it('uses max of history as baseline, not last reading', () => {
+    const poller = makePoller();
+    poller.assessBucketQuality('claude', undefined, bucket(30), 1000);
+    poller.assessBucketQuality('claude', undefined, bucket(25), 2000); // dip but within threshold
+    // Baseline should be 30 (max), not 25 (last)
+    const b = bucket(24); // 6 drop from 30 (suspect), but only 1 from 25
+    const q = poller.assessBucketQuality('claude', undefined, b, 3000);
+    assert.equal(q, 'suspect');
+    assert.equal(b.baselinePct, 30);
+  });
+
+  it('tracks separate histories per engine/account/label', () => {
+    const poller = makePoller();
+    poller.assessBucketQuality('claude', 'acct-a', bucket(50), 1000);
+    // Different account — no history, so no suspect
+    const b = bucket(2);
+    const q = poller.assessBucketQuality('claude', 'acct-b', b, 2000);
+    assert.equal(q, 'normal');
+  });
+
+  it('trims history to HISTORY_SIZE', () => {
+    const poller = makePoller();
+    // Push 15 readings at 10 each
+    for (let i = 0; i < 15; i++) {
+      poller.assessBucketQuality('claude', undefined, bucket(10), i * 1000);
+    }
+    // Now push one at 50 — this becomes the new max
+    poller.assessBucketQuality('claude', undefined, bucket(50), 15000);
+    // Drop to 2 — should be suspect (baseline 50)
+    const b = bucket(2);
+    const q = poller.assessBucketQuality('claude', undefined, b, 16000);
+    assert.equal(q, 'suspect');
+    assert.equal(b.baselinePct, 50);
   });
 });

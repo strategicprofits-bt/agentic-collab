@@ -13,10 +13,14 @@ import type { AccountStore } from './accounts.ts';
 import { getAdapter } from './adapters/index.ts';
 import { sleep } from '../shared/utils.ts';
 
+export type UsageQuality = 'normal' | 'suspect';
+
 export type UsageBucket = {
   label: string;       // e.g. "Current session", "Current week (all models)"
   pctUsed: number;     // 0-100
   resetsAt: string;    // e.g. "Mar 13, 12am (America/Chicago)"
+  quality?: UsageQuality;  // data quality flag (omitted = normal)
+  baselinePct?: number;    // rolling baseline when quality is 'suspect'
 };
 
 export type EngineUsage = {
@@ -43,6 +47,10 @@ const SESSION_PREFIX = 'usage-';
 const RECYCLE_MS = 8 * 60 * 60 * 1000; // 8 hours — kill and recreate stale sessions
 const EMPTY_RECYCLE_THRESHOLD = 3; // consecutive empty polls before forced session recycle
 const MAX_RECYCLES_PER_HOUR = 2; // cap recycle attempts to avoid spin-loops on persistent failures
+const HISTORY_SIZE = 12; // rolling window (~2 hours at 10min intervals)
+const ANOMALY_DROP_THRESHOLD = 5; // flag if pctUsed drops >5 points below baseline
+
+type HistoryEntry = { pctUsed: number; resetsAt: string; timestamp: number };
 
 type EngineConfig = {
   engine: 'claude' | 'codex';
@@ -70,6 +78,8 @@ export class UsagePoller {
   private readonly consecutiveEmpty = new Map<string, number>();
   // Timestamps of recent recycles per session — used to enforce MAX_RECYCLES_PER_HOUR
   private readonly recycleTimestamps = new Map<string, number[]>();
+  // Rolling history per bucket for anomaly detection (keyed by engine:account:label)
+  private readonly bucketHistory = new Map<string, HistoryEntry[]>();
 
   constructor(opts: UsagePollerOptions) {
     this.db = opts.db;
@@ -115,10 +125,49 @@ export class UsagePoller {
     }
     this.activeSessions.clear();
     this.sessionInfo.clear();
+    this.bucketHistory.clear();
   }
 
   getUsageData(): Record<string, EngineUsage> {
     return Object.fromEntries(this.usageData);
+  }
+
+  /**
+   * Assess data quality for a bucket by comparing against rolling history.
+   * Mutates the bucket in place, adding quality/baselinePct fields.
+   * Returns the quality assessment.
+   */
+  assessBucketQuality(engine: string, account: string | undefined, bucket: UsageBucket, now = Date.now()): UsageQuality {
+    const key = `${engine}:${account ?? 'default'}:${bucket.label}`;
+    let history = this.bucketHistory.get(key);
+
+    if (!history) {
+      history = [];
+      this.bucketHistory.set(key, history);
+    }
+
+    // If resetsAt changed, this is a new billing period — clear history
+    if (history.length > 0 && history[history.length - 1]!.resetsAt !== bucket.resetsAt) {
+      history.length = 0;
+    }
+
+    // Compute baseline: max of recent readings (within a period, usage only goes up)
+    const baseline = history.length > 0 ? Math.max(...history.map(h => h.pctUsed)) : -1;
+
+    let quality: UsageQuality = 'normal';
+    if (baseline >= 0 && bucket.pctUsed < baseline - ANOMALY_DROP_THRESHOLD) {
+      quality = 'suspect';
+      bucket.quality = 'suspect';
+      bucket.baselinePct = baseline;
+    }
+
+    // Record this reading
+    history.push({ pctUsed: bucket.pctUsed, resetsAt: bucket.resetsAt, timestamp: now });
+    if (history.length > HISTORY_SIZE) {
+      history.splice(0, history.length - HISTORY_SIZE);
+    }
+
+    return quality;
   }
 
   /**
@@ -284,6 +333,20 @@ export class UsagePoller {
       const key = config.account && config.account !== 'default'
         ? `${config.engine}:${config.account}` : config.engine;
       const label = config.account ? `${config.engine}:${config.account}` : config.engine;
+
+      // Assess data quality against rolling history
+      const suspectBuckets: string[] = [];
+      for (const b of buckets) {
+        const q = this.assessBucketQuality(config.engine, config.account, b);
+        if (q === 'suspect') suspectBuckets.push(`${b.label}: ${b.pctUsed}% (baseline ${b.baselinePct}%)`);
+      }
+      if (suspectBuckets.length > 0) {
+        console.warn(`[usage] ${label}: suspect data — ${suspectBuckets.join(', ')}`);
+        this.db.logEvent('_usage-poller', 'suspect_data', undefined, {
+          engine: config.engine, account: config.account, suspect: suspectBuckets,
+        });
+      }
+
       this.usageData.set(key, {
         engine: config.engine,
         account: config.account,
@@ -291,7 +354,7 @@ export class UsagePoller {
         queriedAt: new Date().toISOString(),
         queriedFrom: config.sessionName,
       });
-      console.log(`[usage] ${label}: ${buckets.map(b => `${b.label}: ${b.pctUsed}%`).join(', ')}`);
+      console.log(`[usage] ${label}: ${buckets.map(b => `${b.label}: ${b.pctUsed}%${b.quality === 'suspect' ? ' ⚠' : ''}`).join(', ')}`);
     } else {
       const label = config.account ? `${config.engine}:${config.account}` : config.engine;
       console.warn(`[usage] ${label}: no usage data found within ${CAPTURE_TIMEOUT_MS / 1000}s`);
