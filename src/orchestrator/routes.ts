@@ -1665,7 +1665,8 @@ route('GET', '/api/engines/status', async (_req, res, _match, ctx) => {
     };
   }
   const usage = ctx.usagePoller.getUsageData();
-  json(res, 200, { engines, usage });
+  const bursting = ctx.usagePoller.isBursting();
+  json(res, 200, { engines, usage, bursting });
 });
 
 route('GET', '/api/voice/status', async (_req, res, _match, ctx) => {
@@ -1680,6 +1681,23 @@ route('POST', '/api/engines/poll', async (_req, res, _match, ctx) => {
   } catch (err) {
     json(res, 500, { error: (err as Error).message });
   }
+});
+
+route('POST', '/api/engines/burst', async (req, res, _match, ctx) => {
+  try {
+    const body = await readJson(req);
+    const durationMin = typeof body.durationMin === 'number' ? body.durationMin : 20;
+    const clamped = Math.max(5, Math.min(60, durationMin));
+    const result = ctx.usagePoller.startBurst(clamped * 60 * 1000);
+    json(res, 200, { ok: true, ...result });
+  } catch (err) {
+    json(res, 500, { error: (err as Error).message });
+  }
+});
+
+route('DELETE', '/api/engines/burst', async (_req, res, _match, ctx) => {
+  ctx.usagePoller.stopBurst();
+  json(res, 200, { ok: true });
 });
 
 route('GET', '/api/orchestrator/status', async (_req, res, _match, ctx) => {
