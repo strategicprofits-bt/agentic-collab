@@ -62,8 +62,12 @@ type EngineConfig = {
   parser: (output: string) => UsageBucket[];
 };
 
+const BURST_POLL_MS = 2 * 60 * 1000; // 2 minutes between burst polls
+
 export class UsagePoller {
   private timer: ReturnType<typeof setInterval> | null = null;
+  private burstTimer: ReturnType<typeof setInterval> | null = null;
+  private burstUntil = 0;
   private readonly db: Database;
   private readonly proxyDispatch: (proxyId: string, command: ProxyCommand) => Promise<ProxyResponse>;
   private readonly accountStore: AccountStore | undefined;
@@ -106,11 +110,45 @@ export class UsagePoller {
     await this.pollAll();
   }
 
+  /**
+   * Start burst polling (every 2min) for a specified duration.
+   * Used to capture high-resolution data around session reset windows.
+   */
+  startBurst(durationMs: number): { burstUntil: string; intervalMs: number } {
+    this.burstUntil = Date.now() + durationMs;
+    if (this.burstTimer) clearInterval(this.burstTimer);
+    console.log(`[usage] Burst polling active for ${Math.round(durationMs / 60000)}min (every ${BURST_POLL_MS / 1000}s)`);
+    this.burstTimer = setInterval(() => {
+      if (Date.now() >= this.burstUntil) {
+        this.stopBurst();
+        return;
+      }
+      this.pollAll().catch(err => console.error('[usage] Burst poll error:', err));
+    }, BURST_POLL_MS);
+    // Immediate poll to start capturing
+    this.pollAll().catch(err => console.error('[usage] Burst initial poll error:', err));
+    return { burstUntil: new Date(this.burstUntil).toISOString(), intervalMs: BURST_POLL_MS };
+  }
+
+  stopBurst(): void {
+    if (this.burstTimer) {
+      clearInterval(this.burstTimer);
+      this.burstTimer = null;
+      this.burstUntil = 0;
+      console.log('[usage] Burst polling stopped');
+    }
+  }
+
+  isBursting(): boolean {
+    return this.burstUntil > Date.now();
+  }
+
   stop(): void {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
     }
+    this.stopBurst();
   }
 
   /** Tear down dedicated sessions on shutdown. */
@@ -291,6 +329,7 @@ export class UsagePoller {
     // Use 80 lines to capture full dialog (includes header, all buckets, extra usage)
     let buckets: UsageBucket[] = [];
     let bestBuckets: UsageBucket[] = [];
+    let lastRawOutput = '';
     const deadline = Date.now() + CAPTURE_TIMEOUT_MS;
     while (Date.now() < deadline) {
       await sleep(CAPTURE_POLL_MS);
@@ -302,6 +341,7 @@ export class UsagePoller {
       });
       if (!result.ok) break;
       const output = (result.data as string) ?? '';
+      lastRawOutput = output;
 
       buckets = config.parser(output);
       // Keep the best result (most buckets) seen so far
@@ -342,8 +382,11 @@ export class UsagePoller {
       }
       if (suspectBuckets.length > 0) {
         console.warn(`[usage] ${label}: suspect data — ${suspectBuckets.join(', ')}`);
+        // Trim raw output to last 40 lines for storage
+        const rawTail = lastRawOutput.split('\n').slice(-40).join('\n');
         this.db.logEvent('_usage-poller', 'suspect_data', undefined, {
           engine: config.engine, account: config.account, suspect: suspectBuckets,
+          rawOutput: rawTail,
         });
       }
 
