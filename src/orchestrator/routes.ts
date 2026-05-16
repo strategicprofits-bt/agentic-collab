@@ -656,6 +656,39 @@ route('GET', '/api/queue', async (req, res, _match, ctx) => {
   json(res, 200, messages);
 });
 
+// ── Agent Token Usage ──
+
+route('GET', '/api/agents/:name/usage', async (req, res, match, ctx) => {
+  const name = match.pathname.groups['name']!;
+  const agent = ctx.db.getAgent(name);
+  if (!agent) return json(res, 404, { error: 'Agent not found' });
+
+  const url = new URL(req.url!, `http://${req.headers.host}`);
+  const since = url.searchParams.get('since') ?? undefined;
+  const limit = parseInt(url.searchParams.get('limit') ?? '500', 10);
+
+  const snapshots = ctx.db.getTokenSnapshots(name, { since, limit: Math.min(limit, 5000) });
+
+  // Compute deltas between consecutive snapshots (returned in chronological order)
+  const chronological = [...snapshots].reverse();
+  const series = chronological.map((s, i) => ({
+    ...s,
+    deltaTokens: i > 0 ? s.totalTokens - chronological[i - 1]!.totalTokens : 0,
+  }));
+
+  const totalDelta = series.reduce((sum, s) => sum + Math.max(0, s.deltaTokens), 0);
+  const latest = chronological.length > 0 ? chronological[chronological.length - 1]! : null;
+
+  json(res, 200, {
+    agent: name,
+    snapshotCount: series.length,
+    latestTotalTokens: latest?.totalTokens ?? null,
+    latestContextPct: latest?.contextPct ?? null,
+    totalTokensConsumed: totalDelta,
+    series,
+  });
+});
+
 // ── Agent Files ──
 
 route('GET', '/api/agents/:name/files', async (_req, res, match, ctx) => {

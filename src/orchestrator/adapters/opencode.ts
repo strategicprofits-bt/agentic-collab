@@ -109,7 +109,7 @@ export class OpenCodeAdapter implements EngineAdapter {
       const tokens = parseInt(tokenMatch[1]!.replace(/,/g, ''), 10);
       const maxTokens = 200_000; // estimated context window
       const pct = Math.min(100, Math.round((tokens / maxTokens) * 100));
-      return { contextPct: pct, confident: false }; // confident: false since we don't know exact max
+      return { contextPct: pct, totalTokens: tokens, confident: false };
     }
 
     return { contextPct: null, confident: false };
