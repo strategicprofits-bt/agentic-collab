@@ -70,7 +70,7 @@ export class ClaudeAdapter implements EngineAdapter {
       if (!line) continue;
 
       // Skip status bar lines (token counts, version info, permission mode, /ide hints, context warnings, usage tier)
-      if (/\d+\s*tokens/.test(line)) continue;
+      if (/\d+(?:[.,]\d+)?\s*[kKmM]?\s*tokens/.test(line)) continue;
       if (/current:.*latest:/.test(line)) continue;
       if (/bypass permissions/.test(line)) continue;
       if (/\/ide\s/.test(line)) continue;
@@ -119,13 +119,17 @@ export class ClaudeAdapter implements EngineAdapter {
         return { contextPct: parseInt(pctMatch[1]!, 10), confident: true };
       }
 
-      // Token count format: "NNNNN tokens" — estimate percentage from 200k context window
-      const tokenMatch = line.match(/(\d[\d,]*)\s*tokens/);
+      // Token count format: "24.9k tokens", "150k tokens", "NNNNN tokens", or "↓ 24.9k tokens"
+      const tokenMatch = line.match(/↓?\s*(\d+(?:[.,]\d+)?)\s*([kKmM])?\s*tokens/);
       if (tokenMatch) {
-        const tokens = parseInt(tokenMatch[1]!.replace(/,/g, ''), 10);
+        let tokens = parseFloat(tokenMatch[1]!.replace(/,/g, ''));
+        const suffix = tokenMatch[2];
+        if (suffix === 'k' || suffix === 'K') tokens *= 1_000;
+        else if (suffix === 'm' || suffix === 'M') tokens *= 1_000_000;
+        tokens = Math.round(tokens);
         const maxTokens = 200_000; // Claude's context window
         const pct = Math.min(100, Math.round((tokens / maxTokens) * 100));
-        return { contextPct: pct, confident: true };
+        return { contextPct: pct, totalTokens: tokens, confident: true };
       }
     }
 

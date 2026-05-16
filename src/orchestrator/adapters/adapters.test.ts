@@ -242,6 +242,27 @@ describe('Engine Adapters', () => {
       assert.equal(result.confident, true);
     });
 
+    it('parses context percent from k-suffix format (24.9k tokens)', () => {
+      const result = adapter.parseContextPercent('Gusting… (33m 58s · ↓ 24.9k tokens · thought for 17s)');
+      assert.equal(result.contextPct, 12); // 24900/200000 ≈ 12.45% rounds to 12%
+      assert.equal(result.totalTokens, 24900);
+      assert.equal(result.confident, true);
+    });
+
+    it('parses context percent from K-suffix format (150K tokens)', () => {
+      const result = adapter.parseContextPercent('Working… (5m · ↓ 150K tokens)');
+      assert.equal(result.contextPct, 75);
+      assert.equal(result.totalTokens, 150000);
+      assert.equal(result.confident, true);
+    });
+
+    it('parses context percent from k-suffix without arrow (88.5k tokens)', () => {
+      const result = adapter.parseContextPercent('  88.5k tokens');
+      assert.equal(result.contextPct, 44); // 88500/200000 = 44.25% rounds to 44%
+      assert.equal(result.totalTokens, 88500);
+      assert.equal(result.confident, true);
+    });
+
     it('returns null context for no match', () => {
       const result = adapter.parseContextPercent('no context info here');
       assert.equal(result.contextPct, null);
