@@ -911,7 +911,9 @@ Run \`collab help\` for full command reference.`);
 Your terminal output, tool calls, and reasoning are invisible to the operator — only messages you send via \`collab send operator\` appear on the dashboard.
 
 Use /compact proactively when your context grows large.
-Keep context light — delegate to sub-agents when appropriate.`);
+Keep context light — delegate to sub-agents when appropriate.
+
+NEVER use /exit or exit your session. You are an always-on agent — your tmux session must remain alive. If you believe your work is done, go idle and wait for the next message.`);
 
   return parts.join('\n');
 }

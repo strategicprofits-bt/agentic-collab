@@ -147,7 +147,11 @@ export const DEFAULT_ENGINE_CONFIGS: DefaultEngineConfig[] = [
       { type: 'keystroke', key: 'Escape' },
     ]),
     hookCompact: JSON.stringify([
-      { type: 'shell', command: '/compact' },
+      { type: 'keystrokes', actions: [
+        { paste: '/compact', post_wait_ms: 200 },
+        { keystroke: 'Escape', post_wait_ms: 100 },
+        { keystroke: 'Enter' },
+      ]},
     ]),
     hookExit: JSON.stringify([
       { type: 'shell', command: '/exit' },
