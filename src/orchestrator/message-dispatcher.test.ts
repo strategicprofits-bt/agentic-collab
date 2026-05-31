@@ -115,4 +115,58 @@ describe('MessageDispatcher', () => {
       dispatcherInternals.DRAIN_INTERVAL_MS = originalDrainIntervalMs;
     }
   });
+
+  it('defers delivery when agent is active with recent token activity', async () => {
+    db.createAgent({ name: 'busy-agent', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    setAgentState('busy-agent', 'active');
+    // Simulate recent token activity
+    db.recordTokenSnapshot('busy-agent', 8000, 45);
+
+    db.enqueueMessage({
+      sourceAgent: null,
+      targetAgent: 'busy-agent',
+      envelope: 'Should be deferred',
+    });
+
+    const commands: ProxyCommand[] = [];
+    const dispatcher = makeDispatcher(async (_proxyId, command) => {
+      commands.push(command);
+      return { ok: true };
+    });
+
+    try {
+      const delivered = await dispatcher.tryDeliver('busy-agent');
+      assert.equal(delivered, false);
+      assert.equal(commands.length, 0);
+    } finally {
+      dispatcher.stop();
+    }
+  });
+
+  it('delivers when agent is active with no recent token activity', async () => {
+    db.createAgent({ name: 'idle-active', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    setAgentState('idle-active', 'active');
+    // No token snapshots recorded — agent has no recent activity
+
+    const msg = db.enqueueMessage({
+      sourceAgent: null,
+      targetAgent: 'idle-active',
+      envelope: 'Should deliver',
+    });
+
+    const commands: ProxyCommand[] = [];
+    const dispatcher = makeDispatcher(async (_proxyId, command) => {
+      commands.push(command);
+      return { ok: true };
+    });
+
+    try {
+      const delivered = await dispatcher.tryDeliver('idle-active');
+      assert.equal(delivered, true);
+      assert.ok(commands.some(c => c.action === 'paste'));
+      assert.equal(db.getPendingMessageById(msg.id)?.status, 'delivered');
+    } finally {
+      dispatcher.stop();
+    }
+  });
 });
