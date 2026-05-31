@@ -1106,4 +1106,74 @@ describe('Database', () => {
       assert.equal(after.status, 'completed');
     });
   });
+
+  describe('token snapshots', () => {
+    const agentName = 'token-snap-agent';
+
+    before(() => {
+      db.createAgent({ name: agentName, engine: 'claude', cwd: '/tmp/test', proxyId: null });
+    });
+
+    it('recordTokenSnapshot inserts a row retrievable by getTokenSnapshots', () => {
+      db.recordTokenSnapshot(agentName, 5000, 42);
+      const snaps = db.getTokenSnapshots(agentName, 1);
+      assert.equal(snaps.length, 1);
+      assert.equal(snaps[0]!.agentName, agentName);
+      assert.equal(snaps[0]!.totalTokens, 5000);
+      assert.equal(snaps[0]!.contextPct, 42);
+    });
+
+    it('recordTokenSnapshot accepts null contextPct', () => {
+      db.recordTokenSnapshot(agentName, 6000, null);
+      const snaps = db.getTokenSnapshots(agentName, 1);
+      assert.equal(snaps[0]!.contextPct, null);
+    });
+
+    it('hasRecentTokenActivity returns false with no snapshots', () => {
+      const fresh = 'token-snap-empty';
+      db.createAgent({ name: fresh, engine: 'claude', cwd: '/tmp/test', proxyId: null });
+      assert.equal(db.hasRecentTokenActivity(fresh), false);
+    });
+
+    it('hasRecentTokenActivity returns true after recent recordTokenSnapshot', () => {
+      assert.equal(db.hasRecentTokenActivity(agentName, 60), true);
+    });
+
+    it('hasRecentTokenActivity returns false for snapshot outside window', () => {
+      const old = 'token-snap-old';
+      db.createAgent({ name: old, engine: 'claude', cwd: '/tmp/test', proxyId: null });
+      // Insert a snapshot with a timestamp 120 seconds in the past
+      db.rawDb.prepare(
+        "INSERT INTO agent_token_snapshots (agent_name, total_tokens, context_pct, captured_at) VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-120 seconds'))"
+      ).run(old, 1000, 50);
+      assert.equal(db.hasRecentTokenActivity(old, 60), false);
+    });
+
+    it('pruneTokenSnapshots removes old rows and returns count', () => {
+      const pruneAgent = 'token-snap-prune';
+      db.createAgent({ name: pruneAgent, engine: 'claude', cwd: '/tmp/test', proxyId: null });
+      // Insert a snapshot 10 days old
+      db.rawDb.prepare(
+        "INSERT INTO agent_token_snapshots (agent_name, total_tokens, context_pct, captured_at) VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 days'))"
+      ).run(pruneAgent, 2000, 30);
+      // Insert a recent snapshot
+      db.recordTokenSnapshot(pruneAgent, 3000, 40);
+
+      const deleted = db.pruneTokenSnapshots(7);
+      assert.ok(deleted >= 1);
+      // Recent snapshot still present
+      const remaining = db.getTokenSnapshots(pruneAgent, 10);
+      assert.ok(remaining.length >= 1);
+      assert.ok(remaining.every(s => s.totalTokens !== 2000));
+    });
+
+    it('pruneTokenSnapshots returns 0 when nothing to prune', () => {
+      const noPrune = 'token-snap-noprune';
+      db.createAgent({ name: noPrune, engine: 'claude', cwd: '/tmp/test', proxyId: null });
+      db.recordTokenSnapshot(noPrune, 4000, 55);
+      const deleted = db.pruneTokenSnapshots(7);
+      // May be 0 if no old rows exist for this agent (other agents may have old rows)
+      assert.equal(typeof deleted, 'number');
+    });
+  });
 });

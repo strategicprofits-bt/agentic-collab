@@ -1260,6 +1260,14 @@ export class Database {
     }));
   }
 
+  hasRecentTokenActivity(agentName: string, withinSeconds = 60): boolean {
+    const row = this.db.prepare(
+      "SELECT 1 FROM agent_token_snapshots WHERE agent_name = ? AND captured_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?) LIMIT 1"
+    ).get(agentName, `-${withinSeconds} seconds`) as Record<string, unknown> | undefined;
+    return row !== undefined;
+  }
+
+
   pruneTokenSnapshots(retentionDays = 7): number {
     const result = this.db.prepare(
       "DELETE FROM agent_token_snapshots WHERE captured_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)"
