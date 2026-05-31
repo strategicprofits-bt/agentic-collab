@@ -212,6 +212,15 @@ export class MessageDispatcher {
     // Wait for any lifecycle cool-down before delivery (Race 2 fix)
     await this.waitForCoolDown(agentName);
 
+    // Health-state check: if the agent is active and has produced tokens
+    // in the last 60s, it's busy generating — defer delivery so we don't
+    // paste into a running TUI and accumulate stuck input.
+    const preCheck = this.db.getAgent(agentName);
+    if (preCheck?.state === 'active' && this.db.hasRecentTokenActivity(agentName, 60)) {
+      console.log(`[dispatcher] ${agentName}: active with recent token activity — deferring delivery`);
+      return false;
+    }
+
     const messages = this.db.getDeliverableMessages(agentName);
     if (messages.length === 0) return false;
 
