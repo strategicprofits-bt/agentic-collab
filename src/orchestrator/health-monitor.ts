@@ -121,6 +121,16 @@ export class HealthMonitor {
   private readonly autoSuspending = new Set<string>();
   /** Last recorded total token count per agent — used to skip duplicate snapshots. */
   private readonly lastTokenCount = new Map<string, number>();
+  /** Timestamps of recent recovery attempts per agent — used for circuit breaker. */
+  private readonly recoveryHistory = new Map<string, number[]>();
+  /** Max recovery attempts within the sliding window before tripping the breaker. */
+  static readonly MAX_RECOVERY_ATTEMPTS = 5;
+  /** Sliding window size (ms) for counting recovery attempts. 30 minutes. */
+  static readonly RECOVERY_WINDOW_MS = 30 * 60 * 1000;
+  /** How long an agent must stay healthy before its recovery history resets (ms). 10 minutes. */
+  static readonly RECOVERY_STABILIZE_MS = 10 * 60 * 1000;
+  /** Pending recovery timers per agent — cleared on stop() for clean shutdown. */
+  private readonly recoveryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(opts: HealthMonitorOptions) {
     this.db = opts.db;
@@ -308,6 +318,10 @@ export class HealthMonitor {
       clearTimeout(timer);
     }
     this.stateWatchdogTimers.clear();
+    for (const timer of this.recoveryTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.recoveryTimers.clear();
   }
 
   /**
@@ -400,6 +414,20 @@ export class HealthMonitor {
         await this.pollFailedAgent(agent);
       } catch (err) {
         console.error(`[health] Error polling failed ${agent.name}:`, err);
+      }
+    }
+
+    // Stabilization check: clear recovery history for agents that stayed healthy
+    const now = Date.now();
+    for (const [name, history] of this.recoveryHistory) {
+      if (history.length === 0) { this.recoveryHistory.delete(name); continue; }
+      const agent = this.db.getAgent(name);
+      if (!agent || (agent.state !== 'active' && agent.state !== 'idle')) continue;
+      const latest = Math.max(...history);
+      if (now - latest >= HealthMonitor.RECOVERY_STABILIZE_MS) {
+        console.log(`[health] ${name}: stable for ${HealthMonitor.RECOVERY_STABILIZE_MS / 60_000}min — clearing recovery history`);
+        this.recoveryHistory.delete(name);
+        this.db.logEvent(name, 'recovery_history_cleared');
       }
     }
   }
@@ -922,26 +950,80 @@ export class HealthMonitor {
   /**
    * Check if an agent that just failed should be auto-recovered.
    * Reads the engine's detection config for the autoRecover flag.
-   * Fires asynchronously — does not block the poll cycle.
+   * Applies exponential backoff and a circuit breaker: after MAX_RECOVERY_ATTEMPTS
+   * within RECOVERY_WINDOW_MS, stops recovering and alerts DrRobby.
    */
   private maybeAutoRecover(agent: AgentRecord): void {
     const resolved = this.resolveAgent(agent);
     const detection = this.getDetection(resolved);
     if (!detection?.config.autoRecover) return;
 
-    console.log(`[health] ${agent.name}: autoRecover enabled — scheduling recovery`);
-    this.db.logEvent(agent.name, 'auto_recover_triggered');
-    this.emitSystemMessage(agent.name, 'Auto-recovering...');
+    // ── Circuit breaker: check recovery history ──
+    const now = Date.now();
+    const windowStart = now - HealthMonitor.RECOVERY_WINDOW_MS;
+    const history = this.recoveryHistory.get(agent.name) ?? [];
+    const recent = history.filter(ts => ts >= windowStart);
 
-    // Fire-and-forget — recovery is a full lifecycle operation
-    const lifecycleCtx = this.makeLifecycleCtx();
-    recoverAgent(lifecycleCtx, agent.name).then(() => {
-      console.log(`[health] ${agent.name}: auto-recovery completed`);
-      this.onAgentUpdate(agent.name);
-    }).catch((err) => {
-      console.error(`[health] ${agent.name}: auto-recovery failed:`, err);
-      this.onAgentUpdate(agent.name);
+    if (recent.length >= HealthMonitor.MAX_RECOVERY_ATTEMPTS) {
+      console.warn(
+        `[health] ${agent.name}: circuit breaker tripped — ${recent.length} recoveries in ${HealthMonitor.RECOVERY_WINDOW_MS / 60_000}min window, skipping recovery`,
+      );
+      this.db.logEvent(agent.name, 'circuit_breaker_tripped', undefined, {
+        attempts: String(recent.length),
+        windowMinutes: String(HealthMonitor.RECOVERY_WINDOW_MS / 60_000),
+      });
+      this.emitSystemMessage(
+        agent.name,
+        `Circuit breaker tripped — ${recent.length} failed recoveries in ${HealthMonitor.RECOVERY_WINDOW_MS / 60_000}min. Auto-recover disabled until manual intervention.`,
+      );
+      const body = `🔴 ${agent.name} circuit breaker tripped: ${recent.length} crash-loop recoveries in ${HealthMonitor.RECOVERY_WINDOW_MS / 60_000}min. Agent left in failed state — needs manual investigation.`;
+      const envelope = `[from: system, reply with collab send system --topic circuit-breaker]: '${body.replace(/'/g, "\\'")}'`;
+      const pending = this.db.enqueueMessage({
+        sourceAgent: null,
+        targetAgent: 'DrRobby',
+        envelope,
+      });
+      this.onQueueUpdate(pending);
+      this.onMessageEnqueued('DrRobby');
+      this.recoveryHistory.delete(agent.name);
+      return;
+    }
+
+    recent.push(now);
+    this.recoveryHistory.set(agent.name, recent);
+
+    // Exponential backoff: delay = BASE * 2^(attempts-1), capped at MAX
+    const BASE_DELAY_MS = 10_000;
+    const MAX_DELAY_MS = 5 * 60_000;
+    const delayMs = Math.min(BASE_DELAY_MS * Math.pow(2, recent.length - 1), MAX_DELAY_MS);
+
+    console.log(
+      `[health] ${agent.name}: autoRecover attempt ${recent.length}/${HealthMonitor.MAX_RECOVERY_ATTEMPTS} — delaying ${Math.round(delayMs / 1000)}s`,
+    );
+    this.db.logEvent(agent.name, 'auto_recover_triggered', undefined, {
+      attempt: String(recent.length),
+      delayMs: String(delayMs),
     });
+    this.emitSystemMessage(agent.name, `Auto-recovering (attempt ${recent.length}/${HealthMonitor.MAX_RECOVERY_ATTEMPTS}, delay ${Math.round(delayMs / 1000)}s)...`);
+
+    const timer = setTimeout(() => {
+      this.recoveryTimers.delete(agent.name);
+      const current = this.db.getAgent(agent.name);
+      if (!current || current.state !== 'failed') {
+        console.log(`[health] ${agent.name}: skipping recovery — state changed to ${current?.state ?? 'deleted'} during backoff`);
+        return;
+      }
+
+      const lifecycleCtx = this.makeLifecycleCtx();
+      recoverAgent(lifecycleCtx, agent.name).then(() => {
+        console.log(`[health] ${agent.name}: auto-recovery completed`);
+        this.onAgentUpdate(agent.name);
+      }).catch((err) => {
+        console.error(`[health] ${agent.name}: auto-recovery failed:`, err);
+        this.onAgentUpdate(agent.name);
+      });
+    }, delayMs);
+    this.recoveryTimers.set(agent.name, timer);
   }
 
   /** Emit a lifecycle event as a system message in the agent's chat thread. */
