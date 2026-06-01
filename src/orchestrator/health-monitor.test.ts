@@ -1228,3 +1228,170 @@ describe('Permission prompt detection patterns', () => {
     assert.ok(!TOOL_PROMPT_RE.test(alertText));
   });
 });
+
+describe('Auto-recover circuit breaker', () => {
+  let cbDb: Database;
+  let cbTmpDir: string;
+  const monitors: HealthMonitor[] = [];
+
+  const CLAUDE_DETECTION = JSON.stringify({
+    idlePatterns: [{ pattern: '^[\\u276f>]\\s*$', lines: 5 }],
+    activePatterns: [],
+    contextPattern: '(\\d+)\\s*tokens',
+    idleThreshold: 2,
+    autoRecover: true,
+  });
+
+  before(() => {
+    cbTmpDir = mkdtempSync(join(tmpdir(), 'cb-test-'));
+    cbDb = new Database(join(cbTmpDir, 'test.db'));
+    cbDb.registerProxy('p1', 'tok', 'localhost:3100');
+    cbDb.createEngineConfig({
+      name: 'claude',
+      engine: 'claude',
+      detection: CLAUDE_DETECTION,
+    });
+  });
+
+  afterEach(() => {
+    for (const m of monitors) m.stop();
+    monitors.length = 0;
+  });
+
+  after(() => {
+    cbDb.close();
+    rmSync(cbTmpDir, { recursive: true, force: true });
+  });
+
+  function makeCbMonitor(overrides?: Partial<ConstructorParameters<typeof HealthMonitor>[0]>): HealthMonitor {
+    const monitor = new HealthMonitor({
+      db: cbDb,
+      locks: new LockManager(cbDb.rawDb),
+      proxyDispatch: async (_proxyId: string, command: ProxyCommand): Promise<ProxyResponse> => {
+        if (command.action === 'capture') {
+          return { ok: true, data: 'No conversation found with session ID abc123\nagent@host:~$ ' };
+        }
+        if (command.action === 'has_session') {
+          return { ok: true, data: true };
+        }
+        return { ok: true };
+      },
+      orchestratorHost: 'http://localhost:3000',
+      pollIntervalMs: 100,
+      ...overrides,
+    });
+    monitors.push(monitor);
+    return monitor;
+  }
+
+  it('trips circuit breaker after MAX_RECOVERY_ATTEMPTS within the sliding window', async () => {
+    cbDb.createAgent({ name: 'cb-loop', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = cbDb.getAgent('cb-loop')!;
+    cbDb.updateAgentState('cb-loop', 'active', a.version, {
+      tmuxSession: 'agent-cb-loop',
+      proxyId: 'p1',
+    });
+
+    const monitor = makeCbMonitor();
+
+    // Pre-populate recovery history at the threshold
+    const now = Date.now();
+    const history = Array.from({ length: HealthMonitor.MAX_RECOVERY_ATTEMPTS }, (_, i) => now - i * 1000);
+    (monitor as any).recoveryHistory.set('cb-loop', history);
+
+    // Trigger exit detection (2 consecutive polls) — this should trip the breaker
+    await monitor.pollAll();
+    await monitor.pollAll();
+
+    const events = cbDb.getEvents('cb-loop', 100);
+    const tripped = events.filter((e: { event: string }) => e.event === 'circuit_breaker_tripped');
+    assert.ok(tripped.length > 0, 'circuit_breaker_tripped event should be logged');
+  });
+
+  it('applies exponential backoff delay on recovery attempts', async () => {
+    cbDb.createAgent({ name: 'cb-backoff', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = cbDb.getAgent('cb-backoff')!;
+    cbDb.updateAgentState('cb-backoff', 'active', a.version, {
+      tmuxSession: 'agent-cb-backoff',
+      proxyId: 'p1',
+    });
+
+    const monitor = makeCbMonitor();
+
+    // Trigger one exit detection cycle (2 polls)
+    await monitor.pollAll();
+    await monitor.pollAll();
+
+    const events = cbDb.getEvents('cb-backoff', 100);
+    const triggered = events.filter((e: { event: string }) => e.event === 'auto_recover_triggered');
+    assert.ok(triggered.length > 0, 'auto_recover_triggered event should be logged');
+
+    // Check that meta includes attempt count and delay
+    const meta = JSON.parse((triggered[0] as any).meta ?? '{}');
+    assert.equal(meta.attempt, '1');
+    assert.equal(meta.delayMs, '10000');
+  });
+
+  it('resets recovery history after stabilization period', async () => {
+    cbDb.createAgent({ name: 'cb-stable', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = cbDb.getAgent('cb-stable')!;
+    cbDb.updateAgentState('cb-stable', 'active', a.version, {
+      tmuxSession: 'agent-cb-stable',
+      proxyId: 'p1',
+    });
+
+    // Normal CLI output — no exit detected
+    const monitor = makeCbMonitor({
+      proxyDispatch: async (_proxyId: string, command: ProxyCommand): Promise<ProxyResponse> => {
+        if (command.action === 'capture') {
+          return { ok: true, data: '❯ \nsome normal output\n' };
+        }
+        if (command.action === 'has_session') {
+          return { ok: true, data: true };
+        }
+        return { ok: true };
+      },
+    });
+
+    // Seed recovery history with timestamps older than stabilization period
+    const staleTs = Date.now() - HealthMonitor.RECOVERY_STABILIZE_MS - 1000;
+    (monitor as any).recoveryHistory.set('cb-stable', [staleTs, staleTs, staleTs]);
+    assert.equal((monitor as any).recoveryHistory.get('cb-stable').length, 3);
+
+    await monitor.pollAll();
+
+    const history = (monitor as any).recoveryHistory.get('cb-stable');
+    assert.ok(!history, 'recovery history should be cleared after stabilization period');
+  });
+
+  it('does not reset recovery history for agents still in failed state', async () => {
+    cbDb.createAgent({ name: 'cb-failed', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = cbDb.getAgent('cb-failed')!;
+    cbDb.updateAgentState('cb-failed', 'failed', a.version, {
+      tmuxSession: 'agent-cb-failed',
+      proxyId: 'p1',
+      failedAt: new Date().toISOString(),
+      failureReason: 'test failure',
+    });
+
+    const monitor = makeCbMonitor({
+      proxyDispatch: async (_proxyId: string, command: ProxyCommand): Promise<ProxyResponse> => {
+        if (command.action === 'capture') {
+          return { ok: true, data: 'agent@host:~$ ' };
+        }
+        if (command.action === 'has_session') {
+          return { ok: true, data: true };
+        }
+        return { ok: true };
+      },
+    });
+
+    const staleTs = Date.now() - HealthMonitor.RECOVERY_STABILIZE_MS - 1000;
+    (monitor as any).recoveryHistory.set('cb-failed', [staleTs, staleTs]);
+
+    await monitor.pollAll();
+
+    const history = (monitor as any).recoveryHistory.get('cb-failed');
+    assert.ok(history && history.length === 2, 'recovery history should NOT be cleared for failed agents');
+  });
+});
