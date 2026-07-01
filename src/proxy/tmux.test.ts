@@ -31,25 +31,20 @@ describe('tmux sendKeys validation', () => {
     assert.throws(() => sendKeys('$(whoami)', 'Escape'), /Invalid session name/);
   });
 
-  // Valid keys would succeed validation but fail on tmux exec (no tmux in test).
-  // We verify they pass validation by checking the error is from tmux, not from our validation.
-  it('accepts valid key names (Escape, Enter, C-c pattern)', () => {
-    // These pass validation but fail on tmux execution — that's expected
-    try {
-      sendKeys('test-session', 'Escape Escape Escape');
-    } catch (err) {
-      // Should fail with "tmux command failed" not "Invalid keys"
-      assert.ok((err as Error).message.includes('tmux command failed'),
-        `Expected tmux error, got: ${(err as Error).message}`);
-    }
+  // Valid keys pass synchronous validation, then the async tmux exec rejects
+  // (no such session / no tmux in the test env). We assert the rejection comes
+  // from tmux execution, not from our validation — proving validation passed.
+  it('accepts valid key names (Escape, Enter, C-c pattern)', async () => {
+    await assert.rejects(
+      sendKeys('test-session', 'Escape Escape Escape'),
+      /tmux command failed/,
+    );
   });
 
-  it('accepts C-c style keys', () => {
-    try {
-      sendKeys('test-session', 'C-c');
-    } catch (err) {
-      assert.ok((err as Error).message.includes('tmux command failed'),
-        `Expected tmux error, got: ${(err as Error).message}`);
-    }
+  it('accepts C-c style keys', async () => {
+    await assert.rejects(
+      sendKeys('test-session', 'C-c'),
+      /tmux command failed/,
+    );
   });
 });

@@ -188,7 +188,7 @@ async function executeCommand(command: ProxyCommand): Promise<ProxyResponse> {
   try {
     switch (command.action) {
       case 'create_session':
-        tmux.createSession(command.sessionName, command.cwd);
+        await tmux.createSession(command.sessionName, command.cwd);
         return { ok: true };
 
       case 'paste':
@@ -196,39 +196,39 @@ async function executeCommand(command: ProxyCommand): Promise<ProxyResponse> {
         return { ok: true };
 
       case 'capture': {
-        const output = tmux.capturePaneLines(command.sessionName, command.lines);
+        const output = await tmux.capturePaneLines(command.sessionName, command.lines);
         return { ok: true, data: output };
       }
 
       case 'kill_session':
-        tmux.killSession(command.sessionName);
+        await tmux.killSession(command.sessionName);
         return { ok: true };
 
       case 'list_sessions': {
-        const sessions = tmux.listSessions();
+        const sessions = await tmux.listSessions();
         return { ok: true, data: sessions };
       }
 
       case 'has_session': {
-        const exists = tmux.hasSession(command.sessionName);
+        const exists = await tmux.hasSession(command.sessionName);
         return { ok: true, data: exists };
       }
 
       case 'pane_activity': {
-        const activity = tmux.paneActivity(command.sessionName);
+        const activity = await tmux.paneActivity(command.sessionName);
         return { ok: true, data: activity };
       }
 
       case 'send_keys':
-        tmux.sendKeys(command.sessionName, command.keys);
+        await tmux.sendKeys(command.sessionName, command.keys);
         return { ok: true };
 
       case 'send_keys_raw':
-        tmux.sendKeysRaw(command.sessionName, command.keys);
+        await tmux.sendKeysRaw(command.sessionName, command.keys);
         return { ok: true };
 
       case 'display_message': {
-        const output = tmux.displayMessage(command.sessionName, command.format);
+        const output = await tmux.displayMessage(command.sessionName, command.format);
         return { ok: true, data: output };
       }
 
@@ -253,11 +253,11 @@ async function executeCommand(command: ProxyCommand): Promise<ProxyResponse> {
       }
 
       case 'resize_pane':
-        tmux.resizePane(command.sessionName, command.width, command.height);
+        await tmux.resizePane(command.sessionName, command.width, command.height);
         return { ok: true };
 
       case 'clear_history':
-        tmux.clearHistory(command.sessionName);
+        await tmux.clearHistory(command.sessionName);
         return { ok: true };
 
       default:
