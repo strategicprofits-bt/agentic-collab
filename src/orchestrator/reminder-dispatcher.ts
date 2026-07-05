@@ -55,7 +55,10 @@ export class ReminderDispatcher {
       this.db.updateReminderDelivery(reminder.id);
 
       const creator = reminder.createdBy || 'system';
-      const envelope = `[reminder #${reminder.id} from ${creator}]: ${reminder.prompt}\nMark done when complete: collab reminder done ${reminder.id}`;
+      // GAP-016: reminders recur automatically on their own cadence — do NOT tell
+      // the agent to "mark done" (that DELETES the reminder and kills the recurrence).
+      // `done` is only for permanently stopping a reminder you no longer want.
+      const envelope = `[reminder #${reminder.id} from ${creator}]: ${reminder.prompt}\nThis reminder recurs automatically — nothing to do to keep it going. Run \`collab reminder done ${reminder.id}\` ONLY when you want to STOP it for good.`;
 
       // Show reminder in dashboard thread
       const displayMessage = `Reminder #${reminder.id}: ${reminder.prompt}`;

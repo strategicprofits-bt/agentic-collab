@@ -1797,30 +1797,11 @@ route('POST', '/api/reminders/:id/complete', async (_req, res, match, ctx) => {
   const reminder = ctx.db.getReminder(id);
   if (!reminder) return json(res, 404, { error: 'Reminder not found' });
 
-  // Delete the completed reminder — no need to keep it around
+  // `done` = explicitly STOP this reminder (remove it). Reminders recur on their
+  // own cadence automatically (GAP-016), so `done` is only for ending a reminder
+  // you no longer want — NOT a per-occurrence acknowledgement. There is no queue
+  // to promote: all pending reminders fire independently on their own cadences.
   ctx.db.deleteReminder(id);
-
-  // Promote the next pending reminder (now that the completed one is gone)
-  const next = ctx.db.getTopReminder(reminder.agentName);
-  if (next) {
-    // Respect skipIfActive on promoted reminders (same check as ReminderDispatcher.tick)
-    const agent = ctx.db.getAgent(next.agentName);
-    const skipBecauseActive = next.skipIfActive && agent && agent.state === 'active';
-    if (!skipBecauseActive) {
-      const creator = next.createdBy || 'system';
-      const envelope = `[reminder #${next.id} from ${creator}]: ${next.prompt}\nMark done when complete: collab reminder done ${next.id}`;
-      const msg = ctx.db.enqueueMessage({
-        sourceAgent: null,
-        targetAgent: next.agentName,
-        envelope,
-      });
-      ctx.db.updateReminderDelivery(next.id);
-      ctx.wss.broadcast(JSON.stringify({ type: 'queue_update', message: msg }));
-      ctx.messageDispatcher.tryDeliver(next.agentName).catch((err) => {
-        console.error(`[routes] Reminder promotion delivery failed for ${next.agentName}:`, (err as Error).message);
-      });
-    }
-  }
 
   broadcastReminderUpdate(ctx);
   json(res, 200, { ok: true, deleted: id });

@@ -721,26 +721,6 @@ describe('Database', () => {
       assert.equal(rDb.swapReminderOrder(rA.id, rB.id), false);
     });
 
-    it('getTopReminder returns lowest sort_order pending', () => {
-      // Create a fresh agent with known state
-      rDb.createAgent({ name: 'rem-agent-top', engine: 'claude', cwd: '/tmp' });
-      const first = rDb.createReminder({
-        agentName: 'rem-agent-top',
-        prompt: 'First',
-        cadenceMinutes: 5,
-      });
-      rDb.createReminder({
-        agentName: 'rem-agent-top',
-        prompt: 'Second',
-        cadenceMinutes: 5,
-      });
-
-      const top = rDb.getTopReminder('rem-agent-top');
-      assert.ok(top);
-      assert.equal(top!.id, first.id);
-      assert.equal(top!.prompt, 'First');
-    });
-
     it('listDueReminders returns reminders where cadence elapsed since creation', () => {
       rDb.createAgent({ name: 'rem-agent-due', engine: 'claude', cwd: '/tmp' });
       const r = rDb.createReminder({
@@ -833,6 +813,19 @@ describe('Database', () => {
         "UPDATE reminders SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 minutes') WHERE id = ?"
       ).run(r.id);
       assert.equal(rDb.hasImminentReminder('rem-imm-overdue', 300_000), true);
+    });
+
+    it('hasImminentReminder checks ALL pending reminders, not just the top (GAP-016)', () => {
+      rDb.createAgent({ name: 'rem-imm-nontop', engine: 'claude', cwd: '/tmp' });
+      // Top reminder (lowest sort_order) fires far in the future — NOT imminent.
+      rDb.createReminder({ agentName: 'rem-imm-nontop', prompt: 'Top, far future', cadenceMinutes: 60 });
+      // A second (non-top) reminder is overdue — imminent.
+      const soon = rDb.createReminder({ agentName: 'rem-imm-nontop', prompt: 'Non-top, overdue', cadenceMinutes: 5 });
+      rDb.rawDb.prepare(
+        "UPDATE reminders SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 minutes') WHERE id = ?"
+      ).run(soon.id);
+      // Old top-only logic returned false (top not imminent); GAP-016 checks all pending → true.
+      assert.equal(rDb.hasImminentReminder('rem-imm-nontop', 300_000), true);
     });
   });
 

@@ -155,17 +155,17 @@ describe('ReminderDispatcher', () => {
     dispatcher.stop();
   });
 
-  it('completing top reminder makes next one deliverable immediately', () => {
+  it('all due reminders for an agent fire independently in one tick (GAP-016: no queue-gating)', () => {
     db.createAgent({ name: 'dispatch-agent-seq', engine: 'claude', cwd: '/tmp' });
 
     const r1 = db.createReminder({
       agentName: 'dispatch-agent-seq',
-      prompt: 'First task',
+      prompt: 'First schedule',
       cadenceMinutes: 5,
     });
     const r2 = db.createReminder({
       agentName: 'dispatch-agent-seq',
-      prompt: 'Second task',
+      prompt: 'Second schedule',
       cadenceMinutes: 5,
     });
 
@@ -177,23 +177,15 @@ describe('ReminderDispatcher', () => {
       "UPDATE reminders SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 minutes') WHERE id = ?"
     ).run(r2.id);
 
-    // First tick should deliver r1 (top reminder)
+    // GAP-016: reminders are independent recurring schedules — BOTH due reminders
+    // fire in a single tick, NOT one-at-a-time behind a MIN(sort_order) queue.
     const dispatcher = new ReminderDispatcher({ db, messageDispatcher: mockMessageDispatcher() });
     dispatcher.tick();
 
-    const afterTick1 = db.getReminder(r1.id)!;
-    assert.ok(afterTick1.lastDeliveredAt !== null);
-
-    // r2 is not the top reminder, so it should not have been delivered
-    const afterTick1R2 = db.getReminder(r2.id)!;
-    assert.equal(afterTick1R2.lastDeliveredAt, null);
-
-    // Complete r1 — now r2 becomes the top reminder
-    db.completeReminder(r1.id);
-
-    // r2 was created 10m ago with 5m cadence — should be due after promotion
-    const due = db.listDueReminders();
-    assert.ok(due.some(d => d.id === r2.id));
+    const afterR1 = db.getReminder(r1.id)!;
+    const afterR2 = db.getReminder(r2.id)!;
+    assert.ok(afterR1.lastDeliveredAt !== null, 'r1 delivered');
+    assert.ok(afterR2.lastDeliveredAt !== null, 'r2 ALSO delivered same tick — independent, not queue-gated behind r1');
 
     // Clean up
     db.deleteReminder(r1.id);

@@ -881,25 +881,35 @@ export class Database {
   }
 
   hasImminentReminder(agentName: string, windowMs: number): boolean {
-    const reminder = this.getTopReminder(agentName);
-    if (!reminder) return false;
-
+    // GAP-016: reminders fire independently on their own cadence (no top-of-queue
+    // gating), so check whether ANY pending reminder is imminent within the window
+    // — not just the lowest-sort_order one.
+    const rows = this.db.prepare(
+      "SELECT * FROM reminders WHERE agent_name = ? AND status = 'pending'"
+    ).all(agentName) as Array<Record<string, unknown>>;
     const now = Date.now();
 
-    if (reminder.deliverAt) {
-      if (reminder.lastDeliveredAt) {
-        const lastDate = new Date(reminder.lastDeliveredAt).toDateString();
-        if (lastDate === new Date().toDateString()) return false;
+    for (const row of rows) {
+      const reminder = mapReminderRow(row);
+
+      if (reminder.deliverAt) {
+        if (reminder.lastDeliveredAt) {
+          const lastDate = new Date(reminder.lastDeliveredAt).toDateString();
+          if (lastDate === new Date().toDateString()) continue; // already delivered today
+        }
+        const [h, m] = reminder.deliverAt.split(':').map(Number);
+        const target = new Date();
+        target.setHours(h, m, 0, 0);
+        if (target.getTime() - now <= windowMs) return true;
+        continue;
       }
-      const [h, m] = reminder.deliverAt.split(':').map(Number);
-      const target = new Date();
-      target.setHours(h, m, 0, 0);
-      return target.getTime() - now <= windowMs;
+
+      const anchor = reminder.lastDeliveredAt || reminder.createdAt;
+      const nextFireAt = new Date(anchor).getTime() + reminder.cadenceMinutes * 60_000;
+      if (nextFireAt - now <= windowMs) return true;
     }
 
-    const anchor = reminder.lastDeliveredAt || reminder.createdAt;
-    const nextFireAt = new Date(anchor).getTime() + reminder.cadenceMinutes * 60_000;
-    return nextFireAt - now <= windowMs;
+    return false;
   }
 
   swapReminderOrder(id1: number, id2: number): boolean {
@@ -911,14 +921,6 @@ export class Database {
     this.db.prepare('UPDATE reminders SET sort_order = ? WHERE id = ?').run(r2.sortOrder, id1);
     this.db.prepare('UPDATE reminders SET sort_order = ? WHERE id = ?').run(r1.sortOrder, id2);
     return true;
-  }
-
-  getTopReminder(agentName: string): Reminder | undefined {
-    const row = this.db.prepare(
-      "SELECT * FROM reminders WHERE agent_name = ? AND status = 'pending' ORDER BY sort_order ASC LIMIT 1"
-    ).get(agentName) as Record<string, unknown> | undefined;
-    if (!row) return undefined;
-    return mapReminderRow(row);
   }
 
   updateReminder(id: number, opts: { prompt?: string; cadenceMinutes?: number; skipIfActive?: boolean; deliverAt?: string | null }): Reminder | undefined {
@@ -949,18 +951,18 @@ export class Database {
   }
 
   listDueReminders(): Reminder[] {
-    // For each agent, find their top pending reminder where delivery is due.
+    // Return EVERY pending reminder whose delivery is due. Reminders are
+    // independent recurring schedules — they fire on their own cadence and do
+    // NOT queue-gate each other (no MIN(sort_order) top-only firing). sort_order
+    // is retained purely for dashboard display order. (GAP-016: the old
+    // single-top-of-queue model blocked an agent's other reminders behind the
+    // top one and, combined with the done→delete envelope, silently killed
+    // recurring reminders.)
     // Two modes:
     //   1. deliver_at (clock-time): fire when local time >= deliver_at AND not yet delivered today
     //   2. cadence (interval): fire when cadence_minutes have elapsed since last delivery
     const rows = this.db.prepare(`
       SELECT r.* FROM reminders r
-      INNER JOIN (
-        SELECT agent_name, MIN(sort_order) AS min_order
-        FROM reminders
-        WHERE status = 'pending'
-        GROUP BY agent_name
-      ) top ON r.agent_name = top.agent_name AND r.sort_order = top.min_order
       WHERE r.status = 'pending'
         AND (
           CASE
