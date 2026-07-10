@@ -2070,15 +2070,34 @@ export function createRouter(ctx: RouteContext): (req: IncomingMessage, res: Ser
   return async (req, res) => {
     const url = new URL(req.url!, `http://${req.headers.host}`);
 
-    // Auth: state-mutating methods require Bearer token (GET and OPTIONS are exempt)
-    if (req.method !== 'GET' && req.method !== 'OPTIONS') {
+    // Auth: state-mutating methods AND sensitive GET reads require a Bearer token.
+    // Public GETs (dashboard shell, docs, published pages, health/status) stay open so
+    // the UI and published pages load without a token. Every other GET — the message
+    // store (/api/dashboard/threads, /messages/search), agents, events, stores, etc. —
+    // requires auth, preventing unauthenticated exfiltration of the message history and
+    // other data. The dashboard sends `Authorization: Bearer` on all its /api calls
+    // (including GETs, via authHeaders), so its reads keep working; only unauthenticated
+    // external GETs are rejected.
+    const authPath = url.pathname;
+    const isPublicGet = req.method === 'GET' && (
+      authPath === '/dashboard' || authPath.startsWith('/dashboard/') ||
+      authPath === '/docs' || authPath.startsWith('/docs/') ||
+      authPath.startsWith('/pages/') ||
+      authPath === '/api/orchestrator/status' ||
+      authPath === '/api/engines/status' ||
+      authPath === '/api/voice/status'
+    );
+    if (req.method !== 'OPTIONS' && !isPublicGet) {
       if (!authorize(ctx.orchestratorSecret, req)) {
         json(res, 401, { error: 'Unauthorized' });
         return;
       }
+    }
 
-      // Rate limiting for POST/DELETE — applied after auth to avoid wasting
-      // rate limit tokens on unauthenticated requests
+    // Rate limiting for state-mutating methods only (reads are not rate-limited to
+    // avoid throttling the dashboard's polling). Applied after auth so unauthenticated
+    // requests don't consume rate-limit tokens.
+    if (req.method !== 'GET' && req.method !== 'OPTIONS') {
       const clientIp = req.socket.remoteAddress ?? 'unknown';
       const isUpload = url.pathname === '/api/dashboard/upload';
       const limit = isUpload ? RATE_LIMIT_UPLOAD_MAX : RATE_LIMIT_MAX;

@@ -566,8 +566,20 @@ describe('API Routes — Auth', () => {
     return { status: resp.status, data };
   }
 
-  it('GET requests bypass auth', async () => {
+  it('unauthenticated GET on a sensitive route is rejected (401)', async () => {
+    // Sensitive /api reads (message store, agents, ...) require the Bearer token —
+    // GET is no longer auth-exempt (prevents unauthenticated data exfiltration).
     const { status } = await apiAuth('GET', '/api/agents');
+    assert.equal(status, 401);
+  });
+
+  it('authenticated GET on a sensitive route is allowed', async () => {
+    const { status } = await apiAuth('GET', '/api/agents', undefined, SECRET);
+    assert.equal(status, 200);
+  });
+
+  it('public GET (health/status) is allowed without auth', async () => {
+    const { status } = await apiAuth('GET', '/api/orchestrator/status');
     assert.equal(status, 200);
   });
 
@@ -665,9 +677,11 @@ describe('API Routes — Rate Limiting', () => {
   });
 
   it('GET requests are not rate limited', async () => {
-    // GET should work unlimited times
+    // Rate limiting applies to state-mutating methods only, not reads. A public
+    // GET (health/status) should work unlimited times without hitting the limit.
+    // (Sensitive GETs now require auth, so use a public-allowlist route here.)
     for (let i = 0; i < 10; i++) {
-      const resp = await fetch(`http://localhost:${port}/api/agents`);
+      const resp = await fetch(`http://localhost:${port}/api/orchestrator/status`);
       assert.equal(resp.status, 200);
     }
   });
