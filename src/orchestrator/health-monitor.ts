@@ -44,6 +44,13 @@ export type HealthMonitorOptions = {
   onIdleDetected?: (agentName: string) => void;
   pollIntervalMs?: number;
   idleSuspendMs?: number;        // ms of idle before suspend (default 5 minutes)
+  /**
+   * Global kill-switch for auto-recovery (incident mitigation). When true, a failed
+   * agent is left in `failed` for manual recovery instead of being auto-respawned —
+   * removing the "flood fake session-death alerts → force-respawn" lever during an
+   * active injection/IR. Defaults to the DISABLE_AUTO_RECOVER env var ('1'). Reversible.
+   */
+  autoRecoverDisabled?: boolean;
 };
 
 const DEFAULT_POLL_MS = 30_000;
@@ -94,6 +101,8 @@ export class HealthMonitor {
   private readonly orchestratorHost: string;
   private readonly pollIntervalMs: number;
   private readonly idleSuspendMs: number;
+  /** When true, auto-recovery is globally suppressed (incident kill-switch). */
+  private readonly autoRecoverDisabled: boolean;
   static readonly FAST_POLL_MS = 2_000;
   private readonly onAgentUpdate: (agentName: string) => void;
   private readonly onQueueUpdate: (message: PendingMessage) => void;
@@ -145,6 +154,10 @@ export class HealthMonitor {
     this.onIdleDetected = opts.onIdleDetected ?? (() => {});
     this.pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_MS;
     this.idleSuspendMs = opts.idleSuspendMs ?? DEFAULT_IDLE_SUSPEND_MS;
+    this.autoRecoverDisabled = opts.autoRecoverDisabled ?? (process.env['DISABLE_AUTO_RECOVER'] === '1');
+    if (this.autoRecoverDisabled) {
+      console.warn('[health] DISABLE_AUTO_RECOVER active — auto-recovery suppressed; failed agents need manual recovery');
+    }
   }
 
   /**
@@ -954,6 +967,13 @@ export class HealthMonitor {
    * within RECOVERY_WINDOW_MS, stops recovering and alerts DrRobby.
    */
   private maybeAutoRecover(agent: AgentRecord): void {
+    // Incident kill-switch: when auto-recovery is globally disabled, leave the agent in
+    // `failed` for manual recovery. Removes the flood-alerts→force-respawn lever during
+    // an active injection/IR. Logged so the suppression is visible/auditable.
+    if (this.autoRecoverDisabled) {
+      this.db.logEvent(agent.name, 'auto_recover_suppressed', undefined, { reason: 'DISABLE_AUTO_RECOVER' });
+      return;
+    }
     const resolved = this.resolveAgent(agent);
     const detection = this.getDetection(resolved);
     if (!detection?.config.autoRecover) return;

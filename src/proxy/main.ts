@@ -241,15 +241,20 @@ async function executeCommand(command: ProxyCommand): Promise<ProxyResponse> {
         return { ok: true };
 
       case 'exec': {
-        const { execSync } = await import('node:child_process');
+        // GAP-026: async exec (was execSync, which blocked the proxy event loop for up
+        // to `timeout` under load → stalled health-poll responses → false session-death
+        // alerts fleet-wide). Uses a shell (command is a server-constructed pipeline,
+        // e.g. `find … | sort | head`); the command is never client/agent-supplied.
+        const { exec } = await import('node:child_process');
+        const { promisify } = await import('node:util');
+        const execAsync = promisify(exec);
         const timeout = command.timeoutMs ?? 5_000;
-        const stdout = execSync(command.command, {
+        const { stdout } = await execAsync(command.command, {
           encoding: 'utf-8',
           timeout,
           cwd: command.cwd ?? undefined,
-          stdio: ['ignore', 'pipe', 'pipe'],
-        }).trim();
-        return { ok: true, data: stdout };
+        });
+        return { ok: true, data: stdout.trim() };
       }
 
       case 'resize_pane':
