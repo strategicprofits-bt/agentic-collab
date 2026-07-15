@@ -6,7 +6,7 @@ Zero-dependency orchestrator for AI coding agents via tmux. Node 24 native TypeS
 
 ```bash
 ./start.sh          # orchestrator (Docker :3000) + proxy (host :3100)
-node --test 'src/**/*.test.ts'  # ~875 tests
+node --test --test-timeout=60000 'src/**/*.test.ts'  # ~875 tests (timeout guards hangs)
 npx tsc --noEmit    # type check
 ```
 
@@ -47,8 +47,8 @@ src/
 ## Testing
 
 ```bash
-node --test 'src/**/*.test.ts'           # all tests
-node --test --watch 'src/**/*.test.ts'   # watch mode
+node --test --test-timeout=60000 'src/**/*.test.ts'   # all tests (--test-timeout fails a hung test/hook loudly instead of stranding the run)
+node --test --test-timeout=60000 --watch 'src/**/*.test.ts'   # watch mode
 node --test src/orchestrator/*.test.ts   # subset
 ```
 
