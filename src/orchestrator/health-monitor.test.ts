@@ -1308,6 +1308,24 @@ describe('Auto-recover circuit breaker', () => {
     assert.ok(tripped.length > 0, 'circuit_breaker_tripped event should be logged');
   });
 
+  it('DISABLE_AUTO_RECOVER suppresses recovery (logs auto_recover_suppressed, never triggers)', async () => {
+    cbDb.createAgent({ name: 'cb-disabled', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = cbDb.getAgent('cb-disabled')!;
+    cbDb.updateAgentState('cb-disabled', 'active', a.version, {
+      tmuxSession: 'agent-cb-disabled',
+      proxyId: 'p1',
+    });
+
+    const monitor = makeCbMonitor({ autoRecoverDisabled: true });
+    // Trigger exit detection (2 consecutive polls) → failed → maybeAutoRecover (suppressed)
+    await monitor.pollAll();
+    await monitor.pollAll();
+
+    const events = cbDb.getEvents('cb-disabled', 100) as Array<{ event: string }>;
+    assert.ok(events.some(e => e.event === 'auto_recover_suppressed'), 'should log auto_recover_suppressed');
+    assert.ok(!events.some(e => e.event === 'auto_recover_triggered'), 'should NOT trigger auto-recovery when disabled');
+  });
+
   it('applies exponential backoff delay on recovery attempts', async () => {
     cbDb.createAgent({ name: 'cb-backoff', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
     const a = cbDb.getAgent('cb-backoff')!;
