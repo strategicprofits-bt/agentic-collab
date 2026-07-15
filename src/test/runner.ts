@@ -146,7 +146,7 @@ export class TestContext {
       res.writeHead(404); res.end();
     });
 
-    await new Promise<void>((resolve) => { this.extServer!.listen(extPort, () => resolve()); });
+    await listenOrReject(this.extServer!, extPort);
   }
 
   async waitForExtension(timeout = 30_000): Promise<void> {
@@ -376,6 +376,30 @@ export class TestContext {
 }
 
 /**
+ * Await `server.listen(port)`, rejecting on a bind error (e.g. EADDRINUSE) or after
+ * `timeoutMs` — it never hangs. A raw `listen(port, cb)` with no `'error'` handler and
+ * an unchecked port silently strands the caller forever on a port collision: that is the
+ * exact defect behind the 2026-07-15 visual-states.test.ts 22h-hang (the derived
+ * `mockPort + 1` probe port collides across parallel `--test-isolation=process` workers,
+ * and with no error handler nor timeout the `before()` hook never returns). Fail loud instead.
+ */
+export function listenOrReject(server: Server, port: number, timeoutMs = 5_000): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const onError = (err: Error): void => { cleanup(); reject(err); };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`server.listen(${port}) did not complete within ${timeoutMs}ms`));
+    }, timeoutMs);
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      server.removeListener('error', onError);
+    };
+    server.once('error', onError);
+    server.listen(port, () => { cleanup(); resolve(); });
+  });
+}
+
+/**
  * Create a fully wired TestContext on random available ports.
  * Mock server listens on `port`, probe WebSocket on `port + 1`.
  */
@@ -405,9 +429,7 @@ export async function createTestContext(): Promise<TestContext> {
     probeWss.handleUpgrade(req, socket, head);
   });
 
-  await new Promise<void>((resolve) => {
-    probeServer.listen(probePort, () => resolve());
-  });
+  await listenOrReject(probeServer, probePort);
 
   return new TestContext(mock, probeServer, probeWss, mockPort);
 }
