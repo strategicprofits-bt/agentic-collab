@@ -209,9 +209,17 @@ describe('Integration: full lifecycle via HTTP', () => {
     assert.equal(resp.status, 401);
   });
 
-  it('auth: allows GET without token', async () => {
+  it('auth: rejects unauthenticated GET on a sensitive route', async () => {
+    // Sensitive /api reads (agents, message store, ...) require the Bearer token —
+    // GET is no longer auth-exempt (prevents unauthenticated data exfiltration).
+    // Mirrors the routes.test.ts secure-invariant fix (3178e44), post-87783e2.
     const resp = await fetch(`http://localhost:${port}/api/agents`);
-    assert.equal(resp.status, 200);
+    assert.equal(resp.status, 401);
+  });
+
+  it('auth: allows authenticated GET on a sensitive route', async () => {
+    const authed = await api('GET', '/api/agents');
+    assert.equal(authed.status, 200);
   });
 
   it('orchestrator status reflects agent counts', async () => {
