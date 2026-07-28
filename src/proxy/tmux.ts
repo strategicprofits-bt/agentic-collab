@@ -83,30 +83,133 @@ function serializePerSession<T>(sessionName: string, fn: () => Promise<T>): Prom
 }
 
 /**
- * Build the `tmux new-session` argv for an agent session. Pure (env injectable)
- * so the spawn-env hygiene is unit-testable without shelling out to tmux.
+ * Least-privilege allowlist for agent session environments (deny-all path-1).
+ * Only these env vars survive from the inherited tmux server-global env into a
+ * spawned agent session; every other var (all ~90 production credentials —
+ * Stripe, Supabase, DB, LLM keys, Doppler, etc.) is neutralized with `-e KEY=`
+ * (set-empty — tmux 3.4 new-session has no `-u`; `-e KEY=` overrides the value).
+ *
+ * Deny-by-default: a var not listed here is removed. Adding a var here is a
+ * security decision — keep it tight. Note this closes only PATH-1 (the inherited
+ * server env); PATH-2 (the login shell re-fetching Doppler at init) needs the
+ * operator-side loader guard. Neither path alone closes the class.
+ */
+export const ALLOWED_SESSION_ENV = new Set<string>([
+  // shell / terminal / locale (TMP is deliberately NOT here — it is an -e override)
+  'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'SHLVL', 'PWD', 'OLDPWD',
+  'LANG', 'LS_COLORS', 'LESSCLOSE', 'LESSOPEN', 'XDG_DATA_DIRS', '_',
+  'TERM', 'TERM_PROGRAM', 'TERM_PROGRAM_VERSION',
+  // tmux
+  'TMUX', 'TMUX_PANE',
+  // claude code runtime (non-secret)
+  'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_CODE_SESSION_ID',
+  'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_EFFORT',
+  // collab CLI runtime — the agent cannot function without these, AND the path-2
+  // loader guard keys on COLLAB_AGENT, so scrubbing it would fail the guard OPEN.
+  'COLLAB_AGENT', 'COLLAB_PERSONA_FILE', 'ORCHESTRATOR_URL',
+  // misc functional / systemd (non-secret)
+  'GIT_EDITOR', 'AI_AGENT', 'COREPACK_ENABLE_AUTO_PIN', 'NoDefaultCurrentDirectoryInExePath',
+  'INVOCATION_ID', 'JOURNAL_STREAM', 'SYSTEMD_EXEC_PID', 'MEMORY_PRESSURE_WATCH', 'MEMORY_PRESSURE_WRITE',
+  'PORT', 'PROXY_PORT',
+  // credentials deliberately KEPT (no-break sequencing): GH_TOKEN pending a git
+  // credential helper — dropping it would break the gh CLI mid-task.
+  'GH_TOKEN', 'GITHUB_TOKEN',
+  // NOTE: ANTHROPIC_API_KEY / OPENAI_API_KEY are intentionally NOT here — claude
+  // auth is OAuth (~/.claude/.credentials.json), so the key is scrub-safe.
+]);
+
+/**
+ * Keys that buildCreateSessionArgs sets AUTHORITATIVELY via `-e`. These are
+ * EXCLUDED from the scrub so it can never emit a SECOND `-e TMP=`/`-e TMPDIR=`
+ * (or, worse, an `-e PATH=` blanking the path). Coherent-by-construction: the
+ * scrub and the explicit overrides never both set these keys, so a future
+ * arg-ordering refactor cannot silently reopen the TMP-clobber. The explicit
+ * `-e` override is the sole authority for these keys.
+ */
+const E_OVERRIDE_KEYS = new Set<string>(['CLAUDECODE', 'PATH', 'TMPDIR', 'TMP']);
+
+/**
+ * Given the key names present in the session's inherited environment, return the
+ * `tmux new-session -e KEY=` argument list for every key that must be NEUTRALIZED:
+ * every key that is NOT allowlisted AND NOT an `-e`-override key. Each is set to
+ * the EMPTY string, which OVERRIDES the inherited server-global value on the
+ * initial pane (no secret value survives).
+ *
+ * Why `-e KEY=` and not `-u KEY`: tmux 3.4 `new-session` has NO `-u` flag
+ * (synopsis: `[-AdDEPX] [-c] [-e environment] [-f flags]...`) — a `-u` arg is
+ * rejected outright ("command new-session: unknown flag -u") and would throw on
+ * EVERY spawn (fleet-kill). `-e KEY=` is the supported mechanism and, verified
+ * empirically, overrides an inherited credential to empty. Trade-off: the key is
+ * left PRESENT-BUT-EMPTY (no secret VALUE) rather than fully absent — the security
+ * invariant (no secret values in agent env) holds; true per-session unset is not
+ * available at new-session time on this tmux.
+ *
+ * Key names are validated against a strict identifier pattern; any that don't
+ * match are skipped defensively so an unsafe token can never be emitted into the
+ * session command. Pure — no side effects, never reads values (names only).
+ */
+export function envScrubArgs(
+  keys: Iterable<string>,
+  allowed: ReadonlySet<string> = ALLOWED_SESSION_ENV,
+): string[] {
+  const args: string[] = [];
+  for (const key of keys) {
+    if (allowed.has(key)) continue;
+    if (E_OVERRIDE_KEYS.has(key)) continue; // authoritative -e override, never double-set
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    args.push('-e', `${key}=`);
+  }
+  return args;
+}
+
+/**
+ * Parse the KEY names out of `tmux show-environment -g` stdout (value-free —
+ * values are never returned or logged). Each set var is `KEY=value`; a leading
+ * `-KEY` marks a var already removed from the global env (skip it). Malformed
+ * lines (blank, or no `=`) are skipped defensively. Splits on the FIRST `=` so
+ * values containing `=` don't corrupt the key.
+ */
+export function parseServerEnvKeys(showEnvOutput: string): string[] {
+  const keys: string[] = [];
+  for (const line of showEnvOutput.split('\n')) {
+    if (line === '' || line.startsWith('-')) continue;
+    const eq = line.indexOf('=');
+    if (eq <= 0) continue; // no '=', or '=' at position 0 (empty key) → malformed
+    keys.push(line.slice(0, eq));
+  }
+  return keys;
+}
+
+/**
+ * Build the `tmux new-session` argv for an agent session. Pure (env + scrub keys
+ * injectable) so the spawn-env hygiene is unit-testable without shelling out.
  *
  * Per-session `-e` overrides matter: tmux new-sessions inherit the tmux SERVER
- * global env, NOT this command's env, so a poisoned server-env value can only be
- * neutralized with an explicit `-e VAR=...` override here.
+ * global env, NOT this command's env, so a poisoned/credential server-env value
+ * can only be neutralized with an explicit `-e VAR=...` on this command (tmux 3.4
+ * new-session has no `-u`).
+ * - scrubKeys : every inherited key NOT allowlisted becomes `-e KEY=` (set-empty,
+ *               deny-all path-1). Sourced from `show-environment -g` (the actual
+ *               inherited env) by the caller; defaults to [] so pure callers stay identical.
  * - CLAUDECODE= : spawned Claude Code instances don't think they're nested.
  * - PATH=       : engines like Codex that spawn sub-shells keep the collab bin.
  * - TMPDIR=/tmp : os.tmpdir() falls TMPDIR -> TMP -> TEMP -> /tmp; pinning TMPDIR
  *                 makes it short-circuit to /tmp regardless of a poisoned TMP.
  * - TMP=        : clear any inherited TMP so a secret value clobbered onto the
- *                 server env is absent from the spawn env entirely (not merely
- *                 bypassed by os.tmpdir()).
+ *                 server env is absent from the spawn env entirely (Facet-B).
  */
 export function buildCreateSessionArgs(
   sessionName: string,
   cwd: string,
   env: NodeJS.ProcessEnv = process.env,
+  scrubKeys: Iterable<string> = [],
 ): string[] {
   const path = env['PATH'] ?? '';
   return [
     'new-session', '-d',
     '-s', sessionName,
     '-c', cwd,
+    ...envScrubArgs(scrubKeys),
     '-e', 'CLAUDECODE=',
     '-e', `PATH=${path}`,
     '-e', 'TMPDIR=/tmp',
@@ -114,9 +217,41 @@ export function buildCreateSessionArgs(
   ];
 }
 
-export function createSession(sessionName: string, cwd: string): Promise<void> {
+/**
+ * Read the tmux SERVER global env key names — the ACTUAL set a new session
+ * inherits. Enumerating this (not process.env) is complete-by-construction: the
+ * tmux server survives proxy restarts, so its env is decoupled from the current
+ * proxy process.env (server-global ⊆ process.env is coincidental, not
+ * guaranteed). Read as late as possible before spawn to minimize the TOCTOU
+ * window. If no server is running yet, `show-environment -g` fails — a fresh
+ * server will inherit THIS proxy's env, so fall back to process.env keys.
+ */
+export async function readInheritedEnvKeys(
+  exec: (args: string[]) => Promise<string> = tmuxExec,
+): Promise<string[]> {
+  try {
+    return parseServerEnvKeys(await exec(['show-environment', '-g']));
+  } catch (err) {
+    const msg = (err as Error)?.message ?? '';
+    // No tmux server yet: the new-session about to run will START the server,
+    // inheriting THIS proxy process's env → process.env IS the inheritance
+    // surface, so enumerating it is correct (and complete) in this case.
+    if (/no server running|error connecting to|failed to connect/i.test(msg)) {
+      return Object.keys(process.env);
+    }
+    // Server is UP but the enumeration read failed. Fail CLOSED: process.env is
+    // only a COINCIDENTAL superset of the server-global env (the server survives
+    // proxy restarts), so silently falling back could leave a server-global cred
+    // un-scrubbed. Refuse the spawn — deny-by-default must hold even on read
+    // failure. The caller rejects; lifecycle retries.
+    throw new Error(`refusing to spawn unscrubbed session: server env enumeration failed: ${msg}`);
+  }
+}
+
+export async function createSession(sessionName: string, cwd: string): Promise<void> {
   validateSessionName(sessionName);
-  return tmuxExec(buildCreateSessionArgs(sessionName, cwd)).then(() => {});
+  const scrubKeys = await readInheritedEnvKeys();
+  await tmuxExec(buildCreateSessionArgs(sessionName, cwd, process.env, scrubKeys));
 }
 
 export function hasSession(sessionName: string): Promise<boolean> {
