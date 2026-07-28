@@ -135,8 +135,13 @@ export const DEFAULT_ENGINE_CONFIGS: DefaultEngineConfig[] = [
       { type: 'wait', ms: 500 },
       { type: 'keystroke', key: 'Enter' },
     ]),
+    // --dangerously-skip-permissions on resume too: matches hookStart's bypass
+    // form exactly, so a resumed session lands in bypass (not manual mode).
+    // Without it, --resume defaults to manual and the agent stalls on a
+    // permission prompt on first tool use — same "lifecycle event leaves agent
+    // unable to act" failure family this PR fixes (surfaced by the staged test).
     hookResume: JSON.stringify([
-      { type: 'shell', command: 'claude --resume $SESSION_ID --append-system-prompt $PERSONA_PROMPT' },
+      { type: 'shell', command: 'claude --resume $SESSION_ID --dangerously-skip-permissions --append-system-prompt $PERSONA_PROMPT' },
       { type: 'wait', ms: 5000 },
       { type: 'keystroke', key: 'Enter' },
       { type: 'wait', ms: 500 },
