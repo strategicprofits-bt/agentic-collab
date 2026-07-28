@@ -38,6 +38,11 @@
 import type { Database } from './database.ts';
 import type { ProxyCommand, ProxyResponse, AgentRecord } from '../shared/types.ts';
 import { sessionName, canSuspend } from '../shared/agent-entity.ts';
+import { extractComposerText, hasComposerText, composerCorrespondsToMessage, MIN_CORRESPONDENCE_CHARS } from '../shared/composer.ts';
+
+// Re-export the shared composer primitives so existing importers (and tests)
+// keep a single import site while the implementation lives in shared/.
+export { extractComposerText, composerCorrespondsToMessage, MIN_CORRESPONDENCE_CHARS };
 
 export const WATCHDOG = {
   /** N — no-activity threshold (seconds). Both signal legs must exceed this. */
@@ -101,116 +106,9 @@ export function classifyModal(pane: string): boolean {
   );
 }
 
-/**
- * S1 — the composer holds un-submitted text, i.e. a paste that was never sent.
- * Mirrors proxy/tmux.ts inputStillHasUnsubmittedText, but reads the pane text the
- * orchestrator already captured (no extra proxy round-trip).
- *
- * The composer is a small, fixed-height BOX at the very bottom of the pane,
- * bounded by two border lines, with an indented hint line below it:
- *
- *     ──────────── AgentName ──     ← top border (has the title)
- *     ❯ first line of the message   ← composer prompt line
- *       wrapped continuation …      ← continuation lines (indented, NO glyph)
- *     ──────────────────────────    ← bottom border
- *       ⏵⏵ bypass permissions …     ← hint line (indented)
- *
- * Two hazards this threads on ONE pass (both are un-mergeable if traded):
- *  - UNDER-detect: trim() BOTH ends per line so the INDENTED hint/continuation
- *    lines don't defeat the walk (the original hint-line miss).
- *  - OVER-detect (false-kill): the walk is BOUNDED to the composer box — it stops
- *    at the top border and never climbs into scrollback, where blockquoted "> …"
- *    system-prompt text would otherwise be misread as live composer input
- *    (Roz gate finding). MAX_SCAN is a hard backstop if the borders are ever
- *    absent/malformed, so a run of blank/decoration lines can't chain up either.
- *
- * Returns the composer's unsubmitted text (visual order, prompt glyph stripped,
- * lines space-joined) or null if the composer is empty. classifyUnsubmittedInput
- * is the boolean view; the watchdog also needs the TEXT for the correspondence
- * guard (does it match the delivered message, or is it an own-draft/placeholder?).
- */
-export function extractComposerText(pane: string): string | null {
-  const lines = pane.split('\n');
-  const MAX_SCAN = 16; // composer box is tiny; generous cap, still finite
-  let scanned = 0;
-  let insideBox = false; // seen the bottom border → now within the composer box
-  const collected: string[] = []; // box content lines, collected bottom-up
-  for (let i = lines.length - 1; i >= 0 && scanned < MAX_SCAN; i--) {
-    const line = lines[i]!.trim();
-    if (!line) continue;
-    scanned++;
-    if (line.startsWith('⏵')) continue; // hint line, rendered BELOW the box
-    if (line.startsWith('─')) {
-      if (!insideBox) { insideBox = true; continue; } // bottom border → enter box
-      break; // top border → everything above is scrollback: STOP
-    }
-    if (insideBox) {
-      // Any non-empty text inside the box = live unsubmitted input. Strip an
-      // optional prompt glyph so a bare "❯"/"> " empty prompt reads as empty
-      // while wrapped continuation lines (no glyph) still count.
-      const content = line.replace(/^[❯>]\s*/, '').trim();
-      if (content.length > 0) collected.push(content);
-    } else {
-      // A non-decoration line reached BEFORE any bottom border = a compact pane
-      // with no rendered box. Only a composer prompt WITH text counts, and only
-      // the "❯" composer glyph (NOT ">") — so a bare scrollback "> …" line that
-      // happens to be last can never false-positive. Decide here and STOP.
-      const m = line.match(/^❯\s+(.+)$/);
-      if (m !== null && m[1] !== undefined && m[1].trim().length > 0) collected.push(m[1].trim());
-      break;
-    }
-  }
-  if (collected.length === 0) return null;
-  return collected.reverse().join(' '); // bottom-up → visual order
-}
-
+/** S1 — the composer holds any un-submitted text (boolean view of extract). */
 export function classifyUnsubmittedInput(pane: string): boolean {
-  return extractComposerText(pane) !== null;
-}
-
-/** Minimum shared run (chars) for the composer to "correspond" to a message. */
-export const MIN_CORRESPONDENCE_CHARS = 30;
-
-/** Longest common substring length (DP, rolling row — inputs are small panes). */
-function longestCommonSubstringLen(a: string, b: string): number {
-  if (a.length === 0 || b.length === 0) return 0;
-  const row = new Array<number>(b.length + 1).fill(0);
-  let best = 0;
-  for (let i = 1; i <= a.length; i++) {
-    let diag = 0; // row[j-1] from the previous i (i.e. [i-1][j-1])
-    for (let j = 1; j <= b.length; j++) {
-      const tmp = row[j]!;
-      if (a[i - 1] === b[j - 1]) {
-        row[j] = diag + 1;
-        if (row[j]! > best) best = row[j]!;
-      } else {
-        row[j] = 0;
-      }
-      diag = tmp;
-    }
-  }
-  return best;
-}
-
-/**
- * Does the unsubmitted composer text CORRESPOND to the delivered message?
- *
- * A genuine stranded paste renders the message envelope into the composer
- * (possibly wrapped / truncated / reformatted by the TUI) → the two share a long
- * common run. An agent's OWN draft, or the TUI placeholder ("❯ Try \"…\""), shares
- * only incidental short words. This is the guard that keeps the kill-capable
- * action path from firing on a healthy agent whose composer holds its own text
- * (Chloe class) or a fresh-composer placeholder (probe #1). TIGHT enough to
- * exclude those, LOOSE enough (substring, not equality) to still match a real
- * paste as it actually renders. Residual (accepted): an own-draft that quotes the
- * message verbatim still matches — a pane-based consumed signal closes that later.
- */
-export function composerCorrespondsToMessage(composerText: string, envelope: string): boolean {
-  const norm = (s: string) => s.toLowerCase().replace(/\s+/g, ' ').trim();
-  const c = norm(composerText);
-  const e = norm(envelope);
-  if (c.length < MIN_CORRESPONDENCE_CHARS) return false; // too short to be a real paste
-  return longestCommonSubstringLen(c, e) >= MIN_CORRESPONDENCE_CHARS;
+  return hasComposerText(pane);
 }
 
 /** Classify the strand kind, preferring the modal signal (it gates keystrokes). */
@@ -340,10 +238,34 @@ export class StrandedWatchdog {
     firstPane: string,
   ): Promise<SweepOutcome> {
     const name = agent.name;
-
-    // (a) Gentle nudge: dismiss the modal (S2) then submit the pending text.
-    //     Escape closes /status-family pickers; Enter submits the composer.
     let pane = firstPane;
+
+    // S2 gate: a modal HID the composer, so the correspondence guard (gate 2b)
+    // couldn't run before now. To keep the kill-capable ladder off a healthy
+    // agent that opened a modal itself (e.g. /status) while its message was
+    // already consumed, DISMISS the modal first (Escape — safe, recoverable),
+    // then require the SAME correspondence on the revealed composer BEFORE any
+    // respawn. A self-opened modal reveals an own-draft or empty composer → no
+    // correspondence → STOP, never respawn (worst case we closed a self-opened
+    // modal). Only a genuine stranded message revealed behind the modal proceeds.
+    if (kind === 'S2') {
+      await this.sendKeys(agent, 'Escape');
+      await this.sleep(WATCHDOG.NUDGE_DELAY_MS);
+      const revealed = await this.capture(agent);
+      if (revealed !== null) pane = revealed;
+      const composerText = revealed === null ? null : extractComposerText(revealed);
+      if (composerText === null || !composerCorrespondsToMessage(composerText, msg.envelope)) {
+        this.logEvent(name, 'stranded_s2_dismissed_no_correspondence', {
+          deliveredAt: msg.deliveredAt,
+          composerPreview: (composerText ?? '').slice(0, 80),
+        });
+        return { agent: name, result: 's1-no-correspondence' }; // dismissed, no genuine strand → no respawn
+      }
+      // A real stranded message is behind the modal — recover it like S1 below.
+    }
+
+    // (a) Gentle nudge: submit the pending (correspondence-verified) text. The
+    //     modal, if any, was already dismissed above; Enter submits the composer.
     for (let attempt = 1; attempt <= WATCHDOG.MAX_NUDGE_ATTEMPTS; attempt++) {
       if (classifyStrand(pane) === 'S2') {
         await this.sendKeys(agent, 'Escape');

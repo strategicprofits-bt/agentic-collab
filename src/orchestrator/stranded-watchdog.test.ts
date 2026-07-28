@@ -328,10 +328,12 @@ describe('StrandedWatchdog', () => {
     assert.equal(db.countRecentWatchdogRespawns('s1agent', 1800), 1);
   });
 
-  it('TEST 1b: S2 modal stranded → Escape+Enter nudges, then respawns', async () => {
+  it('TEST 1b: S2 modal hiding a REAL stranded message → Escape reveals it, corresponds → respawns', async () => {
     const agent = makeAgent('s2agent');
     seedDeliveredMessage('s2agent', 'CoachBeard', 300);
-    scripts.set('s2agent', { pane: S2_PANE, frozenSecs: 300 });
+    // Candidacy capture sees the modal (S2); after the Escape-dismiss the pane
+    // reveals the corresponding stranded message → genuine S2 recovery proceeds.
+    scripts.set('s2agent', { pane: [S2_PANE, CORRESPONDING_S1_PANE], frozenSecs: 300 });
 
     const wd = makeWatchdog();
     const [outcome] = await wd.sweep([agent]);
@@ -339,9 +341,28 @@ describe('StrandedWatchdog', () => {
 
     assert.equal(outcome.result, 'respawned');
     assert.equal((outcome as { kind: string }).kind, 'S2');
-    // S2: Escape sent to dismiss the modal before Enter.
+    // S2: Escape sent to dismiss the modal, then Enter to submit the revealed message.
     assert.ok(sentKeys.some((k) => k.keys === 'Escape'), 'Escape sent for modal');
     assert.ok(sentKeys.some((k) => k.keys === 'Enter'), 'Enter sent after dismiss');
+  });
+
+  it('TEST 1b2: S2 self-opened modal (Escape reveals OWN-DRAFT) → dismissed, NO respawn', async () => {
+    const agent = makeAgent('s2self');
+    seedDeliveredMessage('s2self', 'CoachBeard', 300);
+    // Modal at candidacy; after Escape the composer is the agent's OWN draft, not
+    // the delivered message → correspondence fails → STOP, never respawn.
+    scripts.set('s2self', { pane: [S2_PANE, OWN_DRAFT_S1_PANE], frozenSecs: 300 });
+
+    const wd = makeWatchdog();
+    const [outcome] = await wd.sweep([agent]);
+    assert.ok(outcome);
+
+    assert.equal(outcome.result, 's1-no-correspondence');
+    assert.equal(respawned.length, 0, 'never respawn a self-opened modal on a healthy agent');
+    // Escape WAS sent (safe modal-dismiss), but NO respawn and no Enter-submit of the own-draft.
+    assert.ok(sentKeys.some((k) => k.keys === 'Escape'), 'Escape dismissed the modal');
+    assert.ok(!sentKeys.some((k) => k.keys === 'Enter'), 'no Enter — own-draft not submitted');
+    assert.equal(db.countRecentWatchdogRespawns('s2self', 1800), 0);
   });
 
   it('TEST 1c: nudge clears the strand → recovered without respawn', async () => {
