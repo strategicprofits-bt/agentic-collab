@@ -86,7 +86,8 @@ function serializePerSession<T>(sessionName: string, fn: () => Promise<T>): Prom
  * Least-privilege allowlist for agent session environments (deny-all path-1).
  * Only these env vars survive from the inherited tmux server-global env into a
  * spawned agent session; every other var (all ~90 production credentials —
- * Stripe, Supabase, DB, LLM keys, Doppler, etc.) is stripped with `-u KEY`.
+ * Stripe, Supabase, DB, LLM keys, Doppler, etc.) is neutralized with `-e KEY=`
+ * (set-empty — tmux 3.4 new-session has no `-u`; `-e KEY=` overrides the value).
  *
  * Deny-by-default: a var not listed here is removed. Adding a var here is a
  * security decision — keep it tight. Note this closes only PATH-1 (the inherited
@@ -119,21 +120,33 @@ export const ALLOWED_SESSION_ENV = new Set<string>([
 
 /**
  * Keys that buildCreateSessionArgs sets AUTHORITATIVELY via `-e`. These are
- * NEVER `-u`-scrubbed, so a `-u TMPDIR` can never be emitted to RACE
- * `-e TMPDIR=/tmp`. Coherent-by-construction: we eliminate the ordering race
- * rather than rely on tmux last-wins — a future arg-ordering refactor cannot
- * silently reopen the TMP-clobber. The `-e` override is the sole authority for
- * these keys.
+ * EXCLUDED from the scrub so it can never emit a SECOND `-e TMP=`/`-e TMPDIR=`
+ * (or, worse, an `-e PATH=` blanking the path). Coherent-by-construction: the
+ * scrub and the explicit overrides never both set these keys, so a future
+ * arg-ordering refactor cannot silently reopen the TMP-clobber. The explicit
+ * `-e` override is the sole authority for these keys.
  */
 const E_OVERRIDE_KEYS = new Set<string>(['CLAUDECODE', 'PATH', 'TMPDIR', 'TMP']);
 
 /**
  * Given the key names present in the session's inherited environment, return the
- * `tmux new-session -u KEY` argument list for every key that must be REMOVED:
- * every key that is NOT allowlisted AND NOT an `-e`-override key. Key names are
- * validated against a strict identifier pattern; any that don't match are skipped
- * defensively so an unsafe token can never be emitted into the session command.
- * Pure — no side effects, never reads values (names only).
+ * `tmux new-session -e KEY=` argument list for every key that must be NEUTRALIZED:
+ * every key that is NOT allowlisted AND NOT an `-e`-override key. Each is set to
+ * the EMPTY string, which OVERRIDES the inherited server-global value on the
+ * initial pane (no secret value survives).
+ *
+ * Why `-e KEY=` and not `-u KEY`: tmux 3.4 `new-session` has NO `-u` flag
+ * (synopsis: `[-AdDEPX] [-c] [-e environment] [-f flags]...`) — a `-u` arg is
+ * rejected outright ("command new-session: unknown flag -u") and would throw on
+ * EVERY spawn (fleet-kill). `-e KEY=` is the supported mechanism and, verified
+ * empirically, overrides an inherited credential to empty. Trade-off: the key is
+ * left PRESENT-BUT-EMPTY (no secret VALUE) rather than fully absent — the security
+ * invariant (no secret values in agent env) holds; true per-session unset is not
+ * available at new-session time on this tmux.
+ *
+ * Key names are validated against a strict identifier pattern; any that don't
+ * match are skipped defensively so an unsafe token can never be emitted into the
+ * session command. Pure — no side effects, never reads values (names only).
  */
 export function envScrubArgs(
   keys: Iterable<string>,
@@ -142,9 +155,9 @@ export function envScrubArgs(
   const args: string[] = [];
   for (const key of keys) {
     if (allowed.has(key)) continue;
-    if (E_OVERRIDE_KEYS.has(key)) continue; // authoritative -e override, never -u
+    if (E_OVERRIDE_KEYS.has(key)) continue; // authoritative -e override, never double-set
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
-    args.push('-u', key);
+    args.push('-e', `${key}=`);
   }
   return args;
 }
@@ -171,13 +184,13 @@ export function parseServerEnvKeys(showEnvOutput: string): string[] {
  * Build the `tmux new-session` argv for an agent session. Pure (env + scrub keys
  * injectable) so the spawn-env hygiene is unit-testable without shelling out.
  *
- * Per-session `-e`/`-u` overrides matter: tmux new-sessions inherit the tmux
- * SERVER global env, NOT this command's env, so a poisoned/credential server-env
- * value can only be neutralized with an explicit `-e VAR=...` (set) or `-u VAR`
- * (unset) on this command.
- * - scrubKeys : every inherited key NOT allowlisted becomes `-u KEY` (deny-all
- *               path-1). Sourced from `show-environment -g` (the actual inherited
- *               env) by the caller; defaults to [] so pure callers stay identical.
+ * Per-session `-e` overrides matter: tmux new-sessions inherit the tmux SERVER
+ * global env, NOT this command's env, so a poisoned/credential server-env value
+ * can only be neutralized with an explicit `-e VAR=...` on this command (tmux 3.4
+ * new-session has no `-u`).
+ * - scrubKeys : every inherited key NOT allowlisted becomes `-e KEY=` (set-empty,
+ *               deny-all path-1). Sourced from `show-environment -g` (the actual
+ *               inherited env) by the caller; defaults to [] so pure callers stay identical.
  * - CLAUDECODE= : spawned Claude Code instances don't think they're nested.
  * - PATH=       : engines like Codex that spawn sub-shells keep the collab bin.
  * - TMPDIR=/tmp : os.tmpdir() falls TMPDIR -> TMP -> TEMP -> /tmp; pinning TMPDIR
