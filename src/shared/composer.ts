@@ -17,6 +17,17 @@
 /** Minimum shared run (chars) for the composer to "correspond" to a message. */
 export const MIN_CORRESPONDENCE_CHARS = 30;
 
+// MAINTENANCE COUPLING (verified both ways 2026-07-28): composerCorrespondsToMessage
+// depends on the delivery path pasting the collab inbound envelope VERBATIM into
+// the composer, starting with the "[from: SENDER, reply with collab send SENDER
+// --topic TOPIC]:" prefix (which is always ≥ MIN_CORRESPONDENCE_CHARS). Confirmed
+// against the code path — deliverToAgent → submit hook → adapter.buildSubmitCommand
+// returns the task (= message.envelope) verbatim (claude.ts) — AND against a live
+// delivery (the envelope was observed in the composer). If collab ever changes the
+// envelope format, or the delivery path starts pasting body-only, correspondence
+// silently stops matching → SAFE-DIRECTION under-detect (real strands missed, no
+// false-action), but a real maintenance dependency to re-verify on any such change.
+
 /**
  * The composer's unsubmitted text (visual order, prompt glyph stripped, lines
  * space-joined) or null if the composer is empty.
