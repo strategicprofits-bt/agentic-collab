@@ -95,17 +95,28 @@ export type SweepOutcome =
 // ── Pane classification (pure, operates on captured text) ──
 
 /**
- * S2 — an undismissed blocking modal is stealing keystrokes. Signatures mirror
- * proxy/tmux.ts dismissBlockingModal so classification and dismissal agree.
+ * S2 — an undismissed blocking modal is stealing keystrokes. Signatures are kept
+ * in sync with proxy/tmux.ts matchModalSignature (same real v2.1.220 headers +
+ * legacy OR-alternates) so the watchdog DETECTS the same modals the proxy
+ * DISMISSES. NOTE — deliberate divergence: the proxy additionally applies a
+ * composer-guard (structural check that the working footer is absent) to reject
+ * a signature merely QUOTED in message content; this detector OMITS that guard.
+ * Safe because a content-quote false-match is backstopped downstream — the strand
+ * requires the two-signal AND (a delivered message pending) plus the pending-msg
+ * gate, so a quoted signature on a healthy pane does not trigger action.
+ * (Follow-up: extract ONE shared modal predicate both sides import — drift-proof.)
  */
 export function classifyModal(pane: string): boolean {
   return (
     /How is Claude doing this session/.test(pane) ||
     /Is this a project you (created or one you )?trust/.test(pane) ||
     /Settings\s+Status\s+Config\s+Usage\s+Stats/.test(pane) || // /status, /usage
-    /Select (a|the) model|Switch to a different model/.test(pane) || // /model
-    /Resume a conversation|Select a( previous)? conversation to resume/.test(pane) || // /resume
-    /Available commands|Keyboard shortcuts:/.test(pane) // /help
+    /Help\s+General\s+Commands\s+Custom commands/.test(pane) || // /help (v2.1.220)
+    /Available commands|Keyboard shortcuts:/.test(pane) || // /help (legacy)
+    /Select model\b|Switch between Claude models/.test(pane) || // /model (v2.1.220)
+    /Select (a|the) model|Switch to a different model/.test(pane) || // /model (legacy)
+    /Resume session \(\d+ of \d+\)/.test(pane) || // /resume (v2.1.220)
+    /Resume a conversation|Select a( previous)? conversation to resume/.test(pane) // /resume (legacy)
   );
 }
 
