@@ -82,20 +82,41 @@ function serializePerSession<T>(sessionName: string, fn: () => Promise<T>): Prom
   return next;
 }
 
-export function createSession(sessionName: string, cwd: string): Promise<void> {
-  validateSessionName(sessionName);
-  // Unset CLAUDECODE so spawned Claude Code instances don't think they're nested.
-  // The proxy may itself be launched from within a Claude Code session.
-  // Explicitly pass PATH so engines like Codex that spawn sub-shells don't lose
-  // the collab bin directory that the proxy prepended at startup.
-  const path = process.env['PATH'] ?? '';
-  return tmuxExec([
+/**
+ * Build the `tmux new-session` argv for an agent session. Pure (env injectable)
+ * so the spawn-env hygiene is unit-testable without shelling out to tmux.
+ *
+ * Per-session `-e` overrides matter: tmux new-sessions inherit the tmux SERVER
+ * global env, NOT this command's env, so a poisoned server-env value can only be
+ * neutralized with an explicit `-e VAR=...` override here.
+ * - CLAUDECODE= : spawned Claude Code instances don't think they're nested.
+ * - PATH=       : engines like Codex that spawn sub-shells keep the collab bin.
+ * - TMPDIR=/tmp : os.tmpdir() falls TMPDIR -> TMP -> TEMP -> /tmp; pinning TMPDIR
+ *                 makes it short-circuit to /tmp regardless of a poisoned TMP.
+ * - TMP=        : clear any inherited TMP so a secret value clobbered onto the
+ *                 server env is absent from the spawn env entirely (not merely
+ *                 bypassed by os.tmpdir()).
+ */
+export function buildCreateSessionArgs(
+  sessionName: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const path = env['PATH'] ?? '';
+  return [
     'new-session', '-d',
     '-s', sessionName,
     '-c', cwd,
     '-e', 'CLAUDECODE=',
     '-e', `PATH=${path}`,
-  ]).then(() => {});
+    '-e', 'TMPDIR=/tmp',
+    '-e', 'TMP=',
+  ];
+}
+
+export function createSession(sessionName: string, cwd: string): Promise<void> {
+  validateSessionName(sessionName);
+  return tmuxExec(buildCreateSessionArgs(sessionName, cwd)).then(() => {});
 }
 
 export function hasSession(sessionName: string): Promise<boolean> {

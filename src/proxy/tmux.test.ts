@@ -1,6 +1,15 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { sendKeys } from './tmux.ts';
+import { sendKeys, buildCreateSessionArgs } from './tmux.ts';
+
+// Assert that the flat tmux argv contains an `-e VAR=VALUE` pair (i.e. some
+// index i where args[i] === '-e' and args[i+1] === pair).
+function hasEnvPair(args: string[], pair: string): boolean {
+  for (let i = 0; i < args.length - 1; i++) {
+    if (args[i] === '-e' && args[i + 1] === pair) return true;
+  }
+  return false;
+}
 
 describe('tmux sendKeys validation', () => {
   it('rejects keys with shell metacharacters', () => {
@@ -46,5 +55,47 @@ describe('tmux sendKeys validation', () => {
       sendKeys('test-session', 'C-c'),
       /tmux command failed/,
     );
+  });
+});
+
+describe('createSession spawn-env hygiene (tmp-clobber fix)', () => {
+  // Fleet-wide, the tmux server global env carries a poisoned TMP (clobbered to
+  // a secret token value). Node os.tmpdir() falls TMPDIR -> TMP -> TEMP -> /tmp;
+  // with TMPDIR unset it returned the token, which bled into temp paths and
+  // append-only transcripts. createSession must neutralize this per-spawn.
+
+  it('sets TMPDIR=/tmp so os.tmpdir() short-circuits to /tmp', () => {
+    const args = buildCreateSessionArgs('sess', '/work', { PATH: '/usr/bin' });
+    assert.ok(hasEnvPair(args, 'TMPDIR=/tmp'), 'expected -e TMPDIR=/tmp');
+  });
+
+  it('clears TMP so an inherited server-env token is overridden per session', () => {
+    const args = buildCreateSessionArgs('sess', '/work', { PATH: '/usr/bin' });
+    assert.ok(hasEnvPair(args, 'TMP='), 'expected -e TMP= (cleared)');
+  });
+
+  it('a poisoned parent TMP=<token> is absent from the built spawn args', () => {
+    // Sentinel stands in for the real token — the fix must leave NO trace of an
+    // inherited TMP value in the argv, satisfying the fp-absent security check.
+    const POISON = 'SENTINEL_do_not_leak_0xdeadbeef';
+    const args = buildCreateSessionArgs('sess', '/work', {
+      PATH: '/usr/bin',
+      TMP: POISON,
+    });
+    assert.ok(
+      !args.some((a) => a.includes(POISON)),
+      'inherited TMP token value must not appear anywhere in spawn args',
+    );
+    assert.ok(hasEnvPair(args, 'TMP='), 'TMP must be explicitly cleared, not inherited');
+  });
+
+  it('preserves existing CLAUDECODE=, PATH=, and session/cwd wiring', () => {
+    const args = buildCreateSessionArgs('mysess', '/my/cwd', { PATH: '/custom/bin' });
+    assert.deepEqual(
+      args.slice(0, 6),
+      ['new-session', '-d', '-s', 'mysess', '-c', '/my/cwd'],
+    );
+    assert.ok(hasEnvPair(args, 'CLAUDECODE='), 'expected -e CLAUDECODE=');
+    assert.ok(hasEnvPair(args, 'PATH=/custom/bin'), 'expected -e PATH=/custom/bin');
   });
 });
