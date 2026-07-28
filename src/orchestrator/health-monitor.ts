@@ -22,6 +22,7 @@ import { sessionName, canSuspend } from '../shared/agent-entity.ts';
 import { getAdapter } from './adapters/index.ts';
 import { reloadAgent, recoverAgent, suspendAgent, type LifecycleContext } from './lifecycle.ts';
 import { resolveEffectiveConfig } from './engine-config-resolver.ts';
+import { StrandedWatchdog } from './stranded-watchdog.ts';
 
 type CompiledDetection = {
   json: string;
@@ -140,6 +141,8 @@ export class HealthMonitor {
   static readonly RECOVERY_STABILIZE_MS = 10 * 60 * 1000;
   /** Pending recovery timers per agent — cleared on stop() for clean shutdown. */
   private readonly recoveryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Stranded-input watchdog: recovers alive-but-wedged agents holding undrained messages. */
+  private readonly strandedWatchdog: StrandedWatchdog;
 
   constructor(opts: HealthMonitorOptions) {
     this.db = opts.db;
@@ -158,6 +161,34 @@ export class HealthMonitor {
     if (this.autoRecoverDisabled) {
       console.warn('[health] DISABLE_AUTO_RECOVER active — auto-recovery suppressed; failed agents need manual recovery');
     }
+
+    this.strandedWatchdog = new StrandedWatchdog({
+      db: this.db,
+      proxyDispatch: this.proxyDispatch,
+      respawn: async (agentName, reason) => {
+        // Transition the live-but-wedged agent → failed (under lock) so
+        // recoverAgent (which requires 'failed') can kill + fresh-spawn it.
+        await this.locks.withLock(agentName, async () => {
+          const agent = this.db.getAgent(agentName);
+          if (!agent || agent.state === 'failed') return;
+          this.db.updateAgentState(agentName, 'failed', agent.version, {
+            failedAt: new Date().toISOString(),
+            failureReason: reason,
+          });
+        });
+        await recoverAgent(this.makeLifecycleCtx(), agentName);
+        this.onAgentUpdate(agentName);
+      },
+      alert: (target, topic, body) => {
+        const envelope = `[from: system, reply with collab send system --topic ${topic}]: '${body.replace(/'/g, "\\'")}'`;
+        const pending = this.db.enqueueMessage({ sourceAgent: null, targetAgent: target, envelope });
+        this.onQueueUpdate(pending);
+        this.onMessageEnqueued(target);
+      },
+      logEvent: (agentName, event, meta) => {
+        this.db.logEvent(agentName, event, undefined, meta);
+      },
+    });
   }
 
   /**
@@ -427,6 +458,18 @@ export class HealthMonitor {
         await this.pollFailedAgent(agent);
       } catch (err) {
         console.error(`[health] Error polling failed ${agent.name}:`, err);
+      }
+    }
+
+    // Stranded-input watchdog: catch alive-but-wedged agents holding an
+    // undrained delivered message. Re-list fresh so the sweep sees post-poll
+    // state, and never let a sweep error abort the poll cycle.
+    if (!this.autoRecoverDisabled) {
+      try {
+        const liveNow = this.db.listAgents().filter(a => canSuspend(a) && a.proxyId);
+        await this.strandedWatchdog.sweep(liveNow);
+      } catch (err) {
+        console.error('[health] stranded watchdog sweep error:', err);
       }
     }
 

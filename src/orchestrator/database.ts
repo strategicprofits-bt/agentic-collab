@@ -1301,6 +1301,38 @@ export class Database {
     return row.n;
   }
 
+  /**
+   * Most-recent message this agent RECEIVED that reached 'delivered' status.
+   * The stranded-input watchdog reasons about the newest delivered message to
+   * decide whether the agent processed it or got wedged holding it.
+   */
+  getMostRecentDeliveredMessage(agentName: string): PendingMessage | undefined {
+    const row = this.db.prepare(
+      "SELECT * FROM pending_messages WHERE target_agent = ? AND status = 'delivered' ORDER BY delivered_at DESC, id DESC LIMIT 1"
+    ).get(agentName) as Record<string, unknown> | undefined;
+    return row ? mapPendingMessageRow(row) : undefined;
+  }
+
+  /**
+   * Did the agent show ANY durable sign of processing after `sinceIso`?
+   * Ground-truth, restart-surviving signals only: a token snapshot captured
+   * after the timestamp (the model actually ran), or an activity/idle state
+   * event logged after it (idle→active pickup or active→idle drain). Used to
+   * tell a FULL strand (nothing happened after delivery) from a PARTIAL consume
+   * (agent touched it, then wedged) — the latter must never be re-run.
+   * NEVER reads last_context_pct/context_pct (GAP-012 unreliable).
+   */
+  hasActivitySince(agentName: string, sinceIso: string): boolean {
+    const row = this.db.prepare(`
+      SELECT 1 FROM agent_token_snapshots WHERE agent_name = ? AND captured_at > ?
+      UNION ALL
+      SELECT 1 FROM events WHERE agent_name = ? AND created_at > ?
+        AND event IN ('activity_detected', 'idle_detected')
+      LIMIT 1
+    `).get(agentName, sinceIso, agentName, sinceIso) as Record<string, unknown> | undefined;
+    return row !== undefined;
+  }
+
 
   pruneTokenSnapshots(retentionDays = 7): number {
     const result = this.db.prepare(
