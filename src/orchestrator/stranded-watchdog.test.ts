@@ -218,6 +218,10 @@ describe('StrandedWatchdog', () => {
   let tmpDir: string;
 
   // Per-agent scripted proxy responses.
+  // A capture-fail sentinel pane: makeDispatch returns { ok: false } for it, so
+  // sweepAgent hits the 'capture failed' → 'skip' path — a plausible mid-wedge
+  // transient (also 'sweep already in flight'). Used by TEST 6e.
+  const CAPTURE_FAIL = '__CAPTURE_FAIL__';
   type Script = { pane: string | string[]; frozenSecs: number };
   let scripts: Map<string, Script>;
   let sentKeys: Array<{ agent: string; keys: string }>;
@@ -264,6 +268,8 @@ describe('StrandedWatchdog', () => {
           // Pop through the sequence; last entry sticks.
           pane = pane.length > 1 ? (pane.shift() as string) : pane[0]!;
         }
+        // Sentinel: model a proxy capture failure (→ sweepAgent 'skip').
+        if (pane === CAPTURE_FAIL) return { ok: false };
         return { ok: true, data: pane };
       }
       if (cmd.action === 'pane_activity') {
@@ -655,6 +661,43 @@ describe('StrandedWatchdog', () => {
       events.filter((e) => e.event === 'stranded_s1_no_correspondence').length,
       2,
       're-logs after leaving and re-entering the s1-no-correspondence state',
+    );
+  });
+
+  it('TEST 6e: a transient SKIP (capture failure) mid-episode does NOT clear the episode', async () => {
+    // The load-bearing re-arm edge: 'skip' is a TRANSIENT (capture-failed /
+    // sweep-in-flight), not a recovery. A skip mid-wedge must NOT re-arm the
+    // episode — otherwise the very-next persistent-wedge sweep escalates FRESH
+    // instead of as a deduped reminder = the alarm-fatigue bug this fix targets.
+    // Dispositive: removing 'skip' from the retained-outcomes list makes the
+    // final alert a FRESH escalation (no REMINDER) and fails the match below.
+    const agent = seedPartialConsume('skipmid');
+    let clock = Date.now();
+    const wd = makeWatchdog({ now: () => clock });
+
+    // Episode opens.
+    const [o1] = await wd.sweep([agent]);
+    assert.equal(o1!.result, 'partial-consume-escalated');
+    assert.equal(alerts.length, 2, 'first escalation fans to both targets');
+
+    // Transient skip mid-wedge (capture failed) — emits nothing, must retain the episode.
+    scripts.set('skipmid', { pane: CAPTURE_FAIL, frozenSecs: 300 });
+    const [oskip] = await wd.sweep([agent]);
+    assert.equal(oskip!.result, 'skip');
+    assert.equal(alerts.length, 2, 'a skip emits no alert');
+
+    // Still wedged, a full reminder-interval later. If the skip had wrongly
+    // re-armed the episode, firstAt would reset → this escalates FRESH (no
+    // REMINDER). Because the episode survived the skip, it is a continuation.
+    scripts.set('skipmid', { pane: CORRESPONDING_S1_PANE, frozenSecs: 300 });
+    clock += WATCHDOG.ESCALATE_REMINDER_SECONDS * 1000;
+    const [o2] = await wd.sweep([agent]);
+    assert.equal(o2!.result, 'partial-consume-escalated');
+    assert.equal(alerts.length, 4, 'reminder re-fires after the interval');
+    assert.match(
+      alerts[alerts.length - 1]!.body,
+      /REMINDER/i,
+      'continuation reminder — proves the transient skip did NOT clear the episode',
     );
   });
 });
