@@ -165,6 +165,20 @@ describe('classifyStrand', () => {
   it('returns null: empty composer with REAL "> …" persona scrollback above', () => {
     assert.equal(classifyStrand(REAL_QUOTE_SCROLLBACK_EMPTY), null);
   });
+  // v2.1.220 signature-refresh mirror (proxy PR-2 parity): the a289e43 watchdog
+  // signatures were STALE for /help, /model, /resume — S2 detection missed the
+  // real overlays (watchdog blind to modals the proxy now dismisses). These are
+  // the real v2.1.220 headers; each must classify S2. The watchdog intentionally
+  // omits the proxy's composer-guard (safe: two-signal AND + pending-msg gate).
+  it('detects S2 for a real v2.1.220 /help overlay header', () => {
+    assert.equal(classifyStrand('Help  General   Commands   Custom commands\n\n   Shortcuts'), 'S2');
+  });
+  it('detects S2 for a real v2.1.220 /model overlay header', () => {
+    assert.equal(classifyStrand('   Select model\n   Switch between Claude models'), 'S2');
+  });
+  it('detects S2 for a real v2.1.220 /resume overlay header', () => {
+    assert.equal(classifyStrand('   Resume session (1 of 5)\n   ╭─ Search… ─╮'), 'S2');
+  });
 });
 
 describe('extractComposerText', () => {
