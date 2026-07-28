@@ -43,6 +43,7 @@ src/
 - **Health monitor**: 30s poll cycle, idle detection via tmux parsing, 80%→compact, 90%→reload
 - **Message dispatch**: event-driven queue with cool-down coordination (300ms after lifecycle ops)
 - **Personas**: `persistent-agents/*.md` with YAML frontmatter (engine, cwd, model, hooks)
+- **Operator-reply relay** (P2a): agent → operator replies (`POST /api/dashboard/reply`) reach the operator's phone by DEFAULT, but only when no live dashboard WebSocket session is connected (presence-aware — no double-push while he is watching). Two tiers: a **plain topic** → presence-aware relay (`relay-policy.ts` `decideRelay`); a **`telegram*` topic** → always-push override, relayed unconditionally by the external poller (the inline path skips these to avoid double-send). This retires the old "must prefix `--topic telegram*` to reach the phone" convention. Relay creds are ENV-injected (`OPERATOR_RELAY_BOT_TOKEN` / `OPERATOR_RELAY_CHAT_ID`), never stored at-rest; unprovisioned → safe no-op.
 
 ## Testing
 
