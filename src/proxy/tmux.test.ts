@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { sendKeys, buildCreateSessionArgs } from './tmux.ts';
+import { sendKeys, buildCreateSessionArgs, classifyModal, dismissBlockingModalWith } from './tmux.ts';
 
 // Assert that the flat tmux argv contains an `-e VAR=VALUE` pair (i.e. some
 // index i where args[i] === '-e' and args[i+1] === pair).
@@ -97,5 +97,97 @@ describe('createSession spawn-env hygiene (tmp-clobber fix)', () => {
     );
     assert.ok(hasEnvPair(args, 'CLAUDECODE='), 'expected -e CLAUDECODE=');
     assert.ok(hasEnvPair(args, 'PATH=/custom/bin'), 'expected -e PATH=/custom/bin');
+  });
+});
+
+describe('classifyModal (verified-dismissal detection)', () => {
+  it('detects the feedback survey → dismiss with 0', () => {
+    const pane =
+      'output above\nHow is Claude doing this session? (optional)\n1: Bad  2: Fine  3: Good  0: Dismiss';
+    assert.deepEqual(classifyModal(pane), { kind: 'feedback-survey', keys: ['0'] });
+  });
+
+  it('detects the trust dialog → Up + Enter', () => {
+    const pane = 'Is this a project you trust?\n❯ No, exit\n  Yes, proceed';
+    assert.deepEqual(classifyModal(pane), { kind: 'trust-dialog', keys: ['Up', 'Enter'] });
+  });
+
+  it('detects the /status tabbed panel → Escape', () => {
+    const pane = 'Settings   Status   Config   Usage   Stats\n\nmodel: opus';
+    assert.deepEqual(classifyModal(pane), { kind: 'status-family', keys: ['Escape'] });
+  });
+
+  it('detects the /model picker → Escape', () => {
+    assert.equal(classifyModal('Select a model to use for this session')?.kind, 'status-family');
+    assert.equal(classifyModal('Switch to a different model')?.kind, 'status-family');
+  });
+
+  it('detects the /resume picker → Escape', () => {
+    assert.equal(classifyModal('Resume a conversation')?.kind, 'status-family');
+    assert.equal(classifyModal('Select a previous conversation to resume')?.kind, 'status-family');
+  });
+
+  it('detects the /help overlay → Escape', () => {
+    assert.equal(classifyModal('Available commands')?.kind, 'status-family');
+    assert.equal(classifyModal('Keyboard shortcuts:')?.kind, 'status-family');
+  });
+
+  it('returns null for a normal working pane (never Escape a working composer)', () => {
+    const pane =
+      '⏺ Done — the change is applied.\n\n❯ tell me about the plan\n──────────────\n  ⏵⏵ bypass permissions on';
+    assert.equal(classifyModal(pane), null);
+  });
+
+  it('returns null for an empty pane', () => {
+    assert.equal(classifyModal(''), null);
+  });
+});
+
+describe('dismissBlockingModalWith (verified + retried dismissal)', () => {
+  // Injectable IO driven by a scripted sequence of pane captures. Each capture()
+  // shifts the next pane (last one repeats); sendKeys/delay are recorded.
+  function makeIO(paneSequence: string[]) {
+    const sent: string[][] = [];
+    let i = 0;
+    return {
+      sent,
+      io: {
+        capture: async () => paneSequence[Math.min(i++, paneSequence.length - 1)]!,
+        sendKeys: async (keys: string[]) => {
+          sent.push(keys);
+        },
+        delay: async () => {},
+      },
+    };
+  }
+
+  it('returns false and sends nothing when no modal is present', async () => {
+    const { io, sent } = makeIO(['❯ ordinary working pane, no modal here']);
+    assert.equal(await dismissBlockingModalWith(io), false);
+    assert.equal(sent.length, 0);
+  });
+
+  it('dismisses a modal that clears on the first keystroke', async () => {
+    const modal = 'Settings   Status   Config   Usage   Stats';
+    const { io, sent } = makeIO([modal, '❯ back to work']);
+    assert.equal(await dismissBlockingModalWith(io), true);
+    assert.deepEqual(sent, [['Escape']]);
+  });
+
+  // LOAD-BEARING (the point of PR-2): a modal whose async render outlasts the
+  // first keystroke — the original strand cause — must be RE-dismissed, and the
+  // function may only report success once classifyModal confirms it is gone.
+  it('retries when the modal persists past the first keystroke, then verifies gone', async () => {
+    const modal = 'How is Claude doing this session? (optional)\n0: Dismiss';
+    const { io, sent } = makeIO([modal, modal, '❯ back to work']);
+    assert.equal(await dismissBlockingModalWith(io), true);
+    assert.deepEqual(sent, [['0'], ['0']]); // sent twice — retried on persistence
+  });
+
+  it('gives up (returns false) if the modal never clears, after multiple retries', async () => {
+    const modal = 'Settings   Status   Config   Usage   Stats';
+    const { io, sent } = makeIO([modal]); // capture always returns the modal
+    assert.equal(await dismissBlockingModalWith(io), false);
+    assert.ok(sent.length >= 2, 'must retry multiple times before giving up');
   });
 });

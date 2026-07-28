@@ -187,45 +187,86 @@ async function inputStillHasUnsubmittedText(sessionName: string, pastedText: str
   return false;
 }
 
-// Dismiss any blocking modal Claude TUI shows: feedback survey, trust dialog,
-// and the full-screen overlays from /status, /usage, /model, /help, /resume.
-// These steal all keystrokes, so a paste lands in the prompt but Enter does
-// nothing (the modal-swallow that stranded delivered messages). Returns true
-// if a modal was found and dismissed.
-async function dismissBlockingModal(sessionName: string): Promise<boolean> {
-  try {
-    const pane = await tmuxExec(['capture-pane', '-t', sessionName, '-p', '-S', '-25']);
-    // "How is Claude doing this session? (optional)" — feedback survey.
-    // Keys: 1 Bad, 2 Fine, 3 Good, 0 Dismiss. Send "0".
-    if (/How is Claude doing this session/.test(pane) && /0:\s*Dismiss/.test(pane)) {
-      await tmuxExec(['send-keys', '-t', sessionName, '0']);
-      return true;
-    }
-    // Trust dialog ("Is this a project you trust?"). Default cursor on
-    // "No, exit" — send Up + Enter to choose Yes. We pre-trust folders in
-    // ~/.claude.json so this should rarely fire, but defensive.
-    if (/Is this a project you (created or one you )?trust/.test(pane)) {
-      await tmuxExec(['send-keys', '-t', sessionName, 'Up', 'Enter']);
-      return true;
-    }
-    // Full-screen overlays opened by /status, /usage, /model, /help, /resume.
-    // These capture keystrokes: a delivered paste lands but Enter does nothing,
-    // so the message is stranded (this is the modal-swallow that parked agents
-    // behind /status). All are dismissed with Escape. Signatures are chosen to
-    // be specific so we never Escape a normal working pane.
-    if (
-      /Settings\s+Status\s+Config\s+Usage\s+Stats/.test(pane) || // /status, /usage (tabbed panel)
-      /Select (a|the) model|Switch to a different model/.test(pane) || // /model picker
-      /Resume a conversation|Select a( previous)? conversation to resume/.test(pane) || // /resume picker
-      /Available commands|Keyboard shortcuts:/.test(pane) // /help overlay
-    ) {
-      await tmuxExec(['send-keys', '-t', sessionName, 'Escape']);
-      return true;
-    }
-  } catch {
-    /* capture failed — give up silently */
+// A blocking modal Claude TUI can show, and the keystroke(s) that dismiss it.
+// These modals steal all keystrokes, so a paste lands in the prompt but Enter
+// does nothing (the modal-swallow that stranded delivered messages).
+export type ModalKind = 'feedback-survey' | 'trust-dialog' | 'status-family';
+export interface ModalMatch {
+  kind: ModalKind;
+  keys: string[];
+}
+
+// Pure: given a pane capture, classify any blocking modal and its dismiss keys,
+// or null if none. Doubles as the DISMISSAL VERIFIER — after sending the keys we
+// re-capture and only treat the modal as gone once this returns null. Signatures
+// are deliberately specific so we never classify (and Escape) a normal working
+// pane. Exported for exhaustive unit testing.
+export function classifyModal(pane: string): ModalMatch | null {
+  // "How is Claude doing this session? (optional)" — feedback survey.
+  // Keys: 1 Bad, 2 Fine, 3 Good, 0 Dismiss. Send "0".
+  if (/How is Claude doing this session/.test(pane) && /0:\s*Dismiss/.test(pane)) {
+    return { kind: 'feedback-survey', keys: ['0'] };
+  }
+  // Trust dialog ("Is this a project you trust?"). Default cursor on "No, exit"
+  // — send Up + Enter to choose Yes. We pre-trust folders in ~/.claude.json so
+  // this should rarely fire, but defensive.
+  if (/Is this a project you (created or one you )?trust/.test(pane)) {
+    return { kind: 'trust-dialog', keys: ['Up', 'Enter'] };
+  }
+  // Full-screen overlays opened by /status, /usage, /model, /help, /resume.
+  // All are dismissed with Escape.
+  if (
+    /Settings\s+Status\s+Config\s+Usage\s+Stats/.test(pane) || // /status, /usage (tabbed panel)
+    /Select (a|the) model|Switch to a different model/.test(pane) || // /model picker
+    /Resume a conversation|Select a( previous)? conversation to resume/.test(pane) || // /resume picker
+    /Available commands|Keyboard shortcuts:/.test(pane) // /help overlay
+  ) {
+    return { kind: 'status-family', keys: ['Escape'] };
+  }
+  return null;
+}
+
+// IO seam for dismissBlockingModal so the verify/retry loop is unit-testable
+// without a live tmux (mirrors makeWatchdog's injectable overrides).
+export interface DismissIO {
+  capture: () => Promise<string>;
+  sendKeys: (keys: string[]) => Promise<void>;
+  delay: (ms: number) => Promise<void>;
+}
+
+// Verify + retry: send the dismiss keys, RE-CAPTURE, and only report success
+// once classifyModal confirms the modal is gone. The original strand cause was
+// a single unverified Escape racing the modal's slow async render (it missed,
+// the modal stayed up, and the next paste was swallowed) — so a modal that
+// outlasts the first keystroke is re-dismissed with backoff. Returns true iff a
+// modal was present AND is now verified-gone; false if none was present or it
+// could not be cleared (so the caller never assumes a swallowing modal is gone).
+const DISMISS_VERIFY_DELAYS = [300, 500, 800, 1200];
+export async function dismissBlockingModalWith(io: DismissIO): Promise<boolean> {
+  let modal = classifyModal(await io.capture());
+  if (!modal) return false;
+  for (const delay of DISMISS_VERIFY_DELAYS) {
+    await io.sendKeys(modal.keys);
+    await io.delay(delay);
+    modal = classifyModal(await io.capture());
+    if (!modal) return true;
   }
   return false;
+}
+
+// Real wrapper binding the IO seam to tmux. Capture failures throw out of
+// io.capture and are swallowed here (give up silently, same as before).
+async function dismissBlockingModal(sessionName: string): Promise<boolean> {
+  try {
+    return await dismissBlockingModalWith({
+      capture: () => tmuxExec(['capture-pane', '-t', sessionName, '-p', '-S', '-25']),
+      sendKeys: (keys) => tmuxExec(['send-keys', '-t', sessionName, ...keys]).then(() => {}),
+      delay: (ms) => new Promise<void>((r) => setTimeout(r, ms)),
+    });
+  } catch {
+    /* capture/send failed — give up silently */
+    return false;
+  }
 }
 
 export function pasteText(sessionName: string, text: string, pressEnter: boolean): Promise<void> {
