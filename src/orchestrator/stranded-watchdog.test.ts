@@ -19,6 +19,23 @@ const S2_PANE = [
 ].join('\n');
 const CLEAN_PANE = ['⏵ working...', '─────────────', '❯ '].join('\n'); // empty composer, no modal
 
+// REALISTIC Claude TUI panes — the composer is NOT the last line; an indented
+// hint line renders below it. This is the live layout that exposed the
+// leading-whitespace scan-bail bug (the bottom-up scan hit the hint line first).
+const REAL_HINT = '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents              /rc';
+const REAL_S1_PANE = [
+  '──────────────────────────────── Agent ──',
+  '❯ please respond ok', // un-submitted composer text, ABOVE the hint line
+  '──────────────────────────────────────────',
+  REAL_HINT,
+].join('\n');
+const REAL_CLEAN_PANE = [
+  '──────────────────────────────── Agent ──',
+  '❯ ', // empty composer
+  '──────────────────────────────────────────',
+  REAL_HINT,
+].join('\n');
+
 /** ISO in the DB's strftime format (no millis). */
 function iso(ms: number): string {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
@@ -34,6 +51,16 @@ describe('classifyStrand', () => {
   });
   it('returns null for a clean pane (empty composer, no modal)', () => {
     assert.equal(classifyStrand(CLEAN_PANE), null);
+  });
+  // Regression (live-verify finding): the real TUI renders an INDENTED hint line
+  // below the composer, so "❯ <text>" is not the last line. A trailing-only
+  // strip made the bottom-up scan bail on the hint's leading spaces and miss the
+  // strand. trim() on both ends fixes it.
+  it('detects S1 with a trailing indented hint line below the composer', () => {
+    assert.equal(classifyStrand(REAL_S1_PANE), 'S1');
+  });
+  it('returns null for a real empty composer with a trailing hint line', () => {
+    assert.equal(classifyStrand(REAL_CLEAN_PANE), null);
   });
 });
 
@@ -142,10 +169,14 @@ describe('StrandedWatchdog', () => {
   it('TEST 1a: S1 stranded + no activity → nudges, re-enqueues, respawns', async () => {
     const agent = makeAgent('s1agent');
     seedDeliveredMessage('s1agent', 'CoachBeard', 300); // delivered 5min ago
-    scripts.set('s1agent', { pane: S1_PANE, frozenSecs: 300 }); // pane frozen 5min, stays stranded
+    // Use the REALISTIC pane (composer above a trailing hint line) so the full
+    // detect→respawn ladder is proven on the live TUI layout, not just a fixture
+    // where "❯ text" is conveniently the last line.
+    scripts.set('s1agent', { pane: REAL_S1_PANE, frozenSecs: 300 }); // frozen 5min, stays stranded
 
     const wd = makeWatchdog();
     const [outcome] = await wd.sweep([agent]);
+    assert.ok(outcome);
 
     assert.equal(outcome.result, 'respawned');
     assert.equal((outcome as { kind: string }).kind, 'S1');
@@ -164,6 +195,7 @@ describe('StrandedWatchdog', () => {
 
     const wd = makeWatchdog();
     const [outcome] = await wd.sweep([agent]);
+    assert.ok(outcome);
 
     assert.equal(outcome.result, 'respawned');
     assert.equal((outcome as { kind: string }).kind, 'S2');
@@ -180,6 +212,7 @@ describe('StrandedWatchdog', () => {
 
     const wd = makeWatchdog();
     const [outcome] = await wd.sweep([agent]);
+    assert.ok(outcome);
 
     assert.equal(outcome.result, 'recovered');
     assert.equal(respawned.length, 0, 'no respawn when a nudge fixes it');
@@ -196,6 +229,7 @@ describe('StrandedWatchdog', () => {
 
     const wd = makeWatchdog();
     const [outcome] = await wd.sweep([agent]);
+    assert.ok(outcome);
 
     assert.equal(outcome.result, 'not-stranded');
     assert.equal(respawned.length, 0, 'a live agent is NEVER respawned');
@@ -211,6 +245,7 @@ describe('StrandedWatchdog', () => {
 
     const wd = makeWatchdog();
     const [outcome] = await wd.sweep([agent]);
+    assert.ok(outcome);
 
     assert.equal(outcome.result, 'not-stranded', 'token leg alone keeps it alive');
     assert.equal(respawned.length, 0);
@@ -224,9 +259,11 @@ describe('StrandedWatchdog', () => {
     db.rawDb.prepare('UPDATE agents SET last_context_pct = 1 WHERE name = ?').run('ctxflip');
     const wd = makeWatchdog();
     const [before] = await wd.sweep([agent]);
+    assert.ok(before);
     db.rawDb.prepare('UPDATE agents SET last_context_pct = 99 WHERE name = ?').run('ctxflip');
     scripts.set('ctxflip', { pane: S1_PANE, frozenSecs: 300 });
     const [after] = await makeWatchdog().sweep([db.getAgent('ctxflip')!]);
+    assert.ok(after);
     // Both decisions come from the two ground-truth legs, not ctx% → identical path.
     assert.equal(before.result, 'respawned');
     assert.equal(after.result, 'respawned');
@@ -241,6 +278,7 @@ describe('StrandedWatchdog', () => {
 
     const wd = makeWatchdog();
     const [outcome] = await wd.sweep([agent]);
+    assert.ok(outcome);
 
     assert.equal(outcome.result, 'respawned');
     assert.equal(respawned.length, 1);
@@ -261,6 +299,7 @@ describe('StrandedWatchdog', () => {
     // A FRESH watchdog instance (post-restart) reads the DB-backed counter.
     const freshWatchdog = makeWatchdog();
     const [outcome] = await freshWatchdog.sweep([agent]);
+    assert.ok(outcome);
 
     assert.equal(outcome.result, 'cap-escalated');
     assert.equal(respawned.length, 0, 'no respawn past the cap');
@@ -283,6 +322,7 @@ describe('StrandedWatchdog', () => {
 
     const wd = makeWatchdog();
     const [outcome] = await wd.sweep([agent]);
+    assert.ok(outcome);
 
     assert.equal(outcome.result, 'partial-consume-escalated');
     assert.equal(respawned.length, 0, 'NEVER respawn a partially-consumed message');

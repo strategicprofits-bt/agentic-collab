@@ -108,7 +108,12 @@ export function classifyModal(pane: string): boolean {
 export function classifyUnsubmittedInput(pane: string): boolean {
   const lines = pane.split('\n').reverse();
   for (const raw of lines) {
-    const line = raw.replace(/\s+$/, '');
+    // trim() BOTH ends — the Claude TUI renders an indented hint line below the
+    // composer ("  ⏵⏵ bypass permissions on (shift+tab…)"). Its LEADING spaces
+    // meant a trailing-only strip left it not matching startsWith('⏵'), so the
+    // bottom-up scan bailed on it BEFORE reaching the "❯ <text>" composer line
+    // just above — missing the common S1 layout entirely (live-verify finding).
+    const line = raw.trim();
     if (!line) continue;
     const m = line.match(/^[❯>]\s+(.+)$/);
     if (m && m[1] && m[1].trim().length > 0) return true;

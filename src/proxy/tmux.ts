@@ -151,7 +151,13 @@ async function inputStillHasUnsubmittedText(sessionName: string): Promise<boolea
     const pane = await tmuxExec(['capture-pane', '-t', sessionName, '-p', '-S', '-8']);
     const lines = pane.split('\n').reverse();
     for (const raw of lines) {
-      const line = raw.replace(/\s+$/, '');
+      // trim() BOTH ends: the indented hint line below the composer
+      // ("  ⏵⏵ bypass permissions on (shift+tab…)") starts with spaces, so a
+      // trailing-only strip left the bottom-up scan bailing on it before the
+      // "❯ <text>" composer line above — weakening this throw-on-unsubmitted
+      // guard for the common TUI layout (live-verify finding; mirrors
+      // stranded-watchdog.ts classifyUnsubmittedInput).
+      const line = raw.trim();
       if (!line) continue;
       const m = line.match(/^[❯>]\s+(.+)$/);
       if (m && m[1] && m[1].trim().length > 0) return true;
