@@ -112,6 +112,15 @@ const PLACEHOLDER_S1_PANE = [
   '──────────────────────────────────────────',
   REAL_HINT,
 ].join('\n');
+// Contextual GHOST-TEXT (a TUI-suggested next-action, NOT a delivered message) —
+// the exact ChloeOBrian #396 class DrRobby flagged. Classifies S1 (composer holds
+// text) but must NOT act: it is not a [from:] envelope, so it does not correspond.
+const GHOST_TEXT_S1_PANE = [
+  '──────────────────────────────── Agent ──',
+  "❯ keep watching Brienne's ctx number",
+  '──────────────────────────────────────────',
+  REAL_HINT,
+].join('\n');
 
 /** ISO in the DB's strftime format (no millis). */
 function iso(ms: number): string {
@@ -269,7 +278,7 @@ describe('StrandedWatchdog', () => {
     };
   }
 
-  function makeWatchdog(): StrandedWatchdog {
+  function makeWatchdog(opts?: { now?: () => number; logEvent?: StrandedWatchdogDeps['logEvent'] }): StrandedWatchdog {
     return new StrandedWatchdog({
       db,
       proxyDispatch: makeDispatch(),
@@ -280,8 +289,9 @@ describe('StrandedWatchdog', () => {
         respawned.push({ agent: agentName, pendingExistedAtCall: pendingExisted });
       },
       alert: (target, topic, body) => alerts.push({ target, topic, body }),
-      logEvent: () => {},
+      logEvent: opts?.logEvent ?? (() => {}),
       sleep: async () => {}, // no real delays in tests
+      ...(opts?.now ? { now: opts.now } : {}),
     });
   }
 
@@ -467,6 +477,27 @@ describe('StrandedWatchdog', () => {
     assert.equal(sentKeys.length, 0);
   });
 
+  it('TEST 2f: CONTEXTUAL GHOST-TEXT in composer (Chloe #396 class) → s1-no-correspondence, ZERO escalation', async () => {
+    const agent = makeAgent('ghost');
+    seedDeliveredMessage('ghost', 'CoachBeard', 300);
+    // Snapshot AFTER delivery → this WOULD be partial-consume (escalate) if the
+    // guard let it through; the test proves the guard excludes it FIRST.
+    seedSnapshot('ghost', 200);
+    scripts.set('ghost', { pane: GHOST_TEXT_S1_PANE, frozenSecs: 300 });
+
+    const wd = makeWatchdog();
+    const [outcome] = await wd.sweep([agent]);
+    assert.ok(outcome);
+
+    // TUI-suggested ghost-text is not a [from:] envelope → no correspondence →
+    // excluded BEFORE the partial-consume escalation. The message-grounded guard
+    // (not the episode-dedup) is what keeps a recovered/active agent silent.
+    assert.equal(outcome.result, 's1-no-correspondence');
+    assert.equal(alerts.length, 0, 'contextual ghost-text NEVER escalates');
+    assert.equal(respawned.length, 0);
+    assert.equal(sentKeys.length, 0);
+  });
+
   // ── TEST 3: re-enqueue BEFORE kill (order invariant) ──
   it('TEST 3: unconsumed message is re-enqueued as pending BEFORE the kill', async () => {
     const agent = makeAgent('order');
@@ -528,5 +559,102 @@ describe('StrandedWatchdog', () => {
     assert.equal(db.countRecentWatchdogRespawns('partial', 1800), 0);
     // Escalated to operators.
     assert.deepEqual(alerts.map((a) => a.target).sort(), ['DrRobby', 'SydneyAdamu']);
+  });
+
+  // ── TEST 6: escalation episode-dedup + reminder + re-arm (alarm-fatigue fix) ──
+  // A persistent wedge must escalate ONCE per episode, then re-escalate only as a
+  // 30-min REMINDER — not afresh every ~30s sweep (the ChloeOBrian #396 prod fire).
+  function seedPartialConsume(name: string): AgentRecord {
+    const agent = makeAgent(name);
+    seedDeliveredMessage(name, 'CoachBeard', 300); // delivered 300s ago
+    scripts.set(name, { pane: CORRESPONDING_S1_PANE, frozenSecs: 300 });
+    seedSnapshot(name, 200); // AFTER delivery, older than the 120s window → partial-consume
+    return agent;
+  }
+
+  it('TEST 6a: partial-consume escalation fires ONCE, then dedups within the reminder window', async () => {
+    const agent = seedPartialConsume('dedup');
+    let clock = Date.now();
+    const wd = makeWatchdog({ now: () => clock });
+
+    const [o1] = await wd.sweep([agent]);
+    assert.equal(o1!.result, 'partial-consume-escalated');
+    assert.equal(alerts.length, 2, 'first escalation fans to both targets');
+
+    const [o2] = await wd.sweep([agent]); // immediate re-sweep, same clock
+    assert.equal(o2!.result, 'partial-consume-escalated');
+    assert.equal(alerts.length, 2, 'no NEW alert within the reminder window (dedup)');
+
+    clock += (WATCHDOG.ESCALATE_REMINDER_SECONDS - 1) * 1000; // just under the interval
+    await wd.sweep([agent]);
+    assert.equal(alerts.length, 2, 'still deduped just before the reminder interval');
+  });
+
+  it('TEST 6b: a still-unresolved wedge re-escalates as a REMINDER continuation after the interval', async () => {
+    const agent = seedPartialConsume('remind');
+    let clock = Date.now();
+    const wd = makeWatchdog({ now: () => clock });
+
+    await wd.sweep([agent]);
+    assert.equal(alerts.length, 2);
+
+    clock += WATCHDOG.ESCALATE_REMINDER_SECONDS * 1000; // exactly the interval
+    await wd.sweep([agent]);
+    assert.equal(alerts.length, 4, 'reminder re-escalates once the interval elapses');
+    const reminder = alerts[alerts.length - 1]!.body;
+    assert.match(reminder, /REMINDER/i, 'framed as a continuation, not a fresh alert');
+    assert.match(reminder, /unresolved/i, 'names elapsed-since-first so it reads as ongoing');
+  });
+
+  it('TEST 6c: re-arms on recovery — after not-stranded, a NEW wedge escalates FRESH (not a reminder)', async () => {
+    const agent = seedPartialConsume('rearm');
+    const clock = Date.now();
+    const wd = makeWatchdog({ now: () => clock }); // clock never advances a full interval
+
+    await wd.sweep([agent]);
+    assert.equal(alerts.length, 2, 'first escalation');
+
+    // Recovery: composer clears → not-stranded → episode re-arms.
+    scripts.set('rearm', { pane: CLEAN_PANE, frozenSecs: 0 });
+    const [rec] = await wd.sweep([agent]);
+    assert.equal(rec!.result, 'not-stranded');
+    assert.equal(alerts.length, 2, 'no alert on recovery');
+
+    // Re-wedge: a FRESH episode escalates fresh, even though no full interval has
+    // elapsed — proving the episode cleared (else it would dedup-suppress).
+    scripts.set('rearm', { pane: CORRESPONDING_S1_PANE, frozenSecs: 300 });
+    const [o] = await wd.sweep([agent]);
+    assert.equal(o!.result, 'partial-consume-escalated');
+    assert.equal(alerts.length, 4, 'a new episode escalates fresh after re-arm');
+    assert.doesNotMatch(alerts[alerts.length - 1]!.body, /REMINDER/i, 'fresh episode is NOT a reminder');
+  });
+
+  it('TEST 6d: s1-no-correspondence logs the event ONCE per episode, not every sweep', async () => {
+    const agent = makeAgent('noisy');
+    seedDeliveredMessage('noisy', 'CoachBeard', 300);
+    seedSnapshot('noisy', 300);
+    scripts.set('noisy', { pane: OWN_DRAFT_S1_PANE, frozenSecs: 300 });
+    const events: Array<{ agent: string; event: string }> = [];
+    const wd = makeWatchdog({ logEvent: (a, e) => events.push({ agent: a, event: e }) });
+
+    await wd.sweep([agent]);
+    await wd.sweep([agent]);
+    await wd.sweep([agent]);
+    assert.equal(
+      events.filter((e) => e.event === 'stranded_s1_no_correspondence').length,
+      1,
+      'logged once across three identical sweeps, not 3x',
+    );
+
+    // Recovery clears the once-flag → a fresh episode logs again.
+    scripts.set('noisy', { pane: CLEAN_PANE, frozenSecs: 0 });
+    await wd.sweep([agent]);
+    scripts.set('noisy', { pane: OWN_DRAFT_S1_PANE, frozenSecs: 300 });
+    await wd.sweep([agent]);
+    assert.equal(
+      events.filter((e) => e.event === 'stranded_s1_no_correspondence').length,
+      2,
+      're-logs after leaving and re-entering the s1-no-correspondence state',
+    );
   });
 });

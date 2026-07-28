@@ -57,6 +57,9 @@ export const WATCHDOG = {
   NUDGE_DELAY_MS: 2000,
   /** Escalation targets (Telegram-reaching monitors). */
   ESCALATE_TARGETS: ['DrRobby', 'SydneyAdamu'] as const,
+  /** Re-escalate an unresolved wedge at most once per this interval (seconds).
+   *  30 min — clear of alarm-fatigue while never silently dropping a real one. */
+  ESCALATE_REMINDER_SECONDS: 1800,
 } as const;
 
 export interface StrandedWatchdogDeps {
@@ -128,6 +131,15 @@ export class StrandedWatchdog {
   private readonly sleep: (ms: number) => Promise<void>;
   /** Agents with an in-flight sweep — prevents overlapping recovery ladders. */
   private readonly inFlight = new Set<string>();
+  /** Active escalation episodes: agent → {firstAt, lastAt} (epoch ms). Escalate
+   *  ONCE per episode, then remind at most every ESCALATE_REMINDER_SECONDS;
+   *  cleared when the agent next reads healthy (re-arm) so a NEW wedge fires fresh.
+   *  Without this, a persistent wedge re-escalates every ~30s sweep → alarm
+   *  fatigue (the ChloeOBrian #396 prod fire). */
+  private readonly escalations = new Map<string, { firstAt: number; lastAt: number }>();
+  /** Agents whose s1-no-correspondence was already logged this episode — log the
+   *  event once, not every sweep (Chloe accrued 310 rows in one episode). */
+  private readonly noCorrLogged = new Set<string>();
 
   constructor(deps: StrandedWatchdogDeps) {
     this.db = deps.db;
@@ -143,10 +155,27 @@ export class StrandedWatchdog {
   async sweep(agents: AgentRecord[]): Promise<SweepOutcome[]> {
     const out: SweepOutcome[] = [];
     for (const agent of agents) {
+      let outcome: SweepOutcome;
       try {
-        out.push(await this.sweepAgent(agent));
+        outcome = await this.sweepAgent(agent);
       } catch (err) {
-        out.push({ agent: agent.name, result: 'skip', reason: `error: ${(err as Error).message}` });
+        outcome = { agent: agent.name, result: 'skip', reason: `error: ${(err as Error).message}` };
+      }
+      out.push(outcome);
+      // Re-arm the escalation episode once the agent reads healthy/recovered — any
+      // outcome that is neither an escalation nor a transient skip means the wedge
+      // is over, so a FUTURE wedge escalates fresh (not as a stale reminder).
+      if (
+        outcome.result !== 'partial-consume-escalated' &&
+        outcome.result !== 'cap-escalated' &&
+        outcome.result !== 'skip'
+      ) {
+        this.escalations.delete(agent.name);
+      }
+      // The s1-no-correspondence log-once flag clears whenever the agent leaves
+      // that state, so a later re-entry logs once again (not silence forever).
+      if (outcome.result !== 's1-no-correspondence') {
+        this.noCorrLogged.delete(agent.name);
       }
     }
     return out;
@@ -184,10 +213,15 @@ export class StrandedWatchdog {
     if (kind === 'S1') {
       const composerText = extractComposerText(pane);
       if (composerText === null || !composerCorrespondsToMessage(composerText, msg.envelope)) {
-        this.logEvent(name, 'stranded_s1_no_correspondence', {
-          deliveredAt: msg.deliveredAt,
-          composerPreview: (composerText ?? '').slice(0, 80),
-        });
+        // Log once per episode — a persistent own-draft would otherwise emit an
+        // event every sweep (~30s), flooding the event log (Chloe: 310 rows).
+        if (!this.noCorrLogged.has(name)) {
+          this.logEvent(name, 'stranded_s1_no_correspondence', {
+            deliveredAt: msg.deliveredAt,
+            composerPreview: (composerText ?? '').slice(0, 80),
+          });
+          this.noCorrLogged.add(name);
+        }
         return { agent: name, result: 's1-no-correspondence' };
       }
     }
@@ -210,11 +244,13 @@ export class StrandedWatchdog {
     if (this.db.hasActivitySince(name, msg.deliveredAt)) {
       // The agent DID process after delivery, then wedged. Re-running could
       // double-fire a side-effecting message → escalate only, never respawn.
-      this.logEvent(name, 'stranded_partial_consume', { kind, deliveredAt: msg.deliveredAt });
-      this.escalate(
+      const fired = this.escalate(
         name,
         `⚠️ ${name} wedged (${kind}) AFTER partially processing a delivered message. NOT auto-recovering (avoid double-firing a side-effecting message). Needs operator: unwedge or /clear manually.`,
       );
+      // Log the detection only when the escalation actually fired (first + each
+      // 30-min reminder), not every suppressed sweep — same anti-spam as the alert.
+      if (fired) this.logEvent(name, 'stranded_partial_consume', { kind, deliveredAt: msg.deliveredAt });
       return { agent: name, result: 'partial-consume-escalated', kind };
     }
 
@@ -291,11 +327,11 @@ export class StrandedWatchdog {
     //     off to a human and STOP (do not re-enqueue or kill).
     const respawns = this.db.countRecentWatchdogRespawns(name, WATCHDOG.RESPAWN_WINDOW_SECONDS);
     if (respawns >= WATCHDOG.RESPAWN_CAP) {
-      this.logEvent(name, 'stranded_respawn_cap_reached', { kind, respawns });
-      this.escalate(
+      const fired = this.escalate(
         name,
         `🔴 ${name} stranded (${kind}) and hit the watchdog respawn cap (${respawns}/${WATCHDOG.RESPAWN_CAP} in ${WATCHDOG.RESPAWN_WINDOW_SECONDS / 60}min). Auto-recovery STOPPED — needs operator intervention.`,
       );
+      if (fired) this.logEvent(name, 'stranded_respawn_cap_reached', { kind, respawns });
       return { agent: name, result: 'cap-escalated', kind };
     }
 
@@ -322,7 +358,31 @@ export class StrandedWatchdog {
     return { agent: name, result: 'respawned', kind };
   }
 
-  private escalate(agentName: string, body: string): void {
+  /**
+   * Escalate a wedge to the operator monitors ONCE per episode, then at most once
+   * per ESCALATE_REMINDER_SECONDS as a REMINDER continuation (episode age + first-
+   * escalation time, so the operator distinguishes an ongoing wedge from a new one).
+   * The episode clears on recovery (see sweep) so a fresh wedge escalates fresh.
+   * Returns true iff an alert was actually sent (first escalation or a due reminder).
+   */
+  private escalate(agentName: string, body: string): boolean {
+    const now = this.now();
+    const ep = this.escalations.get(agentName);
+    if (ep === undefined) {
+      this.escalations.set(agentName, { firstAt: now, lastAt: now });
+      this.fanOut(body);
+      return true;
+    }
+    // Ongoing episode — suppress unless the reminder interval has elapsed.
+    if (now - ep.lastAt < WATCHDOG.ESCALATE_REMINDER_SECONDS * 1000) return false;
+    ep.lastAt = now;
+    const unresolvedMin = Math.floor((now - ep.firstAt) / 60000);
+    const firstClock = new Date(ep.firstAt).toISOString().slice(11, 16); // HH:MM UTC
+    this.fanOut(`⏳ REMINDER — still unresolved after ${unresolvedMin}min (first escalated ${firstClock}Z). ${body}`);
+    return true;
+  }
+
+  private fanOut(body: string): void {
     for (const target of WATCHDOG.ESCALATE_TARGETS) {
       this.alert(target, 'stranded-input-escalation', body);
     }
