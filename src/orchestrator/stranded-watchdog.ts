@@ -101,24 +101,57 @@ export function classifyModal(pane: string): boolean {
 }
 
 /**
- * S1 — the composer holds un-submitted text ("❯ <text>"), i.e. a paste that was
- * never sent. Mirrors proxy/tmux.ts inputStillHasUnsubmittedText, but reads the
- * pane text the orchestrator already captured (no extra proxy round-trip).
+ * S1 — the composer holds un-submitted text, i.e. a paste that was never sent.
+ * Mirrors proxy/tmux.ts inputStillHasUnsubmittedText, but reads the pane text the
+ * orchestrator already captured (no extra proxy round-trip).
+ *
+ * The composer is a small, fixed-height BOX at the very bottom of the pane,
+ * bounded by two border lines, with an indented hint line below it:
+ *
+ *     ──────────── AgentName ──     ← top border (has the title)
+ *     ❯ first line of the message   ← composer prompt line
+ *       wrapped continuation …      ← continuation lines (indented, NO glyph)
+ *     ──────────────────────────    ← bottom border
+ *       ⏵⏵ bypass permissions …     ← hint line (indented)
+ *
+ * Two hazards this threads on ONE pass (both are un-mergeable if traded):
+ *  - UNDER-detect: trim() BOTH ends per line so the INDENTED hint/continuation
+ *    lines don't defeat the walk (the original hint-line miss).
+ *  - OVER-detect (false-kill): the walk is BOUNDED to the composer box — it stops
+ *    at the top border and never climbs into scrollback, where blockquoted "> …"
+ *    system-prompt text would otherwise be misread as live composer input
+ *    (Roz gate finding). MAX_SCAN is a hard backstop if the borders are ever
+ *    absent/malformed, so a run of blank/decoration lines can't chain up either.
+ *
+ * Returns true iff there is any non-empty text INSIDE the composer box.
  */
 export function classifyUnsubmittedInput(pane: string): boolean {
-  const lines = pane.split('\n').reverse();
-  for (const raw of lines) {
-    // trim() BOTH ends — the Claude TUI renders an indented hint line below the
-    // composer ("  ⏵⏵ bypass permissions on (shift+tab…)"). Its LEADING spaces
-    // meant a trailing-only strip left it not matching startsWith('⏵'), so the
-    // bottom-up scan bailed on it BEFORE reaching the "❯ <text>" composer line
-    // just above — missing the common S1 layout entirely (live-verify finding).
-    const line = raw.trim();
+  const lines = pane.split('\n');
+  const MAX_SCAN = 16; // composer box is tiny; generous cap, still finite
+  let scanned = 0;
+  let insideBox = false; // seen the bottom border → now within the composer box
+  for (let i = lines.length - 1; i >= 0 && scanned < MAX_SCAN; i--) {
+    const line = lines[i]!.trim();
     if (!line) continue;
-    const m = line.match(/^[❯>]\s+(.+)$/);
-    if (m && m[1] && m[1].trim().length > 0) return true;
-    if (!line.startsWith('❯') && !line.startsWith('>') && !line.startsWith('─') && !line.startsWith('⏵')) {
-      return false;
+    scanned++;
+    if (line.startsWith('⏵')) continue; // hint line, rendered BELOW the box
+    if (line.startsWith('─')) {
+      if (!insideBox) { insideBox = true; continue; } // bottom border → enter box
+      return false; // top border → everything above is scrollback: STOP
+    }
+    if (insideBox) {
+      // Any non-empty text inside the box = live unsubmitted input. Strip an
+      // optional prompt glyph so a bare "❯"/"> " empty prompt reads as empty
+      // while wrapped continuation lines (no glyph) still count.
+      const content = line.replace(/^[❯>]\s*/, '').trim();
+      if (content.length > 0) return true;
+    } else {
+      // A non-decoration line reached BEFORE any bottom border = a compact pane
+      // with no rendered box. Only a composer prompt WITH text counts, and only
+      // the "❯" composer glyph (NOT ">") — so a bare scrollback "> …" line that
+      // happens to be last can never false-positive. Decide here and STOP.
+      const m = line.match(/^❯\s+(.+)$/);
+      return m !== null && m[1] !== undefined && m[1].trim().length > 0;
     }
   }
   return false;

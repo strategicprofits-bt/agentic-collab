@@ -143,26 +143,41 @@ function pasteEnterDelay(textLength: number): number {
   return Math.max(1500, textLength);
 }
 
-// Detect "input prompt has un-submitted text". Last lines look like
-// "❯ <something>" when our Enter was eaten; an empty input prompt is "❯ "
-// with nothing after.
+// Detect "input prompt has un-submitted text". The composer is a small box at
+// the bottom of the pane bounded by two border lines with an indented hint line
+// below it:  [top border] ❯ <text…wrapped continuation…> [bottom border] [hint].
+// We walk UP from the bottom, entering the box at the bottom border and STOPPING
+// at the top border — never into scrollback above, where blockquoted "> …"
+// system-prompt text would false-positive (Roz gate finding). trim() BOTH ends so
+// the indented hint/continuation lines don't defeat the walk (the hint-line miss
+// this fix originally targeted). MAX_SCAN backstops absent/malformed borders.
+// Mirrors stranded-watchdog.ts classifyUnsubmittedInput — keep the two in step.
 async function inputStillHasUnsubmittedText(sessionName: string): Promise<boolean> {
   try {
     const pane = await tmuxExec(['capture-pane', '-t', sessionName, '-p', '-S', '-8']);
-    const lines = pane.split('\n').reverse();
-    for (const raw of lines) {
-      // trim() BOTH ends: the indented hint line below the composer
-      // ("  ⏵⏵ bypass permissions on (shift+tab…)") starts with spaces, so a
-      // trailing-only strip left the bottom-up scan bailing on it before the
-      // "❯ <text>" composer line above — weakening this throw-on-unsubmitted
-      // guard for the common TUI layout (live-verify finding; mirrors
-      // stranded-watchdog.ts classifyUnsubmittedInput).
-      const line = raw.trim();
+    const lines = pane.split('\n');
+    const MAX_SCAN = 16;
+    let scanned = 0;
+    let insideBox = false;
+    for (let i = lines.length - 1; i >= 0 && scanned < MAX_SCAN; i--) {
+      const line = lines[i]!.trim();
       if (!line) continue;
-      const m = line.match(/^[❯>]\s+(.+)$/);
-      if (m && m[1] && m[1].trim().length > 0) return true;
-      // First non-empty, non-prompt-related line ends the scan
-      if (!line.startsWith('❯') && !line.startsWith('>') && !line.startsWith('─') && !line.startsWith('⏵')) return false;
+      scanned++;
+      if (line.startsWith('⏵')) continue; // hint line, below the box
+      if (line.startsWith('─')) {
+        if (!insideBox) { insideBox = true; continue; } // bottom border → enter box
+        return false; // top border → above is scrollback: STOP
+      }
+      if (insideBox) {
+        const content = line.replace(/^[❯>]\s*/, '').trim();
+        if (content.length > 0) return true; // any text inside the box = unsubmitted
+      } else {
+        // Compact pane, no rendered box: only a composer prompt WITH text counts,
+        // and only the "❯" glyph (not ">") so a bare "> …" scrollback line can't
+        // false-positive. Decide and STOP.
+        const m = line.match(/^❯\s+(.+)$/);
+        return m !== null && m[1] !== undefined && m[1].trim().length > 0;
+      }
     }
   } catch {
     /* capture failed — be conservative and don't retry */

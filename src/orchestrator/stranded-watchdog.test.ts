@@ -36,6 +36,55 @@ const REAL_CLEAN_PANE = [
   REAL_HINT,
 ].join('\n');
 
+// Real-captured MULTI-LINE composer (a long unsubmitted paste wraps: the "❯"
+// prompt line + indented continuation lines with NO glyph). Captured verbatim
+// from a live agent's composer while it genuinely held pending text. This is the
+// actual stranding case (collab envelopes are long/multi-line) and must detect.
+const REAL_MULTILINE_S1_PANE = [
+  '──────────────────────────────────────────────────────────────────── Agent ──',
+  '❯ this is a long unsubmitted draft that should wrap across multiple visual',
+  '  lines inside the composer box without ever being submitted so that the',
+  '  composer genuinely holds multi line pending text right now',
+  '────────────────────────────────────────────────────────────────────────────────',
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle)                             /rc',
+].join('\n');
+
+// ── OVER-DETECTION (false-kill) regressions — Roz gate finding ──
+// The composer is EMPTY, but blockquoted "> …" scrollback (routine in this fleet:
+// persona/system-prompt text renders as indented markdown blockquotes) sits
+// ABOVE it. trim() alone let the unbounded reverse scan climb past the empty
+// composer into that scrollback and read "> …" as live input → false S1 → a
+// healthy idle agent enters the kill-capable recovery ladder. The bounded scan
+// must STOP at the composer box and return null. NBSP after "❯" matches the real
+// capture (Roz's fixture-realism note) and exercises whitespace handling.
+const EMPTY_COMPOSER = '❯ '; // real composer ends '❯' + U+00A0 (NBSP)
+// Roz's exact adversarial pane — border between quote and composer.
+const ADVERSARIAL_QUOTE_ABOVE = [
+  '  > some quoted markdown text from assistant output',
+  '──────────────────────────────── Agent ──',
+  EMPTY_COMPOSER,
+  '──────────────────────────────────────────',
+  REAL_HINT,
+].join('\n');
+// Variant — quote immediately adjacent to the composer, no border between.
+const ADVERSARIAL_QUOTE_ADJACENT = [
+  '  > some quoted markdown text',
+  EMPTY_COMPOSER,
+  REAL_HINT,
+].join('\n');
+// Real-captured "> …" blockquote scrollback (verbatim from a live agent's
+// persona history) above a real empty composer box.
+const REAL_QUOTE_SCROLLBACK_EMPTY = [
+  '> You are the ONLY agent authorized to spawn other agents. When the team needs a',
+  ' > **How to spawn an agent:**',
+  '> ```bash',
+  '',
+  '──────────────────────────────── Agent ──',
+  EMPTY_COMPOSER,
+  '──────────────────────────────────────────',
+  REAL_HINT,
+].join('\n');
+
 /** ISO in the DB's strftime format (no millis). */
 function iso(ms: number): string {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
@@ -61,6 +110,23 @@ describe('classifyStrand', () => {
   });
   it('returns null for a real empty composer with a trailing hint line', () => {
     assert.equal(classifyStrand(REAL_CLEAN_PANE), null);
+  });
+  // POSITIVE — must still detect the real multi-line stranding case (the fix
+  // must not over-correct into under-detection; DrRobby's two-sided constraint).
+  it('detects S1 for a real multi-line wrapped unsubmitted paste', () => {
+    assert.equal(classifyStrand(REAL_MULTILINE_S1_PANE), 'S1');
+  });
+  // NEGATIVE (false-kill regression) — empty composer with "> …" scrollback ABOVE
+  // must be null. These are RED on the trim-only fix (0193593) and GREEN on the
+  // bounded scan. The whole point of the bound: never climb into scrollback.
+  it('returns null: empty composer, quoted scrollback above a border (Roz repro)', () => {
+    assert.equal(classifyStrand(ADVERSARIAL_QUOTE_ABOVE), null);
+  });
+  it('returns null: empty composer, quoted scrollback adjacent (no border)', () => {
+    assert.equal(classifyStrand(ADVERSARIAL_QUOTE_ADJACENT), null);
+  });
+  it('returns null: empty composer with REAL "> …" persona scrollback above', () => {
+    assert.equal(classifyStrand(REAL_QUOTE_SCROLLBACK_EMPTY), null);
   });
 });
 
