@@ -1127,8 +1127,38 @@ const RECOVER_TIMEOUT_MS = parseInt(process.env['RECOVER_TIMEOUT_MS'] ?? '60000'
 export async function recoverAgent(
   ctx: LifecycleContext,
   name: string,
+  opts?: { force?: boolean },
 ): Promise<AgentRecord> {
   const peers = computePeers(ctx, name);
+
+  // ── GAP-026 liveness interlock ──
+  // Recovery kills the old session then fresh-respawns. If the session is actually
+  // ALIVE (a false-death signal — proxy blip, transient-suspended, false-frozen pane),
+  // that would reap live context. Self-heal instead of reap, unless explicitly forced.
+  if (!opts?.force) {
+    const pre = ctx.db.getAgent(name);
+    if (pre?.proxyId && pre.tmuxSession) {
+      const live = await ctx.proxyDispatch(pre.proxyId, {
+        action: 'has_session',
+        sessionName: sessionName(pre),
+      }).catch(() => ({ ok: false }) as ProxyResponse);
+      if (live.ok && live.data === true) {
+        return ctx.locks.withLock(name, async () => {
+          const cur = ctx.db.getAgent(name);
+          if (!cur) throw new Error(`Agent "${name}" not found`);
+          const healed = ctx.db.updateAgentState(name, 'active', cur.version, {
+            lastActivity: new Date().toISOString(),
+            failedAt: null,
+            failureReason: null,
+          });
+          ctx.db.logEvent(name, 'recover_skipped_alive', undefined, {
+            reason: 'has_session=true; self-healed instead of reap',
+          });
+          return healed;
+        });
+      }
+    }
+  }
 
   // ── Phase 1: validate + transition to 'spawning' ──
   const phase1 = await ctx.locks.withLock(name, async () => {
@@ -1323,11 +1353,37 @@ export async function compactAgent(
 export async function killAgent(
   ctx: LifecycleContext,
   name: string,
+  opts?: { force?: boolean },
 ): Promise<void> {
   await ctx.locks.withLock(name, async () => {
     const agent = ctx.db.getAgent(name);
     if (!agent) throw new Error(`Agent "${name}" not found`);
     const proxyId = requireProxy(agent);
+
+    // ── GAP-026 liveness interlock ──
+    // Never reap a LIVE tmux session on a false death signal (the 2026-07-28 burst:
+    // a watchdog force-freshed self-healed-alive agents, costing context). If the
+    // session is alive and the caller did not explicitly force, self-heal instead of
+    // killing. Explicit operator force-fresh passes force:true to override.
+    if (!opts?.force) {
+      const live = await ctx.proxyDispatch(proxyId, {
+        action: 'has_session',
+        sessionName: sessionName(agent),
+      }).catch(() => ({ ok: false }) as ProxyResponse);
+      if (live.ok && live.data === true) {
+        if (agent.state !== 'active' && agent.state !== 'idle') {
+          ctx.db.updateAgentState(name, 'active', agent.version, {
+            lastActivity: new Date().toISOString(),
+            failedAt: null,
+            failureReason: null,
+          });
+        }
+        ctx.db.logEvent(name, 'kill_skipped_alive', undefined, {
+          reason: 'has_session=true; refused reap (pass force to override)',
+        });
+        return;
+      }
+    }
 
     await ctx.proxyDispatch(proxyId, {
       action: 'kill_session',

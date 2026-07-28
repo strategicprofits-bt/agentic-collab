@@ -146,8 +146,10 @@ describe('Integration: full lifecycle via HTTP', () => {
     assert.equal((resume.data as Record<string, unknown>).state, 'active');
     assert.ok(sessions.has('agent-int-agent'), 'tmux session should be re-created');
 
-    // 5. Kill agent (hard stop without graceful exit)
-    const kill = await api('POST', '/api/agents/int-agent/kill');
+    // 5. Kill agent (hard stop without graceful exit). force:true = explicit
+    //    operator hard-stop, overriding the GAP-026 liveness interlock (the session
+    //    is alive here; without force the kill would self-heal rather than reap).
+    const kill = await api('POST', '/api/agents/int-agent/kill', { force: true });
     assert.equal(kill.status, 200);
 
     // Kill returns { ok: true }, verify state via GET
