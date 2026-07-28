@@ -38,6 +38,11 @@
 import type { Database } from './database.ts';
 import type { ProxyCommand, ProxyResponse, AgentRecord } from '../shared/types.ts';
 import { sessionName, canSuspend } from '../shared/agent-entity.ts';
+import { extractComposerText, hasComposerText, composerCorrespondsToMessage, MIN_CORRESPONDENCE_CHARS } from '../shared/composer.ts';
+
+// Re-export the shared composer primitives so existing importers (and tests)
+// keep a single import site while the implementation lives in shared/.
+export { extractComposerText, composerCorrespondsToMessage, MIN_CORRESPONDENCE_CHARS };
 
 export const WATCHDOG = {
   /** N — no-activity threshold (seconds). Both signal legs must exceed this. */
@@ -78,6 +83,7 @@ export type StrandKind = 'S1' | 'S2';
 export type SweepOutcome =
   | { agent: string; result: 'skip'; reason: string }
   | { agent: string; result: 'not-stranded' }
+  | { agent: string; result: 's1-no-correspondence' } // composer text ≠ the delivered message (own-draft / placeholder)
   | { agent: string; result: 'recovered'; kind: StrandKind; attempts: number }
   | { agent: string; result: 'partial-consume-escalated'; kind: StrandKind }
   | { agent: string; result: 'respawned'; kind: StrandKind }
@@ -100,23 +106,9 @@ export function classifyModal(pane: string): boolean {
   );
 }
 
-/**
- * S1 — the composer holds un-submitted text ("❯ <text>"), i.e. a paste that was
- * never sent. Mirrors proxy/tmux.ts inputStillHasUnsubmittedText, but reads the
- * pane text the orchestrator already captured (no extra proxy round-trip).
- */
+/** S1 — the composer holds any un-submitted text (boolean view of extract). */
 export function classifyUnsubmittedInput(pane: string): boolean {
-  const lines = pane.split('\n').reverse();
-  for (const raw of lines) {
-    const line = raw.replace(/\s+$/, '');
-    if (!line) continue;
-    const m = line.match(/^[❯>]\s+(.+)$/);
-    if (m && m[1] && m[1].trim().length > 0) return true;
-    if (!line.startsWith('❯') && !line.startsWith('>') && !line.startsWith('─') && !line.startsWith('⏵')) {
-      return false;
-    }
-  }
-  return false;
+  return hasComposerText(pane);
 }
 
 /** Classify the strand kind, preferring the modal signal (it gates keystrokes). */
@@ -181,6 +173,25 @@ export class StrandedWatchdog {
     const kind = classifyStrand(pane);
     if (!kind) return { agent: name, result: 'not-stranded' };
 
+    // Candidacy gate 2b (S1 only): the unsubmitted composer text must CORRESPOND
+    // to the delivered message. A genuine stranded paste renders the message
+    // envelope; an agent's OWN draft or the TUI placeholder ("❯ Try \"…\"") does
+    // not — so this excludes the false-action cases (Chloe's own-draft; the
+    // fresh-composer placeholder / probe #1) BEFORE any nudge/kill. This guard is
+    // safety-sufficient regardless of hasActivitySince blind spots: a healthy
+    // agent's own text simply won't match the message. S2 modals hide the
+    // composer, so correspondence can't be read there — S1 only (see report note).
+    if (kind === 'S1') {
+      const composerText = extractComposerText(pane);
+      if (composerText === null || !composerCorrespondsToMessage(composerText, msg.envelope)) {
+        this.logEvent(name, 'stranded_s1_no_correspondence', {
+          deliveredAt: msg.deliveredAt,
+          composerPreview: (composerText ?? '').slice(0, 80),
+        });
+        return { agent: name, result: 's1-no-correspondence' };
+      }
+    }
+
     // Candidacy gate 3: no-activity — MANDATORY TWO-SIGNAL AND. If either leg
     // shows life, the agent is alive/draining — never touch it.
     const N = WATCHDOG.NO_ACTIVITY_SECONDS;
@@ -227,10 +238,34 @@ export class StrandedWatchdog {
     firstPane: string,
   ): Promise<SweepOutcome> {
     const name = agent.name;
-
-    // (a) Gentle nudge: dismiss the modal (S2) then submit the pending text.
-    //     Escape closes /status-family pickers; Enter submits the composer.
     let pane = firstPane;
+
+    // S2 gate: a modal HID the composer, so the correspondence guard (gate 2b)
+    // couldn't run before now. To keep the kill-capable ladder off a healthy
+    // agent that opened a modal itself (e.g. /status) while its message was
+    // already consumed, DISMISS the modal first (Escape — safe, recoverable),
+    // then require the SAME correspondence on the revealed composer BEFORE any
+    // respawn. A self-opened modal reveals an own-draft or empty composer → no
+    // correspondence → STOP, never respawn (worst case we closed a self-opened
+    // modal). Only a genuine stranded message revealed behind the modal proceeds.
+    if (kind === 'S2') {
+      await this.sendKeys(agent, 'Escape');
+      await this.sleep(WATCHDOG.NUDGE_DELAY_MS);
+      const revealed = await this.capture(agent);
+      if (revealed !== null) pane = revealed;
+      const composerText = revealed === null ? null : extractComposerText(revealed);
+      if (composerText === null || !composerCorrespondsToMessage(composerText, msg.envelope)) {
+        this.logEvent(name, 'stranded_s2_dismissed_no_correspondence', {
+          deliveredAt: msg.deliveredAt,
+          composerPreview: (composerText ?? '').slice(0, 80),
+        });
+        return { agent: name, result: 's1-no-correspondence' }; // dismissed, no genuine strand → no respawn
+      }
+      // A real stranded message is behind the modal — recover it like S1 below.
+    }
+
+    // (a) Gentle nudge: submit the pending (correspondence-verified) text. The
+    //     modal, if any, was already dismissed above; Enter submits the composer.
     for (let attempt = 1; attempt <= WATCHDOG.MAX_NUDGE_ATTEMPTS; attempt++) {
       if (classifyStrand(pane) === 'S2') {
         await this.sendKeys(agent, 'Escape');

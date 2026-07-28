@@ -13,6 +13,7 @@
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { extractComposerText, composerHoldsPaste } from '../shared/composer.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -143,21 +144,22 @@ function pasteEnterDelay(textLength: number): number {
   return Math.max(1500, textLength);
 }
 
-// Detect "input prompt has un-submitted text". Last lines look like
-// "❯ <something>" when our Enter was eaten; an empty input prompt is "❯ "
-// with nothing after.
-async function inputStillHasUnsubmittedText(sessionName: string): Promise<boolean> {
+// Did MY paste fail to submit — i.e. does the composer STILL hold the text I just
+// pasted? Correspondence-based (not "is there ANY text"): the composer must still
+// CORRESPOND to `pastedText`. This is the Part A twin of the watchdog's guard,
+// sharing shared/composer.ts so the two can't drift. It matters because the
+// bounded box-walk now (correctly) sees text a bare heuristic missed — including
+// the TUI's fresh-composer PLACEHOLDER ("❯ Try \"…\"") — and a bare "is there text"
+// check would FALSE-throw on a placeholder after a SUCCESSFUL submit, stranding
+// the message as pending → redelivery (double-delivery). Requiring correspondence
+// to MY text means a placeholder / the agent's own draft / empty all read as
+// "submitted" (no throw); only my un-submitted paste still sitting there throws.
+async function inputStillHasUnsubmittedText(sessionName: string, pastedText: string): Promise<boolean> {
   try {
     const pane = await tmuxExec(['capture-pane', '-t', sessionName, '-p', '-S', '-8']);
-    const lines = pane.split('\n').reverse();
-    for (const raw of lines) {
-      const line = raw.replace(/\s+$/, '');
-      if (!line) continue;
-      const m = line.match(/^[❯>]\s+(.+)$/);
-      if (m && m[1] && m[1].trim().length > 0) return true;
-      // First non-empty, non-prompt-related line ends the scan
-      if (!line.startsWith('❯') && !line.startsWith('>') && !line.startsWith('─') && !line.startsWith('⏵')) return false;
-    }
+    const composer = extractComposerText(pane);
+    if (composer === null) return false; // empty composer → my paste submitted
+    return composerHoldsPaste(composer, pastedText);
   } catch {
     /* capture failed — be conservative and don't retry */
   }
@@ -240,7 +242,7 @@ export function pasteText(sessionName: string, text: string, pressEnter: boolean
       const retryDelays = [800, 1200, 1500, 2000, 2500];
       for (const delay of retryDelays) {
         await new Promise<void>((r) => setTimeout(r, delay));
-        if (!(await inputStillHasUnsubmittedText(sessionName))) return;
+        if (!(await inputStillHasUnsubmittedText(sessionName, text))) return;
         if (await dismissBlockingModal(sessionName)) {
           await new Promise<void>((r) => setTimeout(r, 400));
         }
@@ -255,9 +257,9 @@ export function pasteText(sessionName: string, text: string, pressEnter: boolean
       // deliverToAgent surfaces an error and the dispatcher keeps the message
       // PENDING for retry; the stranded-input watchdog is the recovery path of
       // last resort.
-      if (await inputStillHasUnsubmittedText(sessionName)) {
+      if (await inputStillHasUnsubmittedText(sessionName, text)) {
         throw new Error(
-          `paste to "${sessionName}" not submitted after ${retryDelays.length} retries — input still holds unsubmitted text (TUI submit-wedge or undismissed modal)`,
+          `paste to "${sessionName}" not submitted after ${retryDelays.length} retries — composer still holds the pasted text (TUI submit-wedge or undismissed modal)`,
         );
       }
     }
