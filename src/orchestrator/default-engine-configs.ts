@@ -124,16 +124,16 @@ export const DEFAULT_ENGINE_CONFIGS: DefaultEngineConfig[] = [
   {
     name: 'claude',
     engine: 'claude',
+    // SESSION_ID is passed at spawn via --session-id (pre-generated UUID in
+    // templateVars); no need to scrape it from the /status modal afterward.
+    // The old /status+capture+Escape triplet could leave the modal open on
+    // the pane, swallowing subsequently-delivered messages (inbound parking).
     hookStart: JSON.stringify([
-      { type: 'shell', command: 'claude --dangerously-skip-permissions --model opus --effort max --append-system-prompt $PERSONA_PROMPT' },
+      { type: 'shell', command: 'claude --dangerously-skip-permissions --model opus --effort max --session-id $SESSION_ID --append-system-prompt $PERSONA_PROMPT' },
       { type: 'wait', ms: 5000 },
       { type: 'keystroke', key: 'Enter' },
       { type: 'wait', ms: 500 },
       { type: 'keystroke', key: 'Enter' },
-      { type: 'wait', ms: 1000 },
-      { type: 'shell', command: '/status' },
-      { type: 'capture', lines: 30, regex: 'uuid', var: 'SESSION_ID' },
-      { type: 'keystroke', key: 'Escape' },
     ]),
     hookResume: JSON.stringify([
       { type: 'shell', command: 'claude --resume $SESSION_ID --append-system-prompt $PERSONA_PROMPT' },
@@ -141,10 +141,6 @@ export const DEFAULT_ENGINE_CONFIGS: DefaultEngineConfig[] = [
       { type: 'keystroke', key: 'Enter' },
       { type: 'wait', ms: 500 },
       { type: 'keystroke', key: 'Enter' },
-      { type: 'wait', ms: 1000 },
-      { type: 'shell', command: '/status' },
-      { type: 'capture', lines: 30, regex: 'uuid', var: 'SESSION_ID' },
-      { type: 'keystroke', key: 'Escape' },
     ]),
     hookCompact: JSON.stringify([
       { type: 'keystrokes', actions: [
@@ -161,18 +157,18 @@ export const DEFAULT_ENGINE_CONFIGS: DefaultEngineConfig[] = [
       { type: 'keystroke', key: 'Escape' },
       { type: 'keystroke', key: 'Escape' },
     ]),
+    // NOTE: hookReload is not dispatched by reloadAgent (it decomposes to
+    // hookExit + hookResume/hookStart) and is not persisted by
+    // createEngineConfig. Kept consistent with the others to avoid
+    // reintroducing the /status-scrape pattern by copy.
     hookReload: JSON.stringify([
       { type: 'shell', command: '/exit' },
       { type: 'wait', ms: 10000 },
-      { type: 'shell', command: 'claude --dangerously-skip-permissions --model opus --effort max --append-system-prompt $PERSONA_PROMPT' },
+      { type: 'shell', command: 'claude --dangerously-skip-permissions --model opus --effort max --session-id $SESSION_ID --append-system-prompt $PERSONA_PROMPT' },
       { type: 'wait', ms: 5000 },
       { type: 'keystroke', key: 'Enter' },
       { type: 'wait', ms: 500 },
       { type: 'keystroke', key: 'Enter' },
-      { type: 'wait', ms: 1000 },
-      { type: 'shell', command: '/status' },
-      { type: 'capture', lines: 30, regex: 'uuid', var: 'SESSION_ID' },
-      { type: 'keystroke', key: 'Escape' },
     ]),
     indicators: JSON.stringify([
       UNSAFE_INDICATOR,
