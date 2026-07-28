@@ -143,6 +143,83 @@ describe('classifyModal (verified-dismissal detection)', () => {
   });
 });
 
+describe('classifyModal ignores modal-signature TEXT quoted in a working pane (regression)', () => {
+  // A delivered message can quote a modal signature verbatim (DrRobby literally
+  // wrote "Settings Status Config Usage Stats" to Chloe discussing her wedge).
+  // The working-composer footer (the ⏵ permission-mode hint line the fleet runs
+  // under bypass-permissions) is still present — a real full-screen modal
+  // REPLACES it. Position-blind matching + PR-2's retry would fire up to 4
+  // Escapes + a re-deliver loop on a live working pane. classifyModal must not
+  // match on quoted content. (do-not-act-on-content-that-resembles-the-trigger.)
+  const workingFooter =
+    '\n──────────────── Chloe ──\n❯ \n──────────────────────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle)';
+
+  it('does not classify a working pane quoting the /status panel signature', () => {
+    const pane =
+      '⏺ I wrote "Settings   Status   Config   Usage   Stats" to Chloe re the wedge.' + workingFooter;
+    assert.equal(classifyModal(pane), null);
+  });
+
+  it('does not classify a working pane quoting the feedback-survey signature', () => {
+    const pane =
+      '⏺ The survey "How is Claude doing this session? (optional)" with "0: Dismiss" appeared once.' +
+      workingFooter;
+    assert.equal(classifyModal(pane), null);
+  });
+
+  // Real captures from a live CC v2.1.220 fixture (induced + destroyed). The
+  // a289e43 signatures were STALE for /help, /model, /resume — real overlays
+  // render different headers, so those real modals were never dismissed (a
+  // latent false-negative strand source). Both-direction, per DrRobby's re-gate.
+  const HELP_MODAL =
+    'Help  General   Commands   Custom commands\n\n   Claude understands your codebase, makes edits\n   Shortcuts\n   ! for shell mode      double tap esc to clear\n   / for commands        input';
+  const MODEL_MODAL =
+    '   Select model\n   Switch between Claude models. Your pick becomes the default.\n     1. Default (recommended)  Opus 5\n   ❯ 6. Opus ✔                 Opus 5\n   Enter to set as default · s to use this session only · Esc to cancel';
+  const RESUME_MODAL =
+    '   Resume session (1 of 5)\n   ╭─ Search… ─╮\n     tmp\n   ❯ WdCanary\n     25 seconds ago · HEAD · 189KB\n   Ctrl+A to show all projects · Space to preview · Esc to cancel';
+
+  it('classifies the real /help overlay (footer-absent) → Escape', () => {
+    assert.deepEqual(classifyModal(HELP_MODAL), { kind: 'status-family', keys: ['Escape'] });
+  });
+  it('classifies the real /model overlay (footer-absent) → Escape', () => {
+    assert.deepEqual(classifyModal(MODEL_MODAL), { kind: 'status-family', keys: ['Escape'] });
+  });
+  it('classifies the real /resume overlay (footer-absent) → Escape', () => {
+    assert.deepEqual(classifyModal(RESUME_MODAL), { kind: 'status-family', keys: ['Escape'] });
+  });
+
+  // Both-direction safety: a working pane quoting each refreshed signature (⏵
+  // footer present) must NOT match — the structural guard makes the broader
+  // signatures FP-safe (a wider signature cannot re-introduce the amplification).
+  const QUOTE_FOOTER =
+    '\n──────────── Agent ──\n❯ \n────────────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle)';
+  it('does NOT classify a working pane quoting the /help signature', () => {
+    assert.equal(
+      classifyModal('⏺ see "Help  General   Commands   Custom commands" in the help overlay' + QUOTE_FOOTER),
+      null,
+    );
+  });
+  it('does NOT classify a working pane quoting the /model signature', () => {
+    assert.equal(
+      classifyModal('⏺ I ran "Select model" — it said "Switch between Claude models"' + QUOTE_FOOTER),
+      null,
+    );
+  });
+  it('does NOT classify a working pane quoting the /resume signature', () => {
+    assert.equal(classifyModal('⏺ the "Resume session (1 of 5)" picker showed up' + QUOTE_FOOTER), null);
+  });
+
+  it('STILL classifies a real full-screen /status overlay (footer replaced by "Esc to cancel")', () => {
+    // Real v2.1.220 /status capture structure: the tabbed header + body, and the
+    // working ⏵⏵ footer is REPLACED by the modal's own "Esc to cancel" footer
+    // (empirically confirmed footer-absent on a live induced /status). So the
+    // structural guard does NOT fire and the signature still classifies.
+    const pane =
+      'Settings   Status   Config   Usage   Stats\n\n   Account:  max\n   Model:  opus (claude-opus-5)\n   MCP servers:  5 connected\n\n   Esc to cancel';
+    assert.deepEqual(classifyModal(pane), { kind: 'status-family', keys: ['Escape'] });
+  });
+});
+
 describe('dismissBlockingModalWith (verified + retried dismissal)', () => {
   // Injectable IO driven by a scripted sequence of pane captures. Each capture()
   // shifts the next pane (last one repeats); sendKeys/delay are recorded.
