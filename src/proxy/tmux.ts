@@ -164,9 +164,11 @@ async function inputStillHasUnsubmittedText(sessionName: string): Promise<boolea
   return false;
 }
 
-// Dismiss any blocking modal Claude TUI shows (currently: feedback survey,
-// trust dialog). These steal all keystrokes, so a paste lands in the prompt
-// but Enter does nothing. Returns true if a modal was found and dismissed.
+// Dismiss any blocking modal Claude TUI shows: feedback survey, trust dialog,
+// and the full-screen overlays from /status, /usage, /model, /help, /resume.
+// These steal all keystrokes, so a paste lands in the prompt but Enter does
+// nothing (the modal-swallow that stranded delivered messages). Returns true
+// if a modal was found and dismissed.
 async function dismissBlockingModal(sessionName: string): Promise<boolean> {
   try {
     const pane = await tmuxExec(['capture-pane', '-t', sessionName, '-p', '-S', '-25']);
@@ -181,6 +183,20 @@ async function dismissBlockingModal(sessionName: string): Promise<boolean> {
     // ~/.claude.json so this should rarely fire, but defensive.
     if (/Is this a project you (created or one you )?trust/.test(pane)) {
       await tmuxExec(['send-keys', '-t', sessionName, 'Up', 'Enter']);
+      return true;
+    }
+    // Full-screen overlays opened by /status, /usage, /model, /help, /resume.
+    // These capture keystrokes: a delivered paste lands but Enter does nothing,
+    // so the message is stranded (this is the modal-swallow that parked agents
+    // behind /status). All are dismissed with Escape. Signatures are chosen to
+    // be specific so we never Escape a normal working pane.
+    if (
+      /Settings\s+Status\s+Config\s+Usage\s+Stats/.test(pane) || // /status, /usage (tabbed panel)
+      /Select (a|the) model|Switch to a different model/.test(pane) || // /model picker
+      /Resume a conversation|Select a( previous)? conversation to resume/.test(pane) || // /resume picker
+      /Available commands|Keyboard shortcuts:/.test(pane) // /help overlay
+    ) {
+      await tmuxExec(['send-keys', '-t', sessionName, 'Escape']);
       return true;
     }
   } catch {
@@ -229,6 +245,20 @@ export function pasteText(sessionName: string, text: string, pressEnter: boolean
           await new Promise<void>((r) => setTimeout(r, 400));
         }
         await tmuxExec(['send-keys', '-t', sessionName, 'Enter']);
+      }
+
+      // After all retries: if the input STILL holds unsubmitted text, the paste
+      // landed but was never submitted (TUI submit-wedge, or a modal we could
+      // not dismiss). Do NOT return silently — a silent return marks the
+      // message 'delivered' although the agent never consumed it (the
+      // false-delivered trap that stranded agents' queues). THROW so
+      // deliverToAgent surfaces an error and the dispatcher keeps the message
+      // PENDING for retry; the stranded-input watchdog is the recovery path of
+      // last resort.
+      if (await inputStillHasUnsubmittedText(sessionName)) {
+        throw new Error(
+          `paste to "${sessionName}" not submitted after ${retryDelays.length} retries — input still holds unsubmitted text (TUI submit-wedge or undismissed modal)`,
+        );
       }
     }
   });
