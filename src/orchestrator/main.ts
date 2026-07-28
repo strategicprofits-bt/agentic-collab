@@ -437,6 +437,15 @@ server.listen(PORT, '0.0.0.0', async () => {
   console.log(`[orchestrator] Dashboard: http://localhost:${PORT}/dashboard`);
   console.log(`[orchestrator] DB: ${DB_PATH}`);
 
+  // P2a presence-aware operator-reply relay: surface provisioning state once at
+  // startup so "deployed-dormant" is never mistaken for "working" (and a lost
+  // token post-provision is visible), without per-reply log noise.
+  if (process.env['OPERATOR_RELAY_BOT_TOKEN'] && process.env['OPERATOR_RELAY_CHAT_ID']) {
+    console.log('[orchestrator] Operator-reply relay: PROVISIONED (presence-aware phone relay active)');
+  } else {
+    console.warn('[orchestrator] Operator-reply relay: DORMANT (OPERATOR_RELAY_* not set — operator replies will not reach the phone; --topic telegram* stopgap still active)');
+  }
+
   // Sync persona files → SQLite (idempotent merge)
   try {
     const synced = syncPersonasToDb(db);

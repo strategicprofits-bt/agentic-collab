@@ -114,10 +114,66 @@ describe('relayOperatorReply — dispatch wiring', () => {
     const send = async () => { calls.push(1); return false; };
     const out = await relayOperatorReply({
       agent: 'X', message: 'm', topic: 'status', clientCount: 0, alreadySentRecently: false,
-      creds: { botToken: 't', chatId: 'c' }, send,
+      creds: { botToken: 't', chatId: 'c' }, send, log: () => {},
     });
     assert.equal(out.relayed, false);
     assert.equal(out.reason, 'send-failed');
     assert.equal(calls.length, 1);
+  });
+});
+
+describe('relayOperatorReply — failure observability (a broken relay must not be silent)', () => {
+  function recordingLog() {
+    const logs: Array<{ level: string; message: string }> = [];
+    return { logs, log: (level: 'error' | 'warn', message: string) => { logs.push({ level, message }); } };
+  }
+
+  it('logs an error when the dispatcher returns false — the broken relay is observable', async () => {
+    const { logs, log } = recordingLog();
+    const out = await relayOperatorReply({
+      agent: 'AgentF', message: 'unreachable', topic: 'status', clientCount: 0,
+      alreadySentRecently: false, creds: { botToken: 't', chatId: 'c' },
+      send: async () => false, log,
+    });
+    assert.equal(out.reason, 'send-failed');
+    assert.equal(logs.length, 1);
+    assert.equal(logs[0]!.level, 'error');
+    assert.match(logs[0]!.message, /AgentF/);
+  });
+
+  it('logs an error AND resolves (never rejects) when the dispatcher throws', async () => {
+    const { logs, log } = recordingLog();
+    const out = await relayOperatorReply({
+      agent: 'AgentG', message: 'boom', topic: 'status', clientCount: 0,
+      alreadySentRecently: false, creds: { botToken: 't', chatId: 'c' },
+      send: async () => { throw new Error('network down'); }, log,
+    });
+    assert.equal(out.relayed, false);
+    assert.equal(out.reason, 'send-threw');
+    assert.equal(logs.length, 1);
+    assert.equal(logs[0]!.level, 'error');
+    assert.match(logs[0]!.message, /network down/);
+  });
+
+  it('does NOT log on a successful send', async () => {
+    const { logs, log } = recordingLog();
+    const out = await relayOperatorReply({
+      agent: 'AgentH', message: 'ok', topic: 'status', clientCount: 0,
+      alreadySentRecently: false, creds: { botToken: 't', chatId: 'c' },
+      send: async () => true, log,
+    });
+    assert.equal(out.relayed, true);
+    assert.equal(logs.length, 0);
+  });
+
+  it('does NOT log for a normal do-not-relay decision (on-dashboard)', async () => {
+    const { logs, log } = recordingLog();
+    const out = await relayOperatorReply({
+      agent: 'AgentI', message: 'x', topic: 'status', clientCount: 2,
+      alreadySentRecently: false, creds: { botToken: 't', chatId: 'c' },
+      send: async () => true, log,
+    });
+    assert.equal(out.reason, 'on-dashboard');
+    assert.equal(logs.length, 0);
   });
 });

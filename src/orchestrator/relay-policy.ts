@@ -37,6 +37,11 @@ export const DEFAULT_RELAY_POLICY: RelayPolicy = {
 
 export type RelayDecision = { relay: boolean; reason: string };
 
+/** Observability sink. Injected for testability; defaults to console so a broken
+ * relay is never silent (a silent-drop fix that silently fails is self-defeating). */
+export type RelayLog = (level: 'error' | 'warn', message: string) => void;
+const defaultLog: RelayLog = (level, message) => { console[level](message); };
+
 /**
  * Decide whether an operator-bound reply should be relayed to the phone. Pure —
  * all inputs are passed in, so a classifier/env misread can never itself send.
@@ -90,6 +95,7 @@ export async function relayOperatorReply(deps: {
   policy?: RelayPolicy;
   creds: { botToken: string; chatId: string } | null;
   send: (botToken: string, chatId: string, text: string) => Promise<boolean>;
+  log?: RelayLog;
 }): Promise<{ relayed: boolean; reason: string }> {
   const decision = decideRelay({
     topic: deps.topic,
@@ -100,9 +106,22 @@ export async function relayOperatorReply(deps: {
   if (!decision.relay) return { relayed: false, reason: decision.reason };
   if (!deps.creds) return { relayed: false, reason: 'no-creds' };
 
+  const log = deps.log ?? defaultLog;
   const text = `[${deps.agent}] ${deps.message}`;
-  const ok = await deps.send(deps.creds.botToken, deps.creds.chatId, text);
-  return { relayed: ok, reason: ok ? 'sent' : 'send-failed' };
+  try {
+    const ok = await deps.send(deps.creds.botToken, deps.creds.chatId, text);
+    if (!ok) {
+      // A resolved-but-failed send (bad token / Telegram down) — the exact
+      // silent-drop this fix exists to kill. Make it observable, but never throw
+      // (best-effort: the reply itself already succeeded).
+      log('error', `[relay] operator reply from ${deps.agent} FAILED to reach the operator phone (dispatcher returned false — check OPERATOR_RELAY_* token / Telegram reachability)`);
+      return { relayed: false, reason: 'send-failed' };
+    }
+    return { relayed: true, reason: 'sent' };
+  } catch (err) {
+    log('error', `[relay] operator reply from ${deps.agent} threw while sending to the operator phone: ${(err as Error)?.message ?? String(err)}`);
+    return { relayed: false, reason: 'send-threw' };
+  }
 }
 
 // ── Env-injected credentials + dedup noise-floor + wiring ──
@@ -146,6 +165,7 @@ export async function relayReplyToOperator(deps: {
   nowMs: number;
   send: (botToken: string, chatId: string, text: string) => Promise<boolean>;
   policy?: RelayPolicy;
+  log?: RelayLog;
 }): Promise<{ relayed: boolean; reason: string }> {
   const hash = relayHash(deps.agent, deps.message);
   const last = relaySentHashes.get(hash);
@@ -160,6 +180,7 @@ export async function relayReplyToOperator(deps: {
     policy: deps.policy ?? DEFAULT_RELAY_POLICY,
     creds: operatorRelayCreds(),
     send: deps.send,
+    log: deps.log ?? defaultLog,
   });
 
   if (out.relayed) {

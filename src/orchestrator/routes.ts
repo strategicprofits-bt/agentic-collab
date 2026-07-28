@@ -521,13 +521,18 @@ route('POST', '/api/dashboard/reply', async (req, res, _match, ctx) => {
   // P2a: presence-aware relay to the operator's phone (best-effort, never blocks
   // the reply -- a relay failure must not break posting to the dashboard).
   void relayReplyToOperator({
-    agent: body.agent as string,
+    agent: body['agent'] as string,
     message: sanitized,
-    topic: body.topic as string,
+    topic: body['topic'] as string,
     clientCount: ctx.wss.clientCount,
     nowMs: Date.now(),
     send: (botToken, chatId, text) => ctx.telegramDispatcher.send(botToken, chatId, text),
-  }).catch(() => { /* best-effort */ });
+  }).catch((err) => {
+    // Never breaks the reply, but must not be SILENT — an unexpected relay error
+    // is observable so a broken relay can be detected (send-failures are already
+    // logged inside relayReplyToOperator).
+    console.error(`[relay] unexpected error relaying operator reply from ${body['agent']}:`, (err as Error)?.message ?? err);
+  });
 
   json(res, 200, { ok: true, msg });
 });
