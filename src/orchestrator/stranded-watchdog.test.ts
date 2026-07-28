@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Database } from './database.ts';
 import type { ProxyCommand, ProxyResponse, AgentRecord } from '../shared/types.ts';
-import { StrandedWatchdog, classifyStrand, WATCHDOG, type StrandedWatchdogDeps } from './stranded-watchdog.ts';
+import { StrandedWatchdog, classifyStrand, extractComposerText, composerCorrespondsToMessage, MIN_CORRESPONDENCE_CHARS, WATCHDOG, type StrandedWatchdogDeps } from './stranded-watchdog.ts';
 
 // Pane fixtures that trip each strand classifier (mirrors proxy/tmux.ts sigs).
 const S1_PANE = [
@@ -85,6 +85,34 @@ const REAL_QUOTE_SCROLLBACK_EMPTY = [
   REAL_HINT,
 ].join('\n');
 
+// ── Correspondence-guard fixtures ──
+// A genuine stranded paste: the composer holds the delivered message ENVELOPE
+// (what the dispatcher pasted). Candidacy tests seed this exact envelope so the
+// composer CORRESPONDS and the ladder can run.
+const STRANDED_ENVELOPE = "[from: CoachBeard, reply with collab send CoachBeard --topic ops]: 'please handle the queued task now and report back'";
+const CORRESPONDING_S1_PANE = [
+  '──────────────────────────────── Agent ──',
+  '❯ ' + STRANDED_ENVELOPE, // composer holds the pasted envelope → corresponds
+  '──────────────────────────────────────────',
+  REAL_HINT,
+].join('\n');
+// An agent's OWN draft in the composer — a REAL strand-looking pane that must NOT
+// act because the text does not correspond to the delivered message (Chloe class).
+const OWN_DRAFT_S1_PANE = [
+  '──────────────────────────────── Agent ──',
+  '❯ check the queue for anything else pending', // agent's own note, not the message
+  '──────────────────────────────────────────',
+  REAL_HINT,
+].join('\n');
+// The Claude composer PLACEHOLDER on a fresh/empty composer (verbatim from
+// adapters.test.ts) — classifies S1 but must NOT act (probe #1 false-positive).
+const PLACEHOLDER_S1_PANE = [
+  '──────────────────────────────── Agent ──',
+  '❯ Try "how do I log an error?"',
+  '──────────────────────────────────────────',
+  REAL_HINT,
+].join('\n');
+
 /** ISO in the DB's strftime format (no millis). */
 function iso(ms: number): string {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
@@ -127,6 +155,52 @@ describe('classifyStrand', () => {
   });
   it('returns null: empty composer with REAL "> …" persona scrollback above', () => {
     assert.equal(classifyStrand(REAL_QUOTE_SCROLLBACK_EMPTY), null);
+  });
+});
+
+describe('extractComposerText', () => {
+  it('returns the composer text (single line)', () => {
+    assert.equal(extractComposerText(REAL_S1_PANE), 'please respond ok');
+  });
+  it('joins multi-line wrapped composer text in visual order', () => {
+    assert.equal(
+      extractComposerText(REAL_MULTILINE_S1_PANE),
+      'this is a long unsubmitted draft that should wrap across multiple visual lines inside the composer box without ever being submitted so that the composer genuinely holds multi line pending text right now',
+    );
+  });
+  it('returns null for an empty composer (incl. scrollback above)', () => {
+    assert.equal(extractComposerText(REAL_CLEAN_PANE), null);
+    assert.equal(extractComposerText(ADVERSARIAL_QUOTE_ABOVE), null);
+  });
+  it('extracts the placeholder text (classifier is imprecise; guard excludes it)', () => {
+    assert.equal(extractComposerText(PLACEHOLDER_S1_PANE), 'Try "how do I log an error?"');
+  });
+});
+
+describe('composerCorrespondsToMessage', () => {
+  it('matches a real pasted envelope (even wrapped/truncated)', () => {
+    // full envelope in composer
+    assert.equal(composerCorrespondsToMessage(STRANDED_ENVELOPE, STRANDED_ENVELOPE), true);
+    // truncated (composer cut off at capture width) still shares a long run
+    assert.equal(composerCorrespondsToMessage(STRANDED_ENVELOPE.slice(0, 80), STRANDED_ENVELOPE), true);
+    // reformatted whitespace (wrap inserts spaces) still corresponds
+    assert.equal(
+      composerCorrespondsToMessage(STRANDED_ENVELOPE.replace(/ /g, '  '), STRANDED_ENVELOPE),
+      true,
+    );
+  });
+  it('EXCLUDES an agent own-draft (Chloe class)', () => {
+    assert.equal(
+      composerCorrespondsToMessage('check the queue for anything else pending', STRANDED_ENVELOPE),
+      false,
+    );
+  });
+  it('EXCLUDES the TUI placeholder (probe #1)', () => {
+    assert.equal(composerCorrespondsToMessage('Try "how do I log an error?"', STRANDED_ENVELOPE), false);
+  });
+  it('EXCLUDES text shorter than the correspondence threshold', () => {
+    assert.equal(composerCorrespondsToMessage('ok', STRANDED_ENVELOPE), false);
+    assert.equal('ok'.length < MIN_CORRESPONDENCE_CHARS, true);
   });
 });
 
@@ -216,7 +290,7 @@ describe('StrandedWatchdog', () => {
     const pending = db.enqueueMessage({
       sourceAgent: source,
       targetAgent: agent,
-      envelope: `[from: ${source}]: 'do the thing'`,
+      envelope: STRANDED_ENVELOPE,
     });
     db.rawDb
       .prepare("UPDATE pending_messages SET status = 'delivered', delivered_at = ? WHERE id = ?")
@@ -238,7 +312,7 @@ describe('StrandedWatchdog', () => {
     // Use the REALISTIC pane (composer above a trailing hint line) so the full
     // detect→respawn ladder is proven on the live TUI layout, not just a fixture
     // where "❯ text" is conveniently the last line.
-    scripts.set('s1agent', { pane: REAL_S1_PANE, frozenSecs: 300 }); // frozen 5min, stays stranded
+    scripts.set('s1agent', { pane: CORRESPONDING_S1_PANE, frozenSecs: 300 }); // frozen 5min, stays stranded
 
     const wd = makeWatchdog();
     const [outcome] = await wd.sweep([agent]);
@@ -274,7 +348,7 @@ describe('StrandedWatchdog', () => {
     const agent = makeAgent('nudged');
     seedDeliveredMessage('nudged', 'CoachBeard', 300);
     // First capture (candidacy) stranded; after the first nudge the pane clears.
-    scripts.set('nudged', { pane: [S1_PANE, CLEAN_PANE], frozenSecs: 300 });
+    scripts.set('nudged', { pane: [CORRESPONDING_S1_PANE, CLEAN_PANE], frozenSecs: 300 });
 
     const wd = makeWatchdog();
     const [outcome] = await wd.sweep([agent]);
@@ -291,7 +365,7 @@ describe('StrandedWatchdog', () => {
     seedDeliveredMessage('busy', 'CoachBeard', 300);
     // Stranded-LOOKING pane text, NO token snapshots (the %-status blind spot),
     // BUT pane_activity advancing (frozenSecs 0). The pane leg proves it's alive.
-    scripts.set('busy', { pane: S1_PANE, frozenSecs: 0 });
+    scripts.set('busy', { pane: CORRESPONDING_S1_PANE, frozenSecs: 0 });
 
     const wd = makeWatchdog();
     const [outcome] = await wd.sweep([agent]);
@@ -306,7 +380,7 @@ describe('StrandedWatchdog', () => {
   it('TEST 2b: token snapshot recent (pane frozen) → alive, ZERO action', async () => {
     const agent = makeAgent('draining');
     seedDeliveredMessage('draining', 'CoachBeard', 300);
-    scripts.set('draining', { pane: S1_PANE, frozenSecs: 300 }); // pane frozen...
+    scripts.set('draining', { pane: CORRESPONDING_S1_PANE, frozenSecs: 300 }); // pane frozen...
     seedSnapshot('draining', 5); // ...but a token snapshot 5s ago → real work
 
     const wd = makeWatchdog();
@@ -320,14 +394,14 @@ describe('StrandedWatchdog', () => {
   it('TEST 2c: GAP-012 ctx% has ZERO effect (watchdog never reads it)', async () => {
     const agent = makeAgent('ctxflip');
     seedDeliveredMessage('ctxflip', 'CoachBeard', 300);
-    scripts.set('ctxflip', { pane: S1_PANE, frozenSecs: 300 });
+    scripts.set('ctxflip', { pane: CORRESPONDING_S1_PANE, frozenSecs: 300 });
     // Write wildly different context_pct values — must not change the decision.
     db.rawDb.prepare('UPDATE agents SET last_context_pct = 1 WHERE name = ?').run('ctxflip');
     const wd = makeWatchdog();
     const [before] = await wd.sweep([agent]);
     assert.ok(before);
     db.rawDb.prepare('UPDATE agents SET last_context_pct = 99 WHERE name = ?').run('ctxflip');
-    scripts.set('ctxflip', { pane: S1_PANE, frozenSecs: 300 });
+    scripts.set('ctxflip', { pane: CORRESPONDING_S1_PANE, frozenSecs: 300 });
     const [after] = await makeWatchdog().sweep([db.getAgent('ctxflip')!]);
     assert.ok(after);
     // Both decisions come from the two ground-truth legs, not ctx% → identical path.
@@ -335,11 +409,48 @@ describe('StrandedWatchdog', () => {
     assert.equal(after.result, 'respawned');
   });
 
+  // ── TEST 2d/2e: CORRESPONDENCE GUARD — the false-ACTION cases (Roz + live sweep) ──
+  // Both panes classify S1 and satisfy every no-activity leg + a delivered msg,
+  // so pre-guard they would be nudged/respawned. The guard must exclude them
+  // because the composer text does not correspond to the delivered message.
+  it('TEST 2d: OWN-DRAFT in composer (Chloe class) → s1-no-correspondence, ZERO action', async () => {
+    const agent = makeAgent('owndraft');
+    seedDeliveredMessage('owndraft', 'CoachBeard', 300); // delivered msg exists
+    seedSnapshot('owndraft', 300); // old snapshot only → hasRecentTokenActivity=false
+    // frozen 300s + no recent token = both no-activity legs; composer holds the
+    // agent's OWN note, NOT the delivered message.
+    scripts.set('owndraft', { pane: OWN_DRAFT_S1_PANE, frozenSecs: 300 });
+
+    const wd = makeWatchdog();
+    const [outcome] = await wd.sweep([agent]);
+    assert.ok(outcome);
+
+    assert.equal(outcome.result, 's1-no-correspondence');
+    assert.equal(respawned.length, 0, 'a healthy agent with its own draft is NEVER acted on');
+    assert.equal(alerts.length, 0);
+    assert.equal(sentKeys.length, 0, 'no nudge keys sent');
+    assert.equal(db.countRecentWatchdogRespawns('owndraft', 1800), 0);
+  });
+
+  it('TEST 2e: TUI PLACEHOLDER in composer (probe #1) → s1-no-correspondence, ZERO action', async () => {
+    const agent = makeAgent('placeholder');
+    seedDeliveredMessage('placeholder', 'CoachBeard', 300);
+    scripts.set('placeholder', { pane: PLACEHOLDER_S1_PANE, frozenSecs: 300 });
+
+    const wd = makeWatchdog();
+    const [outcome] = await wd.sweep([agent]);
+    assert.ok(outcome);
+
+    assert.equal(outcome.result, 's1-no-correspondence');
+    assert.equal(respawned.length, 0, 'a fresh-composer placeholder is NEVER acted on');
+    assert.equal(sentKeys.length, 0);
+  });
+
   // ── TEST 3: re-enqueue BEFORE kill (order invariant) ──
   it('TEST 3: unconsumed message is re-enqueued as pending BEFORE the kill', async () => {
     const agent = makeAgent('order');
     seedDeliveredMessage('order', 'CoachBeard', 300);
-    scripts.set('order', { pane: S1_PANE, frozenSecs: 300 });
+    scripts.set('order', { pane: CORRESPONDING_S1_PANE, frozenSecs: 300 });
     assert.equal(db.hasPendingMessages('order'), false, 'no pending before sweep');
 
     const wd = makeWatchdog();
@@ -355,7 +466,7 @@ describe('StrandedWatchdog', () => {
   it('TEST 4: respawn cap survives restart — 3rd attempt blocked + escalates + STOPS', async () => {
     const agent = makeAgent('capped');
     seedDeliveredMessage('capped', 'CoachBeard', 300);
-    scripts.set('capped', { pane: S1_PANE, frozenSecs: 300 });
+    scripts.set('capped', { pane: CORRESPONDING_S1_PANE, frozenSecs: 300 });
 
     // Simulate two prior respawns persisted BEFORE a restart.
     db.recordWatchdogRespawn('capped', 'stranded-input:S1');
@@ -381,7 +492,7 @@ describe('StrandedWatchdog', () => {
   it('TEST 5: activity AFTER delivery (then wedged) → escalate, never re-enqueue/respawn', async () => {
     const agent = makeAgent('partial');
     seedDeliveredMessage('partial', 'CoachBeard', 300); // delivered 300s ago
-    scripts.set('partial', { pane: S1_PANE, frozenSecs: 300 }); // currently frozen ≥120s
+    scripts.set('partial', { pane: CORRESPONDING_S1_PANE, frozenSecs: 300 }); // currently frozen ≥120s
     // A snapshot 200s ago: AFTER delivery (300s ago) but OLDER than the 120s
     // no-activity window → agent processed, then went silent (wedged).
     seedSnapshot('partial', 200);

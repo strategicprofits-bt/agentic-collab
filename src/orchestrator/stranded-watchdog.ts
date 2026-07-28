@@ -78,6 +78,7 @@ export type StrandKind = 'S1' | 'S2';
 export type SweepOutcome =
   | { agent: string; result: 'skip'; reason: string }
   | { agent: string; result: 'not-stranded' }
+  | { agent: string; result: 's1-no-correspondence' } // composer text ≠ the delivered message (own-draft / placeholder)
   | { agent: string; result: 'recovered'; kind: StrandKind; attempts: number }
   | { agent: string; result: 'partial-consume-escalated'; kind: StrandKind }
   | { agent: string; result: 'respawned'; kind: StrandKind }
@@ -123,13 +124,17 @@ export function classifyModal(pane: string): boolean {
  *    (Roz gate finding). MAX_SCAN is a hard backstop if the borders are ever
  *    absent/malformed, so a run of blank/decoration lines can't chain up either.
  *
- * Returns true iff there is any non-empty text INSIDE the composer box.
+ * Returns the composer's unsubmitted text (visual order, prompt glyph stripped,
+ * lines space-joined) or null if the composer is empty. classifyUnsubmittedInput
+ * is the boolean view; the watchdog also needs the TEXT for the correspondence
+ * guard (does it match the delivered message, or is it an own-draft/placeholder?).
  */
-export function classifyUnsubmittedInput(pane: string): boolean {
+export function extractComposerText(pane: string): string | null {
   const lines = pane.split('\n');
   const MAX_SCAN = 16; // composer box is tiny; generous cap, still finite
   let scanned = 0;
   let insideBox = false; // seen the bottom border → now within the composer box
+  const collected: string[] = []; // box content lines, collected bottom-up
   for (let i = lines.length - 1; i >= 0 && scanned < MAX_SCAN; i--) {
     const line = lines[i]!.trim();
     if (!line) continue;
@@ -137,24 +142,75 @@ export function classifyUnsubmittedInput(pane: string): boolean {
     if (line.startsWith('⏵')) continue; // hint line, rendered BELOW the box
     if (line.startsWith('─')) {
       if (!insideBox) { insideBox = true; continue; } // bottom border → enter box
-      return false; // top border → everything above is scrollback: STOP
+      break; // top border → everything above is scrollback: STOP
     }
     if (insideBox) {
       // Any non-empty text inside the box = live unsubmitted input. Strip an
       // optional prompt glyph so a bare "❯"/"> " empty prompt reads as empty
       // while wrapped continuation lines (no glyph) still count.
       const content = line.replace(/^[❯>]\s*/, '').trim();
-      if (content.length > 0) return true;
+      if (content.length > 0) collected.push(content);
     } else {
       // A non-decoration line reached BEFORE any bottom border = a compact pane
       // with no rendered box. Only a composer prompt WITH text counts, and only
       // the "❯" composer glyph (NOT ">") — so a bare scrollback "> …" line that
       // happens to be last can never false-positive. Decide here and STOP.
       const m = line.match(/^❯\s+(.+)$/);
-      return m !== null && m[1] !== undefined && m[1].trim().length > 0;
+      if (m !== null && m[1] !== undefined && m[1].trim().length > 0) collected.push(m[1].trim());
+      break;
     }
   }
-  return false;
+  if (collected.length === 0) return null;
+  return collected.reverse().join(' '); // bottom-up → visual order
+}
+
+export function classifyUnsubmittedInput(pane: string): boolean {
+  return extractComposerText(pane) !== null;
+}
+
+/** Minimum shared run (chars) for the composer to "correspond" to a message. */
+export const MIN_CORRESPONDENCE_CHARS = 30;
+
+/** Longest common substring length (DP, rolling row — inputs are small panes). */
+function longestCommonSubstringLen(a: string, b: string): number {
+  if (a.length === 0 || b.length === 0) return 0;
+  const row = new Array<number>(b.length + 1).fill(0);
+  let best = 0;
+  for (let i = 1; i <= a.length; i++) {
+    let diag = 0; // row[j-1] from the previous i (i.e. [i-1][j-1])
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = row[j]!;
+      if (a[i - 1] === b[j - 1]) {
+        row[j] = diag + 1;
+        if (row[j]! > best) best = row[j]!;
+      } else {
+        row[j] = 0;
+      }
+      diag = tmp;
+    }
+  }
+  return best;
+}
+
+/**
+ * Does the unsubmitted composer text CORRESPOND to the delivered message?
+ *
+ * A genuine stranded paste renders the message envelope into the composer
+ * (possibly wrapped / truncated / reformatted by the TUI) → the two share a long
+ * common run. An agent's OWN draft, or the TUI placeholder ("❯ Try \"…\""), shares
+ * only incidental short words. This is the guard that keeps the kill-capable
+ * action path from firing on a healthy agent whose composer holds its own text
+ * (Chloe class) or a fresh-composer placeholder (probe #1). TIGHT enough to
+ * exclude those, LOOSE enough (substring, not equality) to still match a real
+ * paste as it actually renders. Residual (accepted): an own-draft that quotes the
+ * message verbatim still matches — a pane-based consumed signal closes that later.
+ */
+export function composerCorrespondsToMessage(composerText: string, envelope: string): boolean {
+  const norm = (s: string) => s.toLowerCase().replace(/\s+/g, ' ').trim();
+  const c = norm(composerText);
+  const e = norm(envelope);
+  if (c.length < MIN_CORRESPONDENCE_CHARS) return false; // too short to be a real paste
+  return longestCommonSubstringLen(c, e) >= MIN_CORRESPONDENCE_CHARS;
 }
 
 /** Classify the strand kind, preferring the modal signal (it gates keystrokes). */
@@ -218,6 +274,25 @@ export class StrandedWatchdog {
     if (pane === null) return { agent: name, result: 'skip', reason: 'capture failed' };
     const kind = classifyStrand(pane);
     if (!kind) return { agent: name, result: 'not-stranded' };
+
+    // Candidacy gate 2b (S1 only): the unsubmitted composer text must CORRESPOND
+    // to the delivered message. A genuine stranded paste renders the message
+    // envelope; an agent's OWN draft or the TUI placeholder ("❯ Try \"…\"") does
+    // not — so this excludes the false-action cases (Chloe's own-draft; the
+    // fresh-composer placeholder / probe #1) BEFORE any nudge/kill. This guard is
+    // safety-sufficient regardless of hasActivitySince blind spots: a healthy
+    // agent's own text simply won't match the message. S2 modals hide the
+    // composer, so correspondence can't be read there — S1 only (see report note).
+    if (kind === 'S1') {
+      const composerText = extractComposerText(pane);
+      if (composerText === null || !composerCorrespondsToMessage(composerText, msg.envelope)) {
+        this.logEvent(name, 'stranded_s1_no_correspondence', {
+          deliveredAt: msg.deliveredAt,
+          composerPreview: (composerText ?? '').slice(0, 80),
+        });
+        return { agent: name, result: 's1-no-correspondence' };
+      }
+    }
 
     // Candidacy gate 3: no-activity — MANDATORY TWO-SIGNAL AND. If either leg
     // shows life, the agent is alive/draining — never touch it.
