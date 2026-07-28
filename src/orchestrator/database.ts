@@ -311,6 +311,21 @@ export class Database {
     `);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_ats_agent_time ON agent_token_snapshots(agent_name, captured_at)`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_ats_time ON agent_token_snapshots(captured_at)`);
+
+    // Durable log of stranded-input-watchdog respawns. The watchdog's per-agent
+    // respawn CAP is enforced by COUNTing rows here within a rolling window, so
+    // the bound SURVIVES AN ORCHESTRATOR RESTART — an in-memory counter would
+    // reset to 0 on restart and allow unbounded respawns across restarts (the
+    // GAP-033 loop through a back door). Persisting the log is the whole point.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS watchdog_respawns (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_name  TEXT NOT NULL,
+        reason      TEXT,
+        created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      )
+    `);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_wr_agent_time ON watchdog_respawns(agent_name, created_at)`);
   }
 
   /** Expose raw handle for LockManager (shares same DB connection). */
@@ -1267,6 +1282,23 @@ export class Database {
       "SELECT 1 FROM agent_token_snapshots WHERE agent_name = ? AND captured_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?) LIMIT 1"
     ).get(agentName, `-${withinSeconds} seconds`) as Record<string, unknown> | undefined;
     return row !== undefined;
+  }
+
+  // ── Stranded-input watchdog: durable respawn cap ──
+  // Persisted so the per-agent respawn bound survives an orchestrator restart.
+
+  recordWatchdogRespawn(agentName: string, reason: string): void {
+    this.db.prepare(
+      'INSERT INTO watchdog_respawns (agent_name, reason) VALUES (?, ?)'
+    ).run(agentName, reason);
+  }
+
+  /** Count watchdog respawns for an agent within a rolling window (DB-backed → survives restart). */
+  countRecentWatchdogRespawns(agentName: string, withinSeconds: number): number {
+    const row = this.db.prepare(
+      "SELECT COUNT(*) AS n FROM watchdog_respawns WHERE agent_name = ? AND created_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)"
+    ).get(agentName, `-${withinSeconds} seconds`) as { n: number };
+    return row.n;
   }
 
 
