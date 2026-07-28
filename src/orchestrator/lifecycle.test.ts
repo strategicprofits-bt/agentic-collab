@@ -9,7 +9,7 @@ import type { ProxyCommand, ProxyResponse } from '../shared/types.ts';
 import { shellQuote } from '../shared/utils.ts';
 import {
   spawnAgent, resumeAgent, suspendAgent, destroyAgent,
-  reloadAgent, interruptAgent, compactAgent, killAgent, startWatchdog,
+  reloadAgent, recoverAgent, interruptAgent, compactAgent, killAgent, startWatchdog,
   executeCustomButton, type LifecycleContext,
 } from './lifecycle.ts';
 
@@ -488,7 +488,10 @@ describe('Lifecycle', () => {
   });
 
   describe('killAgent', () => {
-    it('kills an active agent', async () => {
+    // NOTE: the default mock reports has_session=true (session ALIVE). Post GAP-026
+    // liveness interlock, killing a live session requires force:true — so these
+    // "kills from state X" cases pass force to exercise the actual kill path.
+    it('kills an active agent (force)', async () => {
       db.createAgent({ name: 'kill-active', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
       const a = db.getAgent('kill-active')!;
       db.updateAgentState('kill-active', 'active', a.version, {
@@ -497,14 +500,14 @@ describe('Lifecycle', () => {
       });
 
       proxyCommands = [];
-      await killAgent(ctx, 'kill-active');
+      await killAgent(ctx, 'kill-active', { force: true });
 
       const agent = db.getAgent('kill-active');
       assert.equal(agent?.state, 'suspended');
       assert.ok(proxyCommands.some(c => c.action === 'kill_session'));
     });
 
-    it('kills an agent in spawning state', async () => {
+    it('kills an agent in spawning state (force)', async () => {
       db.createAgent({ name: 'kill-spawning', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
       const a = db.getAgent('kill-spawning')!;
       db.updateAgentState('kill-spawning', 'spawning', a.version, {
@@ -513,13 +516,13 @@ describe('Lifecycle', () => {
       });
 
       proxyCommands = [];
-      await killAgent(ctx, 'kill-spawning');
+      await killAgent(ctx, 'kill-spawning', { force: true });
 
       const agent = db.getAgent('kill-spawning');
       assert.equal(agent?.state, 'suspended');
     });
 
-    it('kills an agent in suspending state', async () => {
+    it('kills an agent in suspending state (force)', async () => {
       db.createAgent({ name: 'kill-suspending', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
       const a = db.getAgent('kill-suspending')!;
       db.updateAgentState('kill-suspending', 'suspending', a.version, {
@@ -528,13 +531,13 @@ describe('Lifecycle', () => {
       });
 
       proxyCommands = [];
-      await killAgent(ctx, 'kill-suspending');
+      await killAgent(ctx, 'kill-suspending', { force: true });
 
       const agent = db.getAgent('kill-suspending');
       assert.equal(agent?.state, 'suspended');
     });
 
-    it('kills an agent in resuming state', async () => {
+    it('kills an agent in resuming state (force)', async () => {
       db.createAgent({ name: 'kill-resuming', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
       const a = db.getAgent('kill-resuming')!;
       db.updateAgentState('kill-resuming', 'resuming', a.version, {
@@ -543,10 +546,78 @@ describe('Lifecycle', () => {
       });
 
       proxyCommands = [];
-      await killAgent(ctx, 'kill-resuming');
+      await killAgent(ctx, 'kill-resuming', { force: true });
 
       const agent = db.getAgent('kill-resuming');
       assert.equal(agent?.state, 'suspended');
+    });
+
+    // ── GAP-026 liveness interlock ──
+    it('refuses to kill a LIVE session without force (self-heals instead)', async () => {
+      db.createAgent({ name: 'kill-alive', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      const a = db.getAgent('kill-alive')!;
+      db.updateAgentState('kill-alive', 'failed', a.version, {
+        tmuxSession: 'agent-kill-alive',
+        proxyId: 'p1',
+      });
+
+      proxyCommands = [];
+      await killAgent(ctx, 'kill-alive'); // default mock: has_session=true (alive)
+
+      const agent = db.getAgent('kill-alive');
+      assert.equal(agent?.state, 'active', 'live agent self-healed, not reaped');
+      assert.ok(!proxyCommands.some(c => c.action === 'kill_session'), 'no kill dispatched on live session');
+      assert.ok(
+        db.getEvents('kill-alive', 5).some(e => e.event === 'kill_skipped_alive'),
+        'kill_skipped_alive event logged',
+      );
+    });
+
+    it('kills a DEAD session without force', async () => {
+      db.createAgent({ name: 'kill-dead', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      const a = db.getAgent('kill-dead')!;
+      db.updateAgentState('kill-dead', 'active', a.version, {
+        tmuxSession: 'agent-kill-dead',
+        proxyId: 'p1',
+      });
+
+      const deadProxyCommands: ProxyCommand[] = [];
+      const deadCtx: LifecycleContext = {
+        ...ctx,
+        proxyDispatch: async (_p: string, cmd: ProxyCommand): Promise<ProxyResponse> => {
+          deadProxyCommands.push(cmd);
+          if (cmd.action === 'has_session') return { ok: true, data: false };
+          return { ok: true };
+        },
+      };
+
+      await killAgent(deadCtx, 'kill-dead'); // no force, but session is dead → kills
+
+      assert.equal(db.getAgent('kill-dead')?.state, 'suspended');
+      assert.ok(deadProxyCommands.some(c => c.action === 'kill_session'));
+    });
+  });
+
+  describe('recoverAgent — liveness interlock', () => {
+    it('self-heals instead of respawning when the session is alive', async () => {
+      db.createAgent({ name: 'rec-alive', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      db.registerProxy('p1', 'tok', 'localhost:3100');
+      const a = db.getAgent('rec-alive')!;
+      db.updateAgentState('rec-alive', 'failed', a.version, {
+        tmuxSession: 'agent-rec-alive',
+        proxyId: 'p1',
+      });
+
+      proxyCommands = [];
+      const result = await recoverAgent(ctx, 'rec-alive'); // default mock: has_session=true
+
+      assert.equal(result.state, 'active', 'live failed-agent self-healed, not reaped');
+      assert.ok(!proxyCommands.some(c => c.action === 'kill_session'), 'no kill dispatched');
+      assert.ok(!proxyCommands.some(c => c.action === 'create_session'), 'no respawn');
+      assert.ok(
+        db.getEvents('rec-alive', 5).some(e => e.event === 'recover_skipped_alive'),
+        'recover_skipped_alive event logged',
+      );
     });
   });
 

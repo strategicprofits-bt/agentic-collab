@@ -270,15 +270,35 @@ describe('API Routes', () => {
     assert.ok(proxyCommands.some(c => c.action === 'paste'));
   });
 
-  it('POST /api/agents/:name/kill kills session', async () => {
+  it('POST /api/agents/:name/kill with force kills session', async () => {
+    // Mock reports has_session=true (alive); post GAP-026 interlock, killing a
+    // live session requires force:true (explicit operator force-fresh).
     proxyCommands = [];
-    const { status } = await api('POST', '/api/agents/api-agent-1/kill');
+    const { status } = await api('POST', '/api/agents/api-agent-1/kill', { force: true });
     assert.equal(status, 200);
     assert.ok(proxyCommands.some(c => c.action === 'kill_session'));
 
     // Agent should be suspended after kill
     const agent = db.getAgent('api-agent-1');
     assert.equal(agent?.state, 'suspended');
+  });
+
+  it('POST /api/agents/:name/kill without force refuses to reap a LIVE session', async () => {
+    // GAP-026 liveness interlock: a kill with no force on a live session (mock
+    // has_session=true) must NOT kill — it self-heals instead.
+    db.updateAgentState('api-agent-1', 'active', db.getAgent('api-agent-1')!.version, {
+      tmuxSession: 'agent-api-agent-1',
+    });
+    proxyCommands = [];
+    const { status } = await api('POST', '/api/agents/api-agent-1/kill');
+    assert.equal(status, 200);
+    assert.ok(!proxyCommands.some(c => c.action === 'kill_session'), 'no kill on live session');
+    const agent = db.getAgent('api-agent-1');
+    assert.notEqual(agent?.state, 'suspended', 'live agent not reaped');
+    assert.ok(
+      db.getEvents('api-agent-1', 5).some(e => e.event === 'kill_skipped_alive'),
+      'kill_skipped_alive logged',
+    );
   });
 
   // ── Proxy Registration ──

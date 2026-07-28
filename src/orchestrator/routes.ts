@@ -1374,13 +1374,14 @@ route('POST', '/api/agents/:name/reload', async (req, res, match, ctx) => {
   }
 });
 
-route('POST', '/api/agents/:name/recover', async (_req, res, match, ctx) => {
+route('POST', '/api/agents/:name/recover', async (req, res, match, ctx) => {
   const name = match.pathname.groups['name']!;
+  const body = await readJson(req);
 
   try {
     const lifecycleCtx = makeLifecycleCtx(ctx);
     syncSinglePersona(ctx.db, name);
-    const result = await recoverAgent(lifecycleCtx, name);
+    const result = await recoverAgent(lifecycleCtx, name, { force: body['force'] === true });
     broadcastAgentUpdate(ctx, name);
     broadcastLifecycleEvent(ctx, name, 'Recovered');
     json(res, 200, result);
@@ -1393,7 +1394,21 @@ route('POST', '/api/agents/:name/interrupt', lifecycleRoute(interruptAgent, { ev
 
 route('POST', '/api/agents/:name/compact', lifecycleRoute(compactAgent, { eventLabel: 'Compacted' }));
 
-route('POST', '/api/agents/:name/kill', lifecycleRoute(killAgent, { broadcast: true, eventLabel: 'Killed' }));
+route('POST', '/api/agents/:name/kill', async (req, res, match, ctx) => {
+  const name = match.pathname.groups['name']!;
+  const body = await readJson(req);
+  try {
+    const lifecycleCtx = makeLifecycleCtx(ctx);
+    // force:true = explicit operator force-fresh (overrides the GAP-026 liveness guard).
+    // Automated callers (watchdog, batch scripts) omit force → a live session is not reaped.
+    await killAgent(lifecycleCtx, name, { force: body['force'] === true });
+    broadcastAgentUpdate(ctx, name);
+    broadcastLifecycleEvent(ctx, name, 'Killed');
+    json(res, 200, { ok: true });
+  } catch (err) {
+    json(res, 400, { error: (err as Error).message });
+  }
+});
 
 route('GET', '/api/agents/:name/peek', async (req, res, match, ctx) => {
   const name = match.pathname.groups['name']!;
