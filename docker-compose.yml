@@ -23,6 +23,10 @@ services:
       - PERSONAS_HOST_DIR=${PERSONAS_HOST_DIR:-}
       - ORCHESTRATOR_HOST=${ORCHESTRATOR_HOST:-http://localhost:3000}
       - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-}
+      # P2a presence-aware operator-reply relay (host-env injected, empty default →
+      # relay is a safe no-op until provisioned; token is NEVER stored at-rest).
+      - OPERATOR_RELAY_BOT_TOKEN=${OPERATOR_RELAY_BOT_TOKEN:-}
+      - OPERATOR_RELAY_CHAT_ID=${OPERATOR_RELAY_CHAT_ID:-}
       # 120000 (was 60000) — Opus 4.6 cold-start + per-call proxy retry budget
       # (15s × 3 attempts) can blow past 60s on first launch. Watchdog only fires
       # on actual timeout, so healthy spawns are unaffected. See data/knowledge/

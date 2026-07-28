@@ -16,6 +16,7 @@ import type { Database } from './database.ts';
 import type { WebSocketServer } from '../shared/websocket-server.ts';
 import type { AgentState, DashboardMessage, DestinationRecord, EngineType, PendingMessage, ProxyCommand, ProxyResponse, ProxyRegistration } from '../shared/types.ts';
 import type { TelegramDispatcher } from './telegram.ts';
+import { relayReplyToOperator } from './relay-policy.ts';
 import { sanitizeMessage, generateMessageId } from '../shared/sanitize.ts';
 import { getVersion, versionsMatch } from '../shared/version.ts';
 import type { LockManager } from '../shared/lock.ts';
@@ -516,6 +517,17 @@ route('POST', '/api/dashboard/reply', async (req, res, _match, ctx) => {
 
   // Broadcast to dashboard WebSocket
   ctx.wss.broadcast(JSON.stringify({ type: 'message', msg }));
+
+  // P2a: presence-aware relay to the operator's phone (best-effort, never blocks
+  // the reply -- a relay failure must not break posting to the dashboard).
+  void relayReplyToOperator({
+    agent: body.agent as string,
+    message: sanitized,
+    topic: body.topic as string,
+    clientCount: ctx.wss.clientCount,
+    nowMs: Date.now(),
+    send: (botToken, chatId, text) => ctx.telegramDispatcher.send(botToken, chatId, text),
+  }).catch(() => { /* best-effort */ });
 
   json(res, 200, { ok: true, msg });
 });
