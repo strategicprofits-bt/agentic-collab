@@ -23,6 +23,7 @@ import { getAdapter } from './adapters/index.ts';
 import { reloadAgent, recoverAgent, suspendAgent, type LifecycleContext } from './lifecycle.ts';
 import { resolveEffectiveConfig } from './engine-config-resolver.ts';
 import { StrandedWatchdog } from './stranded-watchdog.ts';
+import { classifyPaneCommand } from './pane-liveness.ts';
 
 type CompiledDetection = {
   json: string;
@@ -420,8 +421,10 @@ export class HealthMonitor {
         // Capture pane output for detection patterns and/or screen-diff
         const paneOutput = await this.capturePaneOutput(agent);
         if (paneOutput === null) continue;
-        // Check for CLI exit even on fast poll (GAP-005)
-        if (this.detectCliExit(agent, paneOutput)) {
+        // Check for CLI exit even on fast poll (GAP-005). Stage 2: pass pane_current_command so
+        // a CLI-exit-to-shell that the content signals miss (leftover UI) is caught.
+        const paneCmd = await this.queryPaneCurrentCommand(agent);
+        if (this.detectCliExit(agent, paneOutput, paneCmd)) {
           this.maybeAutoRecover(agent);
           continue;
         }
@@ -520,8 +523,10 @@ export class HealthMonitor {
     const paneOutput = await this.capturePaneOutput(agent);
     if (paneOutput === null) return;
 
-    // Always check for CLI exit — even when pane is unchanged
-    if (this.detectCliExit(agent, paneOutput)) {
+    // Always check for CLI exit — even when pane is unchanged. Stage 2: pass pane_current_command
+    // so an idle-masked CLI-exit-to-shell (leftover Claude UI, no new output) is detected.
+    const paneCmd = await this.queryPaneCurrentCommand(agent);
+    if (this.detectCliExit(agent, paneOutput, paneCmd)) {
       this.maybeAutoRecover(agent);
       return;
     }
@@ -588,6 +593,14 @@ export class HealthMonitor {
         this.scheduleStateWatchdog(agent.name, failReason);
         this.onAgentUpdate(agent.name);
         this.consecutiveFailures.delete(agent.name);
+        // GAP-026 Stage 2: a session-gone death must SELF-recover, independent of any pending
+        // message. This is the exact GAP-026 trigger path (capture-fails-under-load), so it is
+        // safe ONLY because maybeAutoRecover → recoverAgent re-checks liveness via the Stage-1
+        // claude-running signal — which uses has_session + display_message (lighter tmux queries
+        // than the flaky `capture` above) plus confirm-before-reap. A genuinely-ALIVE agent whose
+        // capture merely blipped is REFUSED (self-heal/defer), never respawned; only a genuinely
+        // dead session (has_session=false or consistent shell) respawns.
+        this.maybeAutoRecover(agent);
       }
       return null;
     }
@@ -595,6 +608,20 @@ export class HealthMonitor {
     // Reset failure counter on success
     this.consecutiveFailures.delete(agent.name);
     return (captureResult.data as string) ?? '';
+  }
+
+  /**
+   * GAP-026 Stage 2: query the pane's foreground command (tmux #{pane_current_command}) for
+   * process-based CLI-exit detection. Returns undefined if the query fails — detectCliExit then
+   * falls back to its content signals only (never false-detects on a missing read).
+   */
+  private async queryPaneCurrentCommand(agent: AgentRecord): Promise<string | undefined> {
+    const res = await this.proxyDispatch(agent.proxyId!, {
+      action: 'display_message',
+      sessionName: sessionName(agent),
+      format: '#{pane_current_command}',
+    }).catch(() => ({ ok: false }) as ProxyResponse);
+    return res.ok ? String(res.data ?? '') : undefined;
   }
 
   /**
@@ -750,7 +777,7 @@ export class HealthMonitor {
    * Requires 2 consecutive detections to avoid false positives during spawn.
    * Returns true if exit was detected (agent marked as failed), false otherwise.
    */
-  private detectCliExit(agent: AgentRecord, paneOutput: string): boolean {
+  private detectCliExit(agent: AgentRecord, paneOutput: string, paneCurrentCommand?: string): boolean {
     const key = `shell_${agent.name}`;
     const lines = paneOutput.split('\n');
 
@@ -796,8 +823,16 @@ export class HealthMonitor {
     ];
     const isShellPrompt = shellPromptPatterns.some(re => re.test(lastLine));
 
+    // Signal 3 (GAP-026 Stage 2): the pane's FOREGROUND process is a shell.
+    // Process-based (tmux #{pane_current_command}), so it catches a CLI-exit-to-shell death
+    // that the content signals MISS — the exact GilDeathCanary pane where the CLI died but a
+    // stale "bypass permissions" status line remained the last rendered line, masking the death
+    // as idle. Reuses the Stage-1 classifier; children of a live TUI read node/claude, so a shell
+    // read means the TUI genuinely exited. Confirm-before-reap in recoverAgent gates any transient.
+    const isShellProcess = classifyPaneCommand(paneCurrentCommand) === 'shell';
+
     // Need at least one signal
-    if (!isShellPrompt && !hasExitMessage) {
+    if (!isShellPrompt && !hasExitMessage && !isShellProcess) {
       this.consecutiveFailures.delete(key);
       return false;
     }

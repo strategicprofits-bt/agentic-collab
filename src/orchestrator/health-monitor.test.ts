@@ -230,9 +230,13 @@ describe('HealthMonitor', () => {
     const updated = db.getAgent('health-compact')!;
     assert.equal(updated.lastContextPct, 95);
 
-    // No compact or reload actions — only capture commands
-    const nonCapture = proxyCommands.filter(c => c.action !== 'capture' && c.action !== 'pane_activity');
-    assert.equal(nonCapture.length, 0, 'should not send any compact/reload commands');
+    // No compact or reload actions. These are pane WRITES (send_keys '/compact', paste reload);
+    // read-only health queries (capture, pane_activity, and the Stage-2 display_message for
+    // process-based liveness) are expected and benign.
+    const writeActions = proxyCommands.filter(
+      c => c.action === 'paste' || c.action === 'send_keys' || c.action === 'send_keys_raw',
+    );
+    assert.equal(writeActions.length, 0, 'should not send any compact/reload commands');
   });
 
   it('fires onMessageDelivered callback after successful delivery', async () => {
@@ -295,9 +299,12 @@ describe('HealthMonitor', () => {
     await monitor.pollAll();
     await monitor.pollAll();
 
-    // Health monitor should NOT have pasted anything — only capture + pane_activity commands
-    const nonCapture = proxyCommands.filter(c => c.action !== 'capture' && c.action !== 'pane_activity' && c.action !== 'pane_activity');
-    assert.equal(nonCapture.length, 0, 'health monitor should not deliver messages');
+    // Health monitor must not DELIVER (paste) anything. Read-only queries (capture, pane_activity,
+    // and the Stage-2 display_message for process-based CLI-exit detection) are expected and benign.
+    const writeActions = proxyCommands.filter(
+      c => c.action === 'paste' || c.action === 'send_keys' || c.action === 'send_keys_raw',
+    );
+    assert.equal(writeActions.length, 0, 'health monitor should not deliver messages');
   });
 
   it('retries failed delivery with backoff (via dispatcher)', async () => {
@@ -1411,5 +1418,223 @@ describe('Auto-recover circuit breaker', () => {
 
     const history = (monitor as any).recoveryHistory.get('cb-failed');
     assert.ok(history && history.length === 2, 'recovery history should NOT be cleared for failed agents');
+  });
+});
+
+// ── GAP-026 Stage 2: orchestrator self-sufficient genuine-death recovery ──
+// Stage 2 wires two previously-missing recovery triggers, EACH gated by the Stage-1
+// claude-actually-running liveness re-check (the refusal itself is exhaustively proven in
+// lifecycle.test.ts: self-heal-when-alive, defer-on-unknown, confirm-before-reap-on-transient):
+//   (i)  session-gone (capture fails FAILURE_THRESHOLD×) → the `health_check_failed` path now
+//        calls maybeAutoRecover → recoverAgent, INDEPENDENT of any pending message. Previously
+//        maybeAutoRecover was structurally unreachable from this path (a quiet dead agent stuck
+//        `failed` forever) — this is the wiring the daemon force-fresh was compensating for.
+//   (ii) CLI-exit-to-shell that the CONTENT signals MISS (leftover Claude UI still rendered) →
+//        detectCliExit Signal 3 (process-based tmux #{pane_current_command}) catches it.
+//
+// THE LOAD-BEARING ADVERSARIAL GATE (named by DrRobby as the whole risk of Stage 2): a TRANSIENT
+// capture-failure on a genuinely-ALIVE agent (proxy blip / event-loop stall — the exact
+// 2026-07-28 false-death burst) must NOT respawn. The new (i) trigger routes through recoverAgent,
+// whose liveness re-check REFUSES the live agent → ZERO respawn. Proven here END-TO-END through the
+// health monitor (negative control) alongside the genuine-death→respawn positive control.
+describe('GAP-026 Stage 2 — orchestrator genuine-death self-recovery', () => {
+  let s2Db: Database;
+  let s2TmpDir: string;
+  const monitors: HealthMonitor[] = [];
+  const FAILURE_THRESHOLD = 3; // mirrors HealthMonitor.FAILURE_THRESHOLD (private)
+
+  const S2_DETECTION = JSON.stringify({
+    idlePatterns: [{ pattern: '^[\\u276f>]\\s*$', lines: 5 }],
+    activePatterns: [],
+    contextPattern: '(\\d+)\\s*tokens',
+    idleThreshold: 2,
+    autoRecover: true,
+  });
+
+  before(() => {
+    s2TmpDir = mkdtempSync(join(tmpdir(), 's2-test-'));
+    s2Db = new Database(join(s2TmpDir, 'test.db'));
+    s2Db.registerProxy('p1', 'tok', 'localhost:3100');
+    s2Db.createEngineConfig({ name: 'claude', engine: 'claude', detection: S2_DETECTION });
+    // Zero the liveness re-sample delay so confirm-before-reap doesn't wait in tests.
+    process.env['LIVENESS_RESAMPLE_DELAY_MS'] = '0';
+  });
+
+  afterEach(() => {
+    for (const m of monitors) m.stop();
+    monitors.length = 0;
+  });
+
+  after(() => {
+    s2Db.close();
+    rmSync(s2TmpDir, { recursive: true, force: true });
+  });
+
+  function makeS2Monitor(
+    dispatch: (proxyId: string, command: ProxyCommand) => Promise<ProxyResponse>,
+  ): HealthMonitor {
+    const m = new HealthMonitor({
+      db: s2Db,
+      locks: new LockManager(s2Db.rawDb),
+      proxyDispatch: dispatch,
+      orchestratorHost: 'http://localhost:3000',
+      pollIntervalMs: 100,
+    });
+    monitors.push(m);
+    return m;
+  }
+
+  function activeAgent(name: string): void {
+    s2Db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = s2Db.getAgent(name)!;
+    s2Db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
+  }
+
+  // Drive FAILURE_THRESHOLD consecutive capture failures → health_check_failed → maybeAutoRecover.
+  async function failCaptureToThreshold(monitor: HealthMonitor, name: string): Promise<void> {
+    for (let i = 0; i < FAILURE_THRESHOLD; i++) {
+      await monitor.pollAgent(s2Db.getAgent(name)!);
+    }
+  }
+
+  // Flush the fire-and-forget recoverAgent promise chain after a mocked backoff tick.
+  // setImmediate is NOT mocked (only setTimeout is), so it yields real macrotask turns that
+  // drain recoverAgent's awaited microtasks. The live-refusal path has no inner sleeps.
+  async function drainAsync(): Promise<void> {
+    for (let i = 0; i < 15; i++) await new Promise((r) => setImmediate(r));
+  }
+
+  it('ADVERSARIAL GATE (negative control): transient capture-fail on a LIVE agent → recoverAgent REFUSES → ZERO respawn', async (t) => {
+    const name = 's2-live-blip';
+    activeAgent(name);
+
+    // Capture blips (transient), but the agent is genuinely ALIVE: has_session=true and the pane's
+    // foreground process is `claude`. This is the 2026-07-28 burst scenario exactly.
+    const cmds: ProxyCommand[] = [];
+    const dispatch = async (_p: string, c: ProxyCommand): Promise<ProxyResponse> => {
+      cmds.push(c);
+      if (c.action === 'capture') return { ok: false, error: 'transient capture blip' };
+      if (c.action === 'has_session') return { ok: true, data: true };
+      if (c.action === 'display_message') return { ok: true, data: 'claude' };
+      return { ok: true };
+    };
+    const monitor = makeS2Monitor(dispatch);
+
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    await failCaptureToThreshold(monitor, name);
+
+    // Stage-2 wiring: the health_check_failed path now REACHES the auto-recover trigger.
+    assert.equal(s2Db.getAgent(name)!.state, 'failed', 'marked failed after capture-fail threshold');
+    assert.ok(
+      s2Db.getEvents(name, 50).some(e => e.event === 'auto_recover_triggered'),
+      'health_check_failed now reaches maybeAutoRecover (previously structurally unreachable)',
+    );
+
+    cmds.length = 0; // ignore the pre-recovery capture/has_session dispatches
+    t.mock.timers.tick(12_000); // fire the backoff → recoverAgent runs its liveness re-check
+    await drainAsync();
+
+    // THE GATE: a live agent whose capture merely blipped is REFUSED — never respawned.
+    assert.ok(!cmds.some(c => c.action === 'create_session'), 'ZERO respawn — live agent refused');
+    assert.ok(!cmds.some(c => c.action === 'kill_session'), 'no kill dispatched on a live agent');
+    assert.ok(
+      s2Db.getEvents(name, 50).some(e => e.event === 'recover_skipped_alive'),
+      'recoverAgent self-healed the live agent instead of reaping',
+    );
+    assert.equal(s2Db.getAgent(name)!.state, 'active', 'live agent self-healed back to active');
+  });
+
+  it('positive control: genuine session-death (has_session=false) → same trigger → recoverAgent RESPAWNS (not refused)', async (t) => {
+    const name = 's2-dead-session';
+    activeAgent(name);
+
+    // Genuine death: capture fails AND the session is gone (has_session=false).
+    const dispatch = async (_p: string, c: ProxyCommand): Promise<ProxyResponse> => {
+      if (c.action === 'capture') return { ok: false, error: 'session gone' };
+      if (c.action === 'has_session') return { ok: true, data: false };
+      return { ok: true };
+    };
+    const monitor = makeS2Monitor(dispatch);
+
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    await failCaptureToThreshold(monitor, name);
+    assert.ok(
+      s2Db.getEvents(name, 50).some(e => e.event === 'auto_recover_triggered'),
+      'genuine session-death fires the auto-recover trigger',
+    );
+
+    t.mock.timers.tick(12_000); // fire backoff → recoverAgent
+    await drainAsync();
+
+    // recoverAgent proceeds to respawn: it transitions OUT of `failed` (Phase-1 → 'spawning',
+    // which happens before any spawn-path sleep). It must NOT self-heal or defer a known death.
+    assert.notEqual(s2Db.getAgent(name)!.state, 'failed', 'genuine death → respawn initiated (left failed)');
+    assert.ok(
+      !s2Db.getEvents(name, 50).some(e => e.event === 'recover_skipped_alive'),
+      'did NOT self-heal a genuinely dead session',
+    );
+    assert.ok(
+      !s2Db.getEvents(name, 50).some(e => e.event === 'recover_deferred_unknown'),
+      'not deferred — session liveness was known (dead)',
+    );
+  });
+
+  // ── (ii) detectCliExit Signal 3: process-based CLI-exit-to-shell detection ──
+  // Leftover-Claude-UI content that MISSES the content signals (no shell prompt, no exit message) —
+  // the exact GilDeathCanary pane that masked a CLI-exit death as idle.
+  const LEFTOVER_UI = 'some claude output\n⏵⏵ bypass permissions on\n';
+
+  it('Signal 3: leftover-UI (content signals MISS) + pane_current_command=shell → CLI-exit detected', async () => {
+    const name = 's2-cliexit-bash';
+    activeAgent(name);
+    const dispatch = async (_p: string, c: ProxyCommand): Promise<ProxyResponse> => {
+      if (c.action === 'capture') return { ok: true, data: LEFTOVER_UI };
+      if (c.action === 'display_message') return { ok: true, data: 'bash' };
+      if (c.action === 'has_session') return { ok: true, data: true };
+      return { ok: true };
+    };
+    const monitor = makeS2Monitor(dispatch);
+
+    await monitor.pollAgent(s2Db.getAgent(name)!);
+    assert.equal(s2Db.getAgent(name)!.state, 'active', 'first poll: needs 2 consecutive to confirm');
+    await monitor.pollAgent(s2Db.getAgent(name)!);
+    assert.equal(s2Db.getAgent(name)!.state, 'failed', 'Signal 3 caught the death the content signals missed');
+    assert.ok(s2Db.getEvents(name, 50).some(e => e.event === 'cli_exit_detected'), 'cli_exit_detected logged');
+  });
+
+  it('Signal 3 negative: same leftover-UI + pane_current_command=claude (idle-alive) → NOT detected', async () => {
+    const name = 's2-cliexit-claude';
+    activeAgent(name);
+    const dispatch = async (_p: string, c: ProxyCommand): Promise<ProxyResponse> => {
+      if (c.action === 'capture') return { ok: true, data: LEFTOVER_UI };
+      if (c.action === 'display_message') return { ok: true, data: 'claude' };
+      if (c.action === 'has_session') return { ok: true, data: true };
+      return { ok: true };
+    };
+    const monitor = makeS2Monitor(dispatch);
+
+    await monitor.pollAgent(s2Db.getAgent(name)!);
+    await monitor.pollAgent(s2Db.getAgent(name)!);
+    assert.equal(s2Db.getAgent(name)!.state, 'active', 'idle-alive (claude foreground) is never false-detected');
+  });
+
+  it('Signal 3 fallback: pane_current_command query fails (undefined) → content-only, no false-positive', async () => {
+    const name = 's2-cliexit-undef';
+    activeAgent(name);
+    const dispatch = async (_p: string, c: ProxyCommand): Promise<ProxyResponse> => {
+      if (c.action === 'capture') return { ok: true, data: LEFTOVER_UI };
+      if (c.action === 'display_message') return { ok: false, error: 'query failed' };
+      if (c.action === 'has_session') return { ok: true, data: true };
+      return { ok: true };
+    };
+    const monitor = makeS2Monitor(dispatch);
+
+    await monitor.pollAgent(s2Db.getAgent(name)!);
+    await monitor.pollAgent(s2Db.getAgent(name)!);
+    assert.equal(
+      s2Db.getAgent(name)!.state,
+      'active',
+      'undefined pane_current_command falls back to content signals only — no false death on a read failure',
+    );
   });
 });
