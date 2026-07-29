@@ -42,6 +42,11 @@ describe('Lifecycle', () => {
         if (command.action === 'capture') {
           return { ok: true, data: '> \n' };
         }
+        // GAP-026 Stage 1: default pane_current_command = 'claude' (alive). Tests that
+        // exercise a dead-CLI shell override this to return 'bash'.
+        if (command.action === 'display_message') {
+          return { ok: true, data: 'claude' };
+        }
         return { ok: true };
       },
       orchestratorHost: 'http://localhost:3000',
@@ -618,6 +623,84 @@ describe('Lifecycle', () => {
         db.getEvents('rec-alive', 5).some(e => e.event === 'recover_skipped_alive'),
         'recover_skipped_alive event logged',
       );
+    });
+  });
+
+  // ── GAP-026 Stage 1: claude-actually-running liveness signal ──
+  // The guard now reaps only when Claude is genuinely not running (pane_current_command is a
+  // shell), never on a false death signal. Two named-hard-gate directions: the regression fix
+  // (dead-CLI shell → respawn, which bare has_session self-healed) and the OVERSHOOT guard
+  // (idle-but-alive → refused, which an activity-based signal would false-kill).
+  describe('GAP-026 Stage 1 — claude-running liveness signal', () => {
+    const shellDispatch = (sink: ProxyCommand[]) =>
+      async (_p: string, c: ProxyCommand): Promise<ProxyResponse> => {
+        sink.push(c);
+        if (c.action === 'has_session') return { ok: true, data: true };
+        if (c.action === 'display_message') return { ok: true, data: 'bash' }; // dead-CLI shell
+        if (c.action === 'capture') return { ok: true, data: '> \n' };
+        return { ok: true };
+      };
+    const downDispatch = (sink: ProxyCommand[]) =>
+      async (_p: string, c: ProxyCommand): Promise<ProxyResponse> => {
+        sink.push(c);
+        if (c.action === 'has_session') return { ok: false, error: 'proxy unreachable' };
+        return { ok: true };
+      };
+
+    it('killAgent: DEAD-CLI shell (has_session=true, pane_current_command=bash) → kills [regression fix]', async () => {
+      db.createAgent({ name: 's1-kill-deadshell', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      const a = db.getAgent('s1-kill-deadshell')!;
+      db.updateAgentState('s1-kill-deadshell', 'failed', a.version, { tmuxSession: 'agent-s1-kill-deadshell', proxyId: 'p1' });
+      const cmds: ProxyCommand[] = [];
+      await killAgent({ ...ctx, proxyDispatch: shellDispatch(cmds) }, 's1-kill-deadshell');
+      assert.equal(db.getAgent('s1-kill-deadshell')?.state, 'suspended', 'dead-CLI shell killed, not self-healed');
+      assert.ok(cmds.some(c => c.action === 'kill_session'), 'kill dispatched on dead shell');
+    });
+
+    it('killAgent: IDLE-ALIVE (pane_current_command=claude, no activity) → refused [overshoot guard]', async () => {
+      db.createAgent({ name: 's1-kill-idle', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      const a = db.getAgent('s1-kill-idle')!;
+      db.updateAgentState('s1-kill-idle', 'failed', a.version, { tmuxSession: 'agent-s1-kill-idle', proxyId: 'p1' });
+      proxyCommands = [];
+      await killAgent(ctx, 's1-kill-idle'); // default mock: display_message='claude'
+      assert.equal(db.getAgent('s1-kill-idle')?.state, 'active', 'idle-alive self-healed, never reaped');
+      assert.ok(!proxyCommands.some(c => c.action === 'kill_session'), 'no kill on idle-alive');
+      assert.ok(db.getEvents('s1-kill-idle', 5).some(e => e.event === 'kill_skipped_alive'));
+    });
+
+    it('killAgent: liveness UNKNOWN (proxy unreachable) → refused [safe]', async () => {
+      db.createAgent({ name: 's1-kill-unknown', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      const a = db.getAgent('s1-kill-unknown')!;
+      db.updateAgentState('s1-kill-unknown', 'failed', a.version, { tmuxSession: 'agent-s1-kill-unknown', proxyId: 'p1' });
+      const cmds: ProxyCommand[] = [];
+      await killAgent({ ...ctx, proxyDispatch: downDispatch(cmds) }, 's1-kill-unknown');
+      assert.notEqual(db.getAgent('s1-kill-unknown')?.state, 'suspended', 'not killed on unknown liveness');
+      assert.ok(!cmds.some(c => c.action === 'kill_session'), 'no kill on unknown');
+    });
+
+    it('recoverAgent: DEAD-CLI shell (has_session=true, pane_current_command=bash) → respawns [regression fix]', async () => {
+      db.createAgent({ name: 's1-rec-deadshell', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      db.registerProxy('p1', 'tok', 'localhost:3100');
+      const a = db.getAgent('s1-rec-deadshell')!;
+      db.updateAgentState('s1-rec-deadshell', 'failed', a.version, { tmuxSession: 'agent-s1-rec-deadshell', proxyId: 'p1' });
+      const cmds: ProxyCommand[] = [];
+      await recoverAgent({ ...ctx, proxyDispatch: shellDispatch(cmds) }, 's1-rec-deadshell');
+      assert.ok(cmds.some(c => c.action === 'create_session'), 'respawned (create_session dispatched)');
+      assert.ok(
+        !db.getEvents('s1-rec-deadshell', 8).some(e => e.event === 'recover_skipped_alive'),
+        'did NOT self-heal a dead shell',
+      );
+    });
+
+    it('recoverAgent: liveness UNKNOWN (proxy unreachable) → defers (no respawn, no false-heal)', async () => {
+      db.createAgent({ name: 's1-rec-unknown', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      const a = db.getAgent('s1-rec-unknown')!;
+      db.updateAgentState('s1-rec-unknown', 'failed', a.version, { tmuxSession: 'agent-s1-rec-unknown', proxyId: 'p1' });
+      const cmds: ProxyCommand[] = [];
+      const result = await recoverAgent({ ...ctx, proxyDispatch: downDispatch(cmds) }, 's1-rec-unknown');
+      assert.equal(result.state, 'failed', 'deferred: stays failed (not respawned, not self-healed)');
+      assert.ok(!cmds.some(c => c.action === 'create_session'), 'no respawn on unknown');
+      assert.ok(db.getEvents('s1-rec-unknown', 5).some(e => e.event === 'recover_deferred_unknown'));
     });
   });
 

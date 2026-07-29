@@ -22,6 +22,7 @@ import { join } from 'node:path';
 import type { Database } from './database.ts';
 import type { LockManager } from '../shared/lock.ts';
 import type { ProxyCommand, ProxyResponse, AgentRecord, PipelineStep } from '../shared/types.ts';
+import { classifyPaneCommand } from './pane-liveness.ts';
 import { sessionName, requireProxy, canSuspend, canResume } from '../shared/agent-entity.ts';
 import { shellQuote, sleep } from '../shared/utils.ts';
 import { getAdapter } from './adapters/index.ts';
@@ -1124,6 +1125,35 @@ const RECOVER_TIMEOUT_MS = parseInt(process.env['RECOVER_TIMEOUT_MS'] ?? '60000'
  *
  * Accepts agents in 'failed' state only. Three-phase locking.
  */
+/**
+ * GAP-026 Stage 1 — is Claude ACTUALLY RUNNING for this agent?
+ *   true  — session exists AND the pane shows Claude UI (active OR idle-but-alive).
+ *   false — session gone, OR session exists but the pane is a dead-CLI shell / no Claude UI.
+ *   null  — could not determine (proxy unreachable / capture failed) → callers treat as
+ *           "do not reap and do not respawn" (safe: kill would fail anyway; recovery defers).
+ * PROCESS-based (tmux #{pane_current_command}), NOT pane-content — immune to leftover Claude
+ * UI after death, and an idle-alive agent still owns the pane as `claude` so it is never
+ * false-killed (the overshoot direction the gate names make-or-break).
+ */
+async function isAgentClaudeRunning(
+  ctx: LifecycleContext,
+  proxyId: string,
+  session: string,
+): Promise<boolean | null> {
+  const has = await ctx.proxyDispatch(proxyId, { action: 'has_session', sessionName: session })
+    .catch(() => ({ ok: false }) as ProxyResponse);
+  if (!has.ok) return null;          // proxy unreachable — unknown
+  if (has.data !== true) return false; // session gone — not running
+  const cmd = await ctx.proxyDispatch(proxyId, {
+    action: 'display_message',
+    sessionName: session,
+    format: '#{pane_current_command}',
+  }).catch(() => ({ ok: false }) as ProxyResponse);
+  if (!cmd.ok) return null;          // couldn't query — unknown
+  // 'shell' → CLI exited to a shell (dead). 'claude'/'other' → alive (refuse reap).
+  return classifyPaneCommand(String(cmd.data ?? '')) !== 'shell';
+}
+
 export async function recoverAgent(
   ctx: LifecycleContext,
   name: string,
@@ -1131,18 +1161,16 @@ export async function recoverAgent(
 ): Promise<AgentRecord> {
   const peers = computePeers(ctx, name);
 
-  // ── GAP-026 liveness interlock ──
-  // Recovery kills the old session then fresh-respawns. If the session is actually
-  // ALIVE (a false-death signal — proxy blip, transient-suspended, false-frozen pane),
-  // that would reap live context. Self-heal instead of reap, unless explicitly forced.
+  // ── GAP-026 liveness interlock (Stage 1: claude-actually-running signal) ──
+  // Recovery kills the old session then fresh-respawns. Only reap if Claude is genuinely
+  // NOT running. A dead-CLI shell has has_session=true but no Claude UI → it MUST respawn
+  // (the Stage-1 fix: bare has_session self-healed it, leaving a dead shell). A live agent
+  // (active OR idle-alive) → self-heal, never reap. Unknown → defer (never false-heal, never reap).
   if (!opts?.force) {
     const pre = ctx.db.getAgent(name);
     if (pre?.proxyId && pre.tmuxSession) {
-      const live = await ctx.proxyDispatch(pre.proxyId, {
-        action: 'has_session',
-        sessionName: sessionName(pre),
-      }).catch(() => ({ ok: false }) as ProxyResponse);
-      if (live.ok && live.data === true) {
+      const running = await isAgentClaudeRunning(ctx, pre.proxyId, sessionName(pre));
+      if (running === true) {
         return ctx.locks.withLock(name, async () => {
           const cur = ctx.db.getAgent(name);
           if (!cur) throw new Error(`Agent "${name}" not found`);
@@ -1152,11 +1180,22 @@ export async function recoverAgent(
             failureReason: null,
           });
           ctx.db.logEvent(name, 'recover_skipped_alive', undefined, {
-            reason: 'has_session=true; self-healed instead of reap',
+            reason: 'claude running (UI present); self-healed instead of reap',
           });
           return healed;
         });
       }
+      if (running === null) {
+        // Liveness undeterminable (proxy unreachable) — do NOT respawn (could reap a live
+        // agent whose proxy blipped) and do NOT self-heal (could hide a real death). Defer:
+        // leave the agent as-is; a later cycle re-attempts once liveness is knowable.
+        ctx.db.logEvent(name, 'recover_deferred_unknown', undefined, {
+          reason: 'has_session/capture unavailable; recovery deferred',
+        });
+        return pre;
+      }
+      // running === false → Claude genuinely not running (session-gone or dead-CLI shell)
+      // → fall through to respawn (this is the Stage-1 regression fix).
     }
   }
 
@@ -1360,18 +1399,17 @@ export async function killAgent(
     if (!agent) throw new Error(`Agent "${name}" not found`);
     const proxyId = requireProxy(agent);
 
-    // ── GAP-026 liveness interlock ──
-    // Never reap a LIVE tmux session on a false death signal (the 2026-07-28 burst:
-    // a watchdog force-freshed self-healed-alive agents, costing context). If the
-    // session is alive and the caller did not explicitly force, self-heal instead of
-    // killing. Explicit operator force-fresh passes force:true to override.
+    // ── GAP-026 liveness interlock (Stage 1: claude-actually-running signal) ──
+    // Never reap a LIVE agent on a false death signal (the 2026-07-28 burst: a watchdog
+    // force-freshed self-healed-alive agents, costing context). Reap only when Claude is
+    // genuinely NOT running (session-gone or dead-CLI shell). A live agent — active OR
+    // idle-but-alive (Claude UI rendered, no new output) — is refused. Unknown liveness is
+    // also refused (kill would fail anyway). Explicit operator force-fresh overrides.
     if (!opts?.force) {
-      const live = await ctx.proxyDispatch(proxyId, {
-        action: 'has_session',
-        sessionName: sessionName(agent),
-      }).catch(() => ({ ok: false }) as ProxyResponse);
-      if (live.ok && live.data === true) {
-        if (agent.state !== 'active' && agent.state !== 'idle') {
+      const running = await isAgentClaudeRunning(ctx, proxyId, sessionName(agent));
+      if (running !== false) {
+        // running === true (alive) OR null (unknown) → refuse the reap.
+        if (running === true && agent.state !== 'active' && agent.state !== 'idle') {
           ctx.db.updateAgentState(name, 'active', agent.version, {
             lastActivity: new Date().toISOString(),
             failedAt: null,
@@ -1379,10 +1417,13 @@ export async function killAgent(
           });
         }
         ctx.db.logEvent(name, 'kill_skipped_alive', undefined, {
-          reason: 'has_session=true; refused reap (pass force to override)',
+          reason: running === true
+            ? 'claude running (UI present); refused reap (pass force to override)'
+            : 'liveness unknown (proxy/capture unavailable); refused reap',
         });
         return;
       }
+      // running === false → Claude genuinely not running → fall through to kill.
     }
 
     await ctx.proxyDispatch(proxyId, {
