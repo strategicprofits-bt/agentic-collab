@@ -13,6 +13,9 @@ import {
   executeCustomButton, type LifecycleContext,
 } from './lifecycle.ts';
 
+// GAP-026 Stage 1 confirm-before-reap: zero the inter-sample delay so shell-read tests don't wait.
+process.env['LIVENESS_RESAMPLE_DELAY_MS'] = '0';
+
 describe('Lifecycle', () => {
   let db: Database;
   let tmpDir: string;
@@ -701,6 +704,47 @@ describe('Lifecycle', () => {
       assert.equal(result.state, 'failed', 'deferred: stays failed (not respawned, not self-healed)');
       assert.ok(!cmds.some(c => c.action === 'create_session'), 'no respawn on unknown');
       assert.ok(db.getEvents('s1-rec-unknown', 5).some(e => e.event === 'recover_deferred_unknown'));
+    });
+
+    // Confirm-before-reap (Brienne R1): distinguish a dead-CLI shell (persistent) from a live
+    // agent momentarily foregrounding an interactive shell (transient → returns to claude).
+    it('killAgent: TRANSIENT shell (bash → claude on re-sample) → REFUSED [R1 confirm-before-reap]', async () => {
+      db.createAgent({ name: 's1-transient-shell', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      const a = db.getAgent('s1-transient-shell')!;
+      db.updateAgentState('s1-transient-shell', 'failed', a.version, { tmuxSession: 'agent-s1-transient-shell', proxyId: 'p1' });
+      let call = 0;
+      const seqCtx: LifecycleContext = {
+        ...ctx,
+        proxyDispatch: async (_p: string, c: ProxyCommand): Promise<ProxyResponse> => {
+          if (c.action === 'has_session') return { ok: true, data: true };
+          if (c.action === 'display_message') { call++; return { ok: true, data: call === 1 ? 'bash' : 'claude' }; }
+          return { ok: true };
+        },
+      };
+      await killAgent(seqCtx, 's1-transient-shell'); // first read 'bash', re-sample sees 'claude'
+      assert.notEqual(db.getAgent('s1-transient-shell')?.state, 'suspended', 'transient shell NOT reaped');
+      assert.ok(call >= 2, 're-sampled after the first shell read');
+    });
+
+    it('killAgent: CONSISTENT shell (bash×3) → reaped [dead-CLI confirmed]', async () => {
+      db.createAgent({ name: 's1-persist-shell', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      const a = db.getAgent('s1-persist-shell')!;
+      db.updateAgentState('s1-persist-shell', 'failed', a.version, { tmuxSession: 'agent-s1-persist-shell', proxyId: 'p1' });
+      let call = 0;
+      const cmds: ProxyCommand[] = [];
+      const persistCtx: LifecycleContext = {
+        ...ctx,
+        proxyDispatch: async (_p: string, c: ProxyCommand): Promise<ProxyResponse> => {
+          cmds.push(c);
+          if (c.action === 'has_session') return { ok: true, data: true };
+          if (c.action === 'display_message') { call++; return { ok: true, data: 'bash' }; }
+          return { ok: true };
+        },
+      };
+      await killAgent(persistCtx, 's1-persist-shell');
+      assert.equal(db.getAgent('s1-persist-shell')?.state, 'suspended', 'persistent shell reaped');
+      assert.equal(call, 3, 'confirmed with 3 consecutive shell reads before reap');
+      assert.ok(cmds.some(c => c.action === 'kill_session'));
     });
   });
 

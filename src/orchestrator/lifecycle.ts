@@ -1135,6 +1135,13 @@ const RECOVER_TIMEOUT_MS = parseInt(process.env['RECOVER_TIMEOUT_MS'] ?? '60000'
  * UI after death, and an idle-alive agent still owns the pane as `claude` so it is never
  * false-killed (the overshoot direction the gate names make-or-break).
  */
+// Confirm-before-reap (Brienne R1, PR#15 gate): pane_current_command cannot tell a dead-CLI shell
+// from a LIVE agent momentarily foregrounding an interactive shell — both read 'shell' on a single
+// sample. Re-sample: a transient foreground command returns to 'claude'; a genuinely-dead shell
+// persists. Reap only on a CONSISTENT shell read. Live agents return on the FIRST non-shell read
+// (zero added latency); only a shell-reading agent pays the bounded re-sample.
+const SHELL_CONFIRM_SAMPLES = 3;
+
 async function isAgentClaudeRunning(
   ctx: LifecycleContext,
   proxyId: string,
@@ -1144,14 +1151,22 @@ async function isAgentClaudeRunning(
     .catch(() => ({ ok: false }) as ProxyResponse);
   if (!has.ok) return null;          // proxy unreachable — unknown
   if (has.data !== true) return false; // session gone — not running
-  const cmd = await ctx.proxyDispatch(proxyId, {
-    action: 'display_message',
-    sessionName: session,
-    format: '#{pane_current_command}',
-  }).catch(() => ({ ok: false }) as ProxyResponse);
-  if (!cmd.ok) return null;          // couldn't query — unknown
-  // 'shell' → CLI exited to a shell (dead). 'claude'/'other' → alive (refuse reap).
-  return classifyPaneCommand(String(cmd.data ?? '')) !== 'shell';
+
+  // Read dynamically so tests can zero it (avoid slow tests); ~1s between reads in prod.
+  const delayMs = parseInt(process.env['LIVENESS_RESAMPLE_DELAY_MS'] ?? '1000', 10);
+  for (let i = 0; i < SHELL_CONFIRM_SAMPLES; i++) {
+    if (i > 0 && delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+    const cmd = await ctx.proxyDispatch(proxyId, {
+      action: 'display_message',
+      sessionName: session,
+      format: '#{pane_current_command}',
+    }).catch(() => ({ ok: false }) as ProxyResponse);
+    if (!cmd.ok) return null;        // couldn't query — unknown (refuse/defer, never reap)
+    // 'claude'/'other' at ANY sample → alive; refuse the reap immediately.
+    if (classifyPaneCommand(String(cmd.data ?? '')) !== 'shell') return true;
+  }
+  // Consistently 'shell' across all samples → genuinely a dead-CLI shell → reap.
+  return false;
 }
 
 export async function recoverAgent(
