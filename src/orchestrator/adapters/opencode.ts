@@ -29,6 +29,7 @@
  */
 
 import { SPINNER_REGEX, type EngineAdapter, type SpawnOptions, type ResumeOptions, type IdleState, type ContextResult } from './types.ts';
+import { validModelId } from '../../shared/utils.ts';
 
 export class OpenCodeAdapter implements EngineAdapter {
   readonly engine = 'opencode';
@@ -37,8 +38,11 @@ export class OpenCodeAdapter implements EngineAdapter {
   buildSpawnCommand(opts: SpawnOptions): string {
     const parts = ['opencode'];
 
-    if (opts.model) {
-      parts.push('-m', opts.model);
+    // opencode selects the model with -m. Reject a malformed token rather than
+    // push it raw (defends the argv — same class-closure as claude/codex --model).
+    const spawnModel = validModelId(opts.model);
+    if (spawnModel) {
+      parts.push('-m', spawnModel);
     }
 
     if (opts.thinking) {
@@ -58,6 +62,14 @@ export class OpenCodeAdapter implements EngineAdapter {
       // Without a session ID, launch a fresh TUI. The orchestrator should always
       // have a session ID from extractSessionId() after exit.
       // Fall through to plain 'opencode' — better than a broken -c resume.
+    }
+
+    // Pin the model on resume too (class-closure — same resume-drop closed for
+    // claude/codex; opencode selects the model with -m). Reject-validated. DORMANT:
+    // no live opencode agents, so -m-with-resume is unverified against a running TUI.
+    const resumeModel = validModelId(opts.model);
+    if (resumeModel) {
+      parts.push('-m', resumeModel);
     }
 
     return parts.join(' ');

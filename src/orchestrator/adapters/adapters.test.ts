@@ -587,6 +587,20 @@ describe('Engine Adapters', () => {
       assert.equal(cmd, 'opencode --variant high');
     });
 
+    it('REJECTS a shell-unsafe model token on spawn rather than pushing -m raw', () => {
+      const cmd = adapter.buildSpawnCommand({ name: 'oc', cwd: '/tmp', model: 'x; rm -rf /' });
+      assert.ok(!cmd.includes('-m'), 'malformed model must not reach the -m argv');
+      assert.ok(!cmd.includes('rm -rf'), 'no injection payload in the command');
+    });
+
+    it('pins the model with -m on resume (class-closure) and rejects malformed', () => {
+      const ok = adapter.buildResumeCommand({ name: 'oc', cwd: '/tmp', sessionId: 'ses_1', model: 'claude-3.5' });
+      const evil = adapter.buildResumeCommand({ name: 'oc', cwd: '/tmp', sessionId: 'ses_1', model: 'x; rm -rf /' });
+      assert.ok(ok.includes('-m claude-3.5'), 'resume should carry -m for a valid model');
+      assert.ok(ok.includes('-s ses_1'));
+      assert.ok(!evil.includes('-m'), 'malformed model must not reach the resume argv');
+    });
+
     it('builds resume with -s for session ID', () => {
       const cmd = adapter.buildResumeCommand({
         name: 'oc-agent',
