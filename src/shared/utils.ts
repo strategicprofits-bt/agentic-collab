@@ -27,11 +27,22 @@ export function sleep(ms: number): Promise<void> {
  * model token (defends the shell interpolation surface against injection).
  */
 export function buildModelFlag(model: string | null | undefined): string {
-  if (!model) return '';
+  const valid = validModelId(model);
+  return valid ? `--model ${valid}` : '';
+}
+
+/**
+ * Return the trimmed model id if it is a safe token, else null.
+ *
+ * Model identifiers are alphanumerics plus . _ - (e.g. claude-haiku-4-5-20251001).
+ * Anything else is REJECTED (not shell-quoted) so a malformed/hostile value can
+ * never break out of the flag position — whether it is interpolated into a shell
+ * string (buildModelFlag) or pushed as a raw argv token by an engine adapter.
+ * The single source of model-token validity for both paths.
+ */
+export function validModelId(model: string | null | undefined): string | null {
+  if (!model) return null;
   const trimmed = model.trim();
-  // Model identifiers are alphanumerics plus . _ - (e.g. claude-haiku-4-5-20251001).
-  // Anything else is rejected rather than shell-quoted so a malformed/hostile value
-  // can never break out of the flag position in an interpolated shell string.
-  if (!/^[A-Za-z0-9._-]+$/.test(trimmed)) return '';
-  return `--model ${trimmed}`;
+  if (!/^[A-Za-z0-9._-]+$/.test(trimmed)) return null;
+  return trimmed;
 }

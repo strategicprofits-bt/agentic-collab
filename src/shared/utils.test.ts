@@ -1,6 +1,34 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildModelFlag, shellQuote, sleep } from './utils.ts';
+import { buildModelFlag, validModelId, shellQuote, sleep } from './utils.ts';
+
+describe('validModelId', () => {
+  it('returns the trimmed id for a safe model token', () => {
+    assert.equal(validModelId('claude-sonnet-5'), 'claude-sonnet-5');
+    assert.equal(validModelId('claude-haiku-4-5-20251001'), 'claude-haiku-4-5-20251001');
+    assert.equal(validModelId('  opus '), 'opus');
+  });
+
+  it('returns null for empty/unpinned', () => {
+    assert.equal(validModelId(undefined), null);
+    assert.equal(validModelId(null), null);
+    assert.equal(validModelId(''), null);
+    assert.equal(validModelId('   '), null);
+  });
+
+  it('returns null for shell-unsafe values (reject, never quote)', () => {
+    assert.equal(validModelId('sonnet; rm -rf /'), null);
+    assert.equal(validModelId('$(whoami)'), null);
+    assert.equal(validModelId('a b'), null);
+    assert.equal(validModelId("x' --dangerously"), null);
+  });
+
+  it('buildModelFlag is validModelId + the flag prefix (single source of validity)', () => {
+    assert.equal(buildModelFlag('claude-sonnet-5'), '--model claude-sonnet-5');
+    assert.equal(buildModelFlag('sonnet; rm -rf /'), '');
+    assert.equal(buildModelFlag(''), '');
+  });
+});
 
 describe('buildModelFlag', () => {
   it('builds a --model flag for a valid model id', () => {

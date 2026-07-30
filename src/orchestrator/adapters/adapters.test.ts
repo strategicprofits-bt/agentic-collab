@@ -154,6 +154,15 @@ describe('Engine Adapters', () => {
       assert.ok(!cmd.includes('--model'));
     });
 
+    it('REJECTS a shell-unsafe model token rather than pushing it raw (spawn + resume)', () => {
+      const evil = 'x; rm -rf / #';
+      const spawn = adapter.buildSpawnCommand({ name: 'a', cwd: '/tmp', model: evil, sessionId: 'sid' });
+      const resume = adapter.buildResumeCommand({ name: 'a', cwd: '/tmp', model: evil, sessionId: 'sid' });
+      assert.ok(!spawn.includes('--model'), 'malformed model must not reach the spawn argv');
+      assert.ok(!resume.includes('--model'), 'malformed model must not reach the resume argv');
+      assert.ok(!spawn.includes('rm -rf'), 'no injection payload in the command');
+    });
+
     it('builds exit command', () => {
       assert.equal(adapter.buildExitCommand(), '/exit');
     });
@@ -321,6 +330,21 @@ describe('Engine Adapters', () => {
 
     it('supports resume prompt', () => {
       assert.equal(adapter.supportsResumePrompt, true);
+    });
+
+    it('resume command pins --model before the resume subcommand (class-closure)', () => {
+      const cmd = adapter.buildResumeCommand({ name: 'codex-agent', cwd: '/tmp', sessionId: 'sess-1', model: 'gpt-4' });
+      assert.ok(cmd.includes('--model gpt-4'), 'codex resume should carry --model');
+      // --model is a top-level flag, before the `resume` subcommand.
+      assert.ok(cmd.indexOf('--model') < cmd.indexOf('resume'), '--model precedes the resume subcommand');
+      assert.ok(cmd.includes('sess-1'));
+    });
+
+    it('resume command omits --model when unset or malformed', () => {
+      const none = adapter.buildResumeCommand({ name: 'codex-agent', cwd: '/tmp', sessionId: 'sess-1' });
+      const evil = adapter.buildResumeCommand({ name: 'codex-agent', cwd: '/tmp', sessionId: 'sess-1', model: 'x; rm -rf /' });
+      assert.ok(!none.includes('--model'));
+      assert.ok(!evil.includes('--model'));
     });
 
     it('builds spawn command with -p profile when appendSystemPrompt is set', () => {
