@@ -265,20 +265,27 @@ export class Database {
     // hook. The seed is insert-once (main.ts), so an existing DB keeps the old
     // no-model resume string; without the flag a resumed session inherits the
     // model persisted in its transcript, which can be a poisoned CLI-default
-    // (respawn-model-drop defect). Idempotent + exact-fragment-guarded: only
-    // rewrites the pristine default string and never a customized/already-migrated
-    // row.
+    // (respawn-model-drop defect).
+    //
+    // PERMISSION-AGNOSTIC guard: anchor on the `--resume $SESSION_ID ` prefix and
+    // inject $MODEL_FLAG immediately after the session id, regardless of which
+    // permission flag follows. The live DB was seeded from an OLDER default that
+    // used `--permission-mode bypassPermissions`, while the current source seed uses
+    // `--dangerously-skip-permissions` — so an exact-fragment guard on the source
+    // form silently no-ops against the real live row (caught at deploy-verify). The
+    // prefix anchor covers both forms. Still idempotent (skips if $MODEL_FLAG already
+    // present) and scoped to a claude resume hook that actually resumes a session.
     const claudeResume = this.db
       .prepare("SELECT hook_resume FROM engine_configs WHERE name = 'claude'")
       .get() as { hook_resume: string | null } | undefined;
     if (
       claudeResume?.hook_resume &&
-      claudeResume.hook_resume.includes('--resume $SESSION_ID --dangerously-skip-permissions') &&
+      claudeResume.hook_resume.includes('--resume $SESSION_ID ') &&
       !claudeResume.hook_resume.includes('$MODEL_FLAG')
     ) {
       const updated = claudeResume.hook_resume.replace(
-        '--resume $SESSION_ID --dangerously-skip-permissions',
-        '--resume $SESSION_ID $MODEL_FLAG --dangerously-skip-permissions',
+        '--resume $SESSION_ID ',
+        '--resume $SESSION_ID $MODEL_FLAG ',
       );
       this.db.prepare("UPDATE engine_configs SET hook_resume = ? WHERE name = 'claude'").run(updated);
       console.log('[migration] injected $MODEL_FLAG into claude engine_config hook_resume (respawn-model-pin)');
