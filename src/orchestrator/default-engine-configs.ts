@@ -140,8 +140,12 @@ export const DEFAULT_ENGINE_CONFIGS: DefaultEngineConfig[] = [
     // Without it, --resume defaults to manual and the agent stalls on a
     // permission prompt on first tool use — same "lifecycle event leaves agent
     // unable to act" failure family this PR fixes (surfaced by the staged test).
+    // $MODEL_FLAG pins the configured model on resume (expands to "--model <model>"
+    // or "" when unpinned). Without it a resumed session inherits the model persisted
+    // in its transcript, which can be a poisoned CLI-default — the respawn-model-drop
+    // defect. Populated from the agent's effective model in the lifecycle layer.
     hookResume: JSON.stringify([
-      { type: 'shell', command: 'claude --resume $SESSION_ID --dangerously-skip-permissions --append-system-prompt $PERSONA_PROMPT' },
+      { type: 'shell', command: 'claude --resume $SESSION_ID $MODEL_FLAG --dangerously-skip-permissions --append-system-prompt $PERSONA_PROMPT' },
       { type: 'wait', ms: 5000 },
       { type: 'keystroke', key: 'Enter' },
       { type: 'wait', ms: 500 },

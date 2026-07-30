@@ -207,6 +207,70 @@ describe('Database', () => {
         rmSync(legacyDir, { recursive: true, force: true });
       }
     });
+
+    // engine_configs seed is insert-once (main.ts), so an existing DB keeps the
+    // old no-model claude resume hook. This migration injects $MODEL_FLAG so a
+    // resumed session pins its configured model instead of inheriting a possibly
+    // poisoned session-persisted one (respawn-model-drop defect).
+    const ENGINE_CONFIGS_DDL = `
+      CREATE TABLE engine_configs (
+        name TEXT PRIMARY KEY, engine TEXT NOT NULL, model TEXT, thinking TEXT,
+        permissions TEXT, hook_start TEXT, hook_resume TEXT, hook_compact TEXT,
+        hook_exit TEXT, hook_interrupt TEXT, hook_submit TEXT, indicators TEXT,
+        detection TEXT, launch_env TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+      );`;
+    const OLD_CLAUDE_RESUME = JSON.stringify([
+      { type: 'shell', command: 'claude --resume $SESSION_ID --dangerously-skip-permissions --append-system-prompt $PERSONA_PROMPT' },
+    ]);
+
+    it('injects $MODEL_FLAG into a legacy default claude resume hook, idempotently', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'agentic-collab-modelflag-'));
+      const dbPath = join(dir, 'legacy.db');
+      const legacyDb = new DatabaseSync(dbPath);
+      legacyDb.exec(ENGINE_CONFIGS_DDL);
+      legacyDb.prepare('INSERT INTO engine_configs (name, engine, hook_resume) VALUES (?, ?, ?)')
+        .run('claude', 'claude', OLD_CLAUDE_RESUME);
+      legacyDb.close();
+
+      const migrated = new Database(dbPath);
+      try {
+        const row = migrated.rawDb.prepare("SELECT hook_resume FROM engine_configs WHERE name = 'claude'").get() as { hook_resume: string };
+        assert.ok(row.hook_resume.includes('--resume $SESSION_ID $MODEL_FLAG --dangerously-skip-permissions'),
+          'claude resume hook should gain $MODEL_FLAG in the right position');
+        migrated.close();
+
+        // Reopen → migration must not double-inject.
+        const reopened = new Database(dbPath);
+        const row2 = reopened.rawDb.prepare("SELECT hook_resume FROM engine_configs WHERE name = 'claude'").get() as { hook_resume: string };
+        const occurrences = (row2.hook_resume.match(/\$MODEL_FLAG/g) ?? []).length;
+        assert.equal(occurrences, 1, 'reopening must not double-inject $MODEL_FLAG');
+        reopened.close();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('leaves a customized claude resume hook untouched (exact-fragment guard)', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'agentic-collab-modelflag-custom-'));
+      const dbPath = join(dir, 'legacy.db');
+      const CUSTOM = 'claude --resume $SESSION_ID --some-operator-flag --append-system-prompt $PERSONA_PROMPT';
+      const legacyDb = new DatabaseSync(dbPath);
+      legacyDb.exec(ENGINE_CONFIGS_DDL);
+      legacyDb.prepare('INSERT INTO engine_configs (name, engine, hook_resume) VALUES (?, ?, ?)')
+        .run('claude', 'claude', CUSTOM);
+      legacyDb.close();
+
+      const migrated = new Database(dbPath);
+      try {
+        const row = migrated.rawDb.prepare("SELECT hook_resume FROM engine_configs WHERE name = 'claude'").get() as { hook_resume: string };
+        assert.equal(row.hook_resume, CUSTOM, 'a customized resume hook (no old default fragment) must not be rewritten');
+        assert.ok(!row.hook_resume.includes('$MODEL_FLAG'));
+      } finally {
+        migrated.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 
   describe('events', () => {

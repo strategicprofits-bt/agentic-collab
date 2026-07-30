@@ -24,7 +24,7 @@ import type { LockManager } from '../shared/lock.ts';
 import type { ProxyCommand, ProxyResponse, AgentRecord, PipelineStep } from '../shared/types.ts';
 import { classifyPaneCommand } from './pane-liveness.ts';
 import { sessionName, requireProxy, canSuspend, canResume } from '../shared/agent-entity.ts';
-import { shellQuote, sleep } from '../shared/utils.ts';
+import { buildModelFlag, shellQuote, sleep } from '../shared/utils.ts';
 import { getAdapter } from './adapters/index.ts';
 import { resolvePersonaPath, loadPersona, composeSystemPrompt, getPersonasDir, toHostPath } from './persona.ts';
 import { resolveHook } from './hook-resolver.ts';
@@ -411,6 +411,10 @@ function resolveResumeOrStartHook(params: {
         task: params.resumeTask,
         appendSystemPrompt: params.systemPrompt,
         dangerouslySkipPermissions: params.permissions === 'skip',
+        // Pin the configured model on resume (preset path). The shell-string hook
+        // path pins via the $MODEL_FLAG template var instead; both source the model
+        // from the agent's effective config so a resume can't silently drop the pin.
+        model: params.agentRecord.model ?? undefined,
       },
       templateVars: params.templateVars,
     });
@@ -730,6 +734,7 @@ export async function resumeAgent(
       SESSION_ID: resolvedSessionId ?? undefined,
       PERSONA_PROMPT: systemPrompt,
       PERSONA_PROMPT_FILEPATH: personaFile ?? undefined,
+      MODEL_FLAG: buildModelFlag(effectiveCurrent.model),
       capturedVars: phase1.current.capturedVars ?? undefined,
     };
 
@@ -1050,6 +1055,7 @@ export async function reloadAgent(
       SESSION_ID: existingSessionId ?? name,
       PERSONA_PROMPT: systemPrompt,
       PERSONA_PROMPT_FILEPATH: personaFile ?? undefined,
+      MODEL_FLAG: buildModelFlag(effectiveCurrent.model),
       capturedVars: postExitAgent?.capturedVars ?? phase1.current.capturedVars ?? undefined,
     };
 

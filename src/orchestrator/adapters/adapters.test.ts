@@ -131,6 +131,29 @@ describe('Engine Adapters', () => {
       assert.ok(!cmd.includes('--dangerously-skip-permissions'));
     });
 
+    it('resume command pins --model when a model is configured', () => {
+      // Without an explicit --model, `claude --resume` inherits the model persisted
+      // in the session transcript (which can be a poisoned CLI-default). The pin
+      // makes the resumed model deterministic == configured.
+      const cmd = adapter.buildResumeCommand({
+        name: 'test-agent',
+        sessionId: 'abc-123',
+        cwd: '/tmp/test',
+        model: 'claude-sonnet-5',
+      });
+      assert.ok(cmd.includes('--model claude-sonnet-5'));
+      assert.ok(cmd.includes('--resume'));
+    });
+
+    it('resume command omits --model when no model configured (negative control)', () => {
+      const cmd = adapter.buildResumeCommand({
+        name: 'test-agent',
+        sessionId: 'abc-123',
+        cwd: '/tmp/test',
+      });
+      assert.ok(!cmd.includes('--model'));
+    });
+
     it('builds exit command', () => {
       assert.equal(adapter.buildExitCommand(), '/exit');
     });

@@ -33,6 +33,12 @@ export type ResumeOptions = {
   task?: string;
   appendSystemPrompt?: string;
   dangerouslySkipPermissions?: boolean;
+  /**
+   * Model to pin on resume. Injected as `--model` so the resumed session runs the
+   * configured model rather than inheriting the session-persisted one. Omit to let
+   * the engine resolve its default.
+   */
+  model?: string;
 };
 
 export interface EngineAdapter {
