@@ -242,6 +242,20 @@ describe('hook-resolver', () => {
       assert.ok((result as { text: string }).text.includes('opus'));
     });
 
+    it('applies preset options model to resumeOpts (resume pins --model)', () => {
+      // Regression guard for the respawn-model-drop defect: the preset resume path
+      // must carry --model, not silently drop it (it previously returned context
+      // unchanged for resume, so a resumed session inherited the session-persisted
+      // model instead of the configured one).
+      const agent = makeAgent();
+      const result = resolveHook('resume', { preset: 'claude', options: { model: 'claude-sonnet-5' } }, agent, {
+        resumeOpts: { name: 'test-agent', sessionId: 'sess-123', cwd: '/tmp' },
+      });
+      assert.equal(result.mode, 'paste');
+      assert.ok((result as { text: string }).text.includes('--model claude-sonnet-5'));
+      assert.ok((result as { text: string }).text.includes('--resume'));
+    });
+
     it('applies permissions skip from preset options', () => {
       const agent = makeAgent();
       const result = resolveHook('start', { preset: 'claude', options: { permissions: 'skip' } }, agent, {
@@ -519,6 +533,34 @@ describe('hook-resolver', () => {
       // This is expected — shell hooks should use actual shell env vars via export
       const result = interpolateTemplateVars('echo $HOME $AGENT_NAME', { AGENT_NAME: 'bot' });
       assert.equal(result, 'echo  bot');
+    });
+
+    it('injects $MODEL_FLAG into the fleet resume hook when pinned', () => {
+      // Mirrors the real default claude hookResume string. A pinned agent gets an
+      // explicit --model so the resumed session runs the configured model.
+      const result = interpolateTemplateVars(
+        'claude --resume $SESSION_ID $MODEL_FLAG --dangerously-skip-permissions --append-system-prompt $PERSONA_PROMPT',
+        {
+          SESSION_ID: 'abc-123',
+          MODEL_FLAG: '--model claude-sonnet-5',
+          PERSONA_PROMPT: 'persona',
+        },
+      );
+      assert.equal(
+        result,
+        "claude --resume abc-123 --model claude-sonnet-5 --dangerously-skip-permissions --append-system-prompt 'persona'",
+      );
+    });
+
+    it('leaves the resume hook flagless when $MODEL_FLAG is empty (negative control)', () => {
+      // Unpinned agent: buildModelFlag('') → '' → no --model injected → the CLI
+      // resolves its intended default. The empty expansion collapses cleanly.
+      const result = interpolateTemplateVars(
+        'claude --resume $SESSION_ID $MODEL_FLAG --dangerously-skip-permissions',
+        { SESSION_ID: 'abc-123', MODEL_FLAG: '' },
+      );
+      assert.ok(!result.includes('--model'));
+      assert.ok(result.includes('--resume abc-123'));
     });
   });
 

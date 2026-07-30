@@ -53,6 +53,13 @@ export type TemplateVars = {
   PERSONA_PROMPT?: string;
   /** Path to the persona prompt file on disk */
   PERSONA_PROMPT_FILEPATH?: string;
+  /**
+   * `--model <model>` flag fragment (or '' when unpinned), for injection into
+   * shell-string spawn/resume hooks so a respawned session runs its CONFIGURED
+   * model instead of inheriting the session-persisted one. Built via
+   * buildModelFlag() from the agent's effective model.
+   */
+  MODEL_FLAG?: string;
   /** Captured variables from pipeline capture steps (fallback for $VAR interpolation) */
   capturedVars?: Record<string, string>;
 };
@@ -241,7 +248,19 @@ function applyPresetOptions(hook: PresetHook, context?: HookContext): HookContex
     };
   }
 
-  // Apply to resume opts — model and thinking don't apply to resume
+  // Apply to resume opts — an explicit --model DOES apply on resume: it overrides
+  // the model persisted in the resumed session (which can be a poisoned CLI-default),
+  // making the running model deterministic instead of inherited. thinking still
+  // does not apply on resume.
+  if (context.resumeOpts) {
+    return {
+      ...context,
+      resumeOpts: {
+        ...context.resumeOpts,
+        model: hook.options.model ?? context.resumeOpts.model,
+      },
+    };
+  }
   return context;
 }
 

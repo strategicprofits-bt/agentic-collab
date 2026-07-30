@@ -1,6 +1,35 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { shellQuote, sleep } from './utils.ts';
+import { buildModelFlag, shellQuote, sleep } from './utils.ts';
+
+describe('buildModelFlag', () => {
+  it('builds a --model flag for a valid model id', () => {
+    assert.equal(buildModelFlag('claude-sonnet-5'), '--model claude-sonnet-5');
+    assert.equal(buildModelFlag('claude-haiku-4-5-20251001'), '--model claude-haiku-4-5-20251001');
+    assert.equal(buildModelFlag('opus'), '--model opus');
+  });
+
+  it('returns empty string for an unpinned model (negative control)', () => {
+    // An unpinned agent MUST still resolve to its intended default — no flag injected.
+    assert.equal(buildModelFlag(undefined), '');
+    assert.equal(buildModelFlag(null), '');
+    assert.equal(buildModelFlag(''), '');
+    assert.equal(buildModelFlag('   '), '');
+  });
+
+  it('trims surrounding whitespace before building the flag', () => {
+    assert.equal(buildModelFlag('  claude-sonnet-5 '), '--model claude-sonnet-5');
+  });
+
+  it('rejects shell-unsafe values rather than injecting them', () => {
+    // Defends the shell-interpolation surface: anything outside [A-Za-z0-9._-] is
+    // dropped (empty flag), so a hostile model value can never break out of the flag.
+    assert.equal(buildModelFlag('sonnet; rm -rf /'), '');
+    assert.equal(buildModelFlag('$(whoami)'), '');
+    assert.equal(buildModelFlag('a b'), '');
+    assert.equal(buildModelFlag("x' --dangerously"), '');
+  });
+});
 
 describe('shellQuote', () => {
   it('wraps simple strings in single quotes', () => {

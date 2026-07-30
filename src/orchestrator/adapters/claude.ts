@@ -54,6 +54,14 @@ export class ClaudeAdapter implements EngineAdapter {
       parts.push('--resume', opts.sessionId);
     }
 
+    // Pin the model explicitly on resume. Without it, `claude --resume` inherits
+    // the model recorded in the session transcript — which can be a poisoned
+    // CLI-default if the session was ever created without --model. Mirrors
+    // buildSpawnCommand so spawn and resume resolve the same configured model.
+    if (opts.model) {
+      parts.push('--model', opts.model);
+    }
+
     if (opts.appendSystemPrompt) {
       parts.push('--append-system-prompt', shellQuote(opts.appendSystemPrompt));
     }

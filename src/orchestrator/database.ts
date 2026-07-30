@@ -261,6 +261,29 @@ export class Database {
       }
     }
 
+    // Data migration: inject the $MODEL_FLAG template var into the claude resume
+    // hook. The seed is insert-once (main.ts), so an existing DB keeps the old
+    // no-model resume string; without the flag a resumed session inherits the
+    // model persisted in its transcript, which can be a poisoned CLI-default
+    // (respawn-model-drop defect). Idempotent + exact-fragment-guarded: only
+    // rewrites the pristine default string and never a customized/already-migrated
+    // row.
+    const claudeResume = this.db
+      .prepare("SELECT hook_resume FROM engine_configs WHERE name = 'claude'")
+      .get() as { hook_resume: string | null } | undefined;
+    if (
+      claudeResume?.hook_resume &&
+      claudeResume.hook_resume.includes('--resume $SESSION_ID --dangerously-skip-permissions') &&
+      !claudeResume.hook_resume.includes('$MODEL_FLAG')
+    ) {
+      const updated = claudeResume.hook_resume.replace(
+        '--resume $SESSION_ID --dangerously-skip-permissions',
+        '--resume $SESSION_ID $MODEL_FLAG --dangerously-skip-permissions',
+      );
+      this.db.prepare("UPDATE engine_configs SET hook_resume = ? WHERE name = 'claude'").run(updated);
+      console.log('[migration] injected $MODEL_FLAG into claude engine_config hook_resume (respawn-model-pin)');
+    }
+
     // Create data_stores table
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS data_stores (
