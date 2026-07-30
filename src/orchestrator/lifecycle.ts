@@ -427,6 +427,12 @@ function resolveResumeOrStartHook(params: {
     spawnOpts: {
       name: params.name,
       cwd: params.cwd,
+      // Poison-minting prevention: a session created without --model persists the
+      // CLI default in its transcript, which flag-less resumes then re-inherit. Pin
+      // the configured model on EVERY session-creation path so no session is minted
+      // model-less. (Preset buildSpawnCommand path; custom shell-hooks pin via their
+      // own --model. Sourced from the agent's effective config.)
+      model: params.agentRecord.model ?? undefined,
       task: params.startTask,
       appendSystemPrompt: params.systemPrompt,
       dangerouslySkipPermissions: params.permissions === 'skip',
@@ -569,6 +575,7 @@ export async function spawnAgent(
       SESSION_ID: generatedSessionId,
       PERSONA_PROMPT: systemPrompt,
       PERSONA_PROMPT_FILEPATH: personaFile ?? undefined,
+      MODEL_FLAG: buildModelFlag(effectiveCurrent.model),
       capturedVars: phase1.current.capturedVars ?? undefined,
     };
     const startResult = resolveHook('start', hookStart, effectiveCurrent, {
@@ -1279,6 +1286,7 @@ export async function recoverAgent(
       SESSION_ID: generatedSessionId,
       PERSONA_PROMPT: systemPrompt,
       PERSONA_PROMPT_FILEPATH: personaFile ?? undefined,
+      MODEL_FLAG: buildModelFlag(effectiveCurrent.model),
     };
 
     const recoveryTask = [
@@ -1295,6 +1303,10 @@ export async function recoverAgent(
       spawnOpts: {
         name,
         cwd,
+        // Poison-minting prevention (auto-recovery spawn path): mint the recovered
+        // session WITH the configured model so a later flag-less resume cannot
+        // inherit a CLI-default. Sourced from the agent's effective config.
+        model: effectiveCurrent.model ?? undefined,
         task: recoveryTask,
         appendSystemPrompt: systemPrompt,
         dangerouslySkipPermissions: permissions === 'skip',

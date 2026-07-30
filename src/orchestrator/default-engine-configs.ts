@@ -128,8 +128,10 @@ export const DEFAULT_ENGINE_CONFIGS: DefaultEngineConfig[] = [
     // templateVars); no need to scrape it from the /status modal afterward.
     // The old /status+capture+Escape triplet could leave the modal open on
     // the pane, swallowing subsequently-delivered messages (inbound parking).
+    // $MODEL_FLAG (not a hardcoded --model) so a preset-start agent spawns with its
+    // DECLARED model (or the CLI default when unpinned) instead of a forced 'opus'.
     hookStart: JSON.stringify([
-      { type: 'shell', command: 'claude --dangerously-skip-permissions --model opus --effort max --session-id $SESSION_ID --append-system-prompt $PERSONA_PROMPT' },
+      { type: 'shell', command: 'claude --dangerously-skip-permissions $MODEL_FLAG --effort max --session-id $SESSION_ID --append-system-prompt $PERSONA_PROMPT' },
       { type: 'wait', ms: 5000 },
       { type: 'keystroke', key: 'Enter' },
       { type: 'wait', ms: 500 },
@@ -173,7 +175,7 @@ export const DEFAULT_ENGINE_CONFIGS: DefaultEngineConfig[] = [
     hookReload: JSON.stringify([
       { type: 'shell', command: '/exit' },
       { type: 'wait', ms: 10000 },
-      { type: 'shell', command: 'claude --dangerously-skip-permissions --model opus --effort max --session-id $SESSION_ID --append-system-prompt $PERSONA_PROMPT' },
+      { type: 'shell', command: 'claude --dangerously-skip-permissions $MODEL_FLAG --effort max --session-id $SESSION_ID --append-system-prompt $PERSONA_PROMPT' },
       { type: 'wait', ms: 5000 },
       { type: 'keystroke', key: 'Enter' },
       { type: 'wait', ms: 500 },

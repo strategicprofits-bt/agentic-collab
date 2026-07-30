@@ -3,7 +3,7 @@
  */
 
 import { SPINNER_REGEX, type EngineAdapter, type SpawnOptions, type ResumeOptions, type IdleState, type ContextResult } from './types.ts';
-import { shellQuote } from '../../shared/utils.ts';
+import { shellQuote, validModelId } from '../../shared/utils.ts';
 
 export class ClaudeAdapter implements EngineAdapter {
   readonly engine = 'claude';
@@ -16,8 +16,10 @@ export class ClaudeAdapter implements EngineAdapter {
       parts.push('--dangerously-skip-permissions');
     }
 
-    if (opts.model) {
-      parts.push('--model', opts.model);
+    // Reject a malformed model token rather than push it raw (defends the argv).
+    const spawnModel = validModelId(opts.model);
+    if (spawnModel) {
+      parts.push('--model', spawnModel);
     }
 
     // Claude Code uses --effort for reasoning effort (low, medium, high)
@@ -58,8 +60,10 @@ export class ClaudeAdapter implements EngineAdapter {
     // the model recorded in the session transcript — which can be a poisoned
     // CLI-default if the session was ever created without --model. Mirrors
     // buildSpawnCommand so spawn and resume resolve the same configured model.
-    if (opts.model) {
-      parts.push('--model', opts.model);
+    // Reject a malformed model token rather than push it raw (defends the argv).
+    const resumeModel = validModelId(opts.model);
+    if (resumeModel) {
+      parts.push('--model', resumeModel);
     }
 
     if (opts.appendSystemPrompt) {

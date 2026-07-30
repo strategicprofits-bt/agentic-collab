@@ -9,7 +9,7 @@
  */
 
 import { SPINNER_REGEX, type EngineAdapter, type SpawnOptions, type ResumeOptions, type IdleState, type ContextResult } from './types.ts';
-import { shellQuote } from '../../shared/utils.ts';
+import { shellQuote, validModelId } from '../../shared/utils.ts';
 
 export class CodexAdapter implements EngineAdapter {
   readonly engine = 'codex';
@@ -28,8 +28,9 @@ export class CodexAdapter implements EngineAdapter {
     // --dangerously-bypass-approvals-and-sandbox is always on for unattended tmux sessions.
     // Without it, the TUI hangs waiting for interactive approval prompts.
 
-    if (opts.model) {
-      parts.push('--model', opts.model);
+    const spawnModel = validModelId(opts.model);
+    if (spawnModel) {
+      parts.push('--model', spawnModel);
     }
 
     // System prompt is injected via config profile, not -c flag.
@@ -46,7 +47,17 @@ export class CodexAdapter implements EngineAdapter {
   }
 
   buildResumeCommand(opts: ResumeOptions): string {
-    const parts = ['codex', '--dangerously-bypass-approvals-and-sandbox', '--no-alt-screen', 'resume'];
+    const parts = ['codex', '--dangerously-bypass-approvals-and-sandbox', '--no-alt-screen'];
+
+    // Pin the model on resume too (class-closure — same drop-on-resume gap the
+    // claude adapter fixed). --model is a top-level flag, placed before the `resume`
+    // subcommand to mirror buildSpawnCommand. DORMANT: no live codex agents, so this
+    // position is unverified against a running codex CLI.
+    const resumeModel = validModelId(opts.model);
+    if (resumeModel) {
+      parts.push('--model', resumeModel);
+    }
+    parts.push('resume');
 
     if (opts.sessionId) {
       parts.push(opts.sessionId);
