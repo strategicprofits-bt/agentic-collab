@@ -2,6 +2,7 @@ import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { Database } from './database.ts';
+import { DEFAULT_ENGINE_CONFIGS } from './default-engine-configs.ts';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -279,6 +280,70 @@ describe('Database', () => {
         const row = migrated.rawDb.prepare("SELECT hook_resume FROM engine_configs WHERE name = 'claude'").get() as { hook_resume: string };
         assert.equal(row.hook_resume, CUSTOM, 'a resume hook without --resume $SESSION_ID must not be rewritten');
         assert.ok(!row.hook_resume.includes('$MODEL_FLAG'));
+      } finally {
+        migrated.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    // GAP-051: the live default claude hook_start was seeded from an OLD form that
+    // omitted --session-id (+ used the /status modal-scrape + hardcoded --model opus).
+    // Reseed it to the canonical seed form (which has --session-id + $MODEL_FLAG, no
+    // /status) so a preset-start spawn mints a DB-tracked session, not a self-generated
+    // one that fails "No conversation found" on resume.
+    const STALE_HOOK_START = JSON.stringify([
+      { type: 'shell', command: 'claude --dangerously-skip-permissions --model opus --effort max --append-system-prompt $PERSONA_PROMPT' },
+      { type: 'wait', ms: 5000 },
+      { type: 'shell', command: '/status' },
+      { type: 'capture', pattern: '[0-9a-f-]{36}' },
+      { type: 'keystroke', key: 'Enter' },
+    ]);
+    const CANONICAL_HOOK_START = DEFAULT_ENGINE_CONFIGS.find((c) => c.name === 'claude')!.hookStart!;
+
+    it('reseeds a stale claude hook_start (missing --session-id) to the canonical form, idempotently', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'agentic-collab-hookstart-'));
+      const dbPath = join(dir, 'legacy.db');
+      const legacyDb = new DatabaseSync(dbPath);
+      legacyDb.exec(ENGINE_CONFIGS_DDL);
+      legacyDb.prepare('INSERT INTO engine_configs (name, engine, hook_start) VALUES (?, ?, ?)')
+        .run('claude', 'claude', STALE_HOOK_START);
+      legacyDb.close();
+
+      const migrated = new Database(dbPath);
+      try {
+        const row = migrated.rawDb.prepare("SELECT hook_start FROM engine_configs WHERE name = 'claude'").get() as { hook_start: string };
+        // Fixes all three defects at once, and equals the canonical seed exactly.
+        assert.equal(row.hook_start, CANONICAL_HOOK_START, 'stale hook_start should be reseeded to canonical');
+        assert.ok(row.hook_start.includes('--session-id'), '+--session-id');
+        assert.ok(row.hook_start.includes('$MODEL_FLAG'), '+$MODEL_FLAG (not --model opus)');
+        assert.ok(!row.hook_start.includes('/status'), 'drop /status');
+        assert.ok(!row.hook_start.includes('--model opus'), 'no hardcoded opus');
+        migrated.close();
+
+        // Idempotent: canonical contains --session-id → reopen must not re-fire/alter it.
+        const reopened = new Database(dbPath);
+        const row2 = reopened.rawDb.prepare("SELECT hook_start FROM engine_configs WHERE name = 'claude'").get() as { hook_start: string };
+        assert.equal(row2.hook_start, CANONICAL_HOOK_START, 'reopening must leave the reseeded hook_start unchanged');
+        reopened.close();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('leaves a claude hook_start that already has --session-id untouched', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'agentic-collab-hookstart-ok-'));
+      const dbPath = join(dir, 'legacy.db');
+      const CUSTOM_OK = 'claude --my-custom-flag --session-id $SESSION_ID --append-system-prompt $PERSONA_PROMPT';
+      const legacyDb = new DatabaseSync(dbPath);
+      legacyDb.exec(ENGINE_CONFIGS_DDL);
+      legacyDb.prepare('INSERT INTO engine_configs (name, engine, hook_start) VALUES (?, ?, ?)')
+        .run('claude', 'claude', CUSTOM_OK);
+      legacyDb.close();
+
+      const migrated = new Database(dbPath);
+      try {
+        const row = migrated.rawDb.prepare("SELECT hook_start FROM engine_configs WHERE name = 'claude'").get() as { hook_start: string };
+        assert.equal(row.hook_start, CUSTOM_OK, 'a hook_start already carrying --session-id must not be reseeded');
       } finally {
         migrated.close();
         rmSync(dir, { recursive: true, force: true });

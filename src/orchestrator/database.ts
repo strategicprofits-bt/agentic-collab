@@ -32,6 +32,7 @@ import {
   serializeUpsertParams,
   buildMigrationStatements,
 } from './field-registry.ts';
+import { DEFAULT_ENGINE_CONFIGS } from './default-engine-configs.ts';
 
 const SCHEMA = `
   PRAGMA journal_mode = WAL;
@@ -289,6 +290,29 @@ export class Database {
       );
       this.db.prepare("UPDATE engine_configs SET hook_resume = ? WHERE name = 'claude'").run(updated);
       console.log('[migration] injected $MODEL_FLAG into claude engine_config hook_resume (respawn-model-pin)');
+    }
+
+    // GAP-051: reseed the claude default hook_start if it lacks --session-id. The
+    // insert-once seed means an existing DB keeps an OLD default form that omitted
+    // --session-id (and used the /status modal-scrape + a hardcoded --model opus).
+    // Without --session-id at spawn, claude self-generates a session id the DB does
+    // not track → a later resume `--resume <db-id>` fails "No conversation found";
+    // the /status-scrape can also capture a FOREIGN session id from the shared tmux
+    // pane. Align it to the current canonical seed (which carries --session-id +
+    // $MODEL_FLAG and drops the /status step) — three defects fixed in one row.
+    // Idempotent: the canonical form contains --session-id, so this never re-fires.
+    // Scoped to the defining defect (missing --session-id); no real agent uses the
+    // engine-default start hook (all have agent-level custom start hooks), so a claude
+    // default hook_start missing --session-id IS the stale form, not a customization.
+    const claudeStart = this.db
+      .prepare("SELECT hook_start FROM engine_configs WHERE name = 'claude'")
+      .get() as { hook_start: string | null } | undefined;
+    if (claudeStart?.hook_start && !claudeStart.hook_start.includes('--session-id')) {
+      const canonical = DEFAULT_ENGINE_CONFIGS.find((c) => c.name === 'claude')?.hookStart;
+      if (canonical) {
+        this.db.prepare("UPDATE engine_configs SET hook_start = ? WHERE name = 'claude'").run(canonical);
+        console.log('[migration] reseeded claude engine_config hook_start (GAP-051: +--session-id +$MODEL_FLAG, drop /status)');
+      }
     }
 
     // Create data_stores table
