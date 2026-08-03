@@ -86,6 +86,10 @@ const SCHEMA = `
   );
 
   CREATE INDEX IF NOT EXISTS idx_dm_agent ON dashboard_messages(agent);
+  -- GAP-026 T0: getDashboardThreads()/searchMessages() ORDER BY created_at with no
+  -- supporting index → full scan + temp-b-tree sort of the whole table on the shared
+  -- event loop. Index the sort/filter column so those reads stop stalling heartbeats.
+  CREATE INDEX IF NOT EXISTS idx_dm_created ON dashboard_messages(created_at);
 
   CREATE TABLE IF NOT EXISTS proxies (
     proxy_id      TEXT PRIMARY KEY,
@@ -1393,6 +1397,47 @@ export class Database {
       "DELETE FROM agent_token_snapshots WHERE captured_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)"
     ).run(`-${retentionDays} days`);
     return result.changes;
+  }
+
+  /**
+   * High-volume operational-CHURN event types that are safe to age out. These are
+   * pure state-transition noise (idle/active flips) with no audit value beyond a
+   * few minutes — the only reader, hasActivitySince(), looks back seconds/minutes.
+   * Audit-relevant classes (spawned, killed, session_death_*, proxy_disconnected,
+   * suspended, …) are NEVER listed here → kept indefinitely for incident forensics.
+   * NOTE: 'idle_timeout_exceeded' is intentionally EXCLUDED — its emitter was removed
+   * (0 written in 30d), so ongoing retention has nothing to do for it; the historical
+   * 1.36M-row scar is cleared once by the controlled GAP-026 T0 ops cleanup, keeping
+   * that class's write out of this steady-state path. See docs/gap-026-loadspike-rootcause.md.
+   */
+  private static readonly CHURN_EVENT_TYPES = ['idle_detected', 'activity_detected'] as const;
+
+  /**
+   * Prune churn events older than the retention window. BATCHED by construction:
+   * each iteration deletes at most `batchSize` rows in its own transaction, so even
+   * a large backlog can never hold SQLite's single-writer lock long enough to stall
+   * heartbeat processing on the shared event loop (the exact GAP-026 failure this
+   * mitigates). Runs off the low-frequency maintenance tick, never the hot path.
+   * Returns the total rows pruned this invocation.
+   */
+  pruneChurnEvents(retentionDays = 14, batchSize = 5000, maxBatches = 100): number {
+    const types = Database.CHURN_EVENT_TYPES;
+    const placeholders = types.map(() => '?').join(',');
+    const stmt = this.db.prepare(
+      `DELETE FROM events WHERE id IN (
+         SELECT id FROM events
+         WHERE event IN (${placeholders})
+           AND created_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)
+         LIMIT ?
+       )`
+    );
+    let total = 0;
+    for (let i = 0; i < maxBatches; i++) {
+      const changes = Number(stmt.run(...types, `-${retentionDays} days`, batchSize).changes);
+      total += changes;
+      if (changes < batchSize) break; // fewer than a full batch ⇒ drained
+    }
+    return total;
   }
 }
 

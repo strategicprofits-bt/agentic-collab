@@ -1,4 +1,4 @@
-import { describe, it, before, after, beforeEach } from 'node:test';
+import { describe, it, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { Database } from './database.ts';
@@ -1310,5 +1310,84 @@ describe('Database', () => {
       // May be 0 if no old rows exist for this agent (other agents may have old rows)
       assert.equal(typeof deleted, 'number');
     });
+  });
+});
+
+describe('GAP-026 T0: churn-event retention + dashboard index', () => {
+  let db: Database;
+  let tmpDir: string;
+  let dbPath: string;
+
+  // Insert an event with an explicit backdated created_at via a second connection
+  // (logEvent always stamps 'now', so the retention window can't be exercised through it).
+  const backdate = (raw: DatabaseSync, agent: string, event: string, daysAgo: number) => {
+    raw.prepare(
+      "INSERT INTO events (agent_name, event, created_at) VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%SZ','now',?))"
+    ).run(agent, event, `-${daysAgo} days`);
+  };
+  const countEvent = (event: string): number => {
+    const raw = new DatabaseSync(dbPath);
+    const n = (raw.prepare('SELECT COUNT(*) AS n FROM events WHERE event = ?').get(event) as { n: number }).n;
+    raw.close();
+    return n;
+  };
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'agentic-collab-t0-'));
+    dbPath = join(tmpDir, 'test.db');
+    db = new Database(dbPath);
+  });
+  afterEach(() => {
+    db.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('creates the dashboard_messages(created_at) index on init', () => {
+    const raw = new DatabaseSync(dbPath);
+    const row = raw.prepare(
+      "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_dm_created'"
+    ).get();
+    raw.close();
+    assert.ok(row, 'idx_dm_created should exist after init');
+  });
+
+  it('prunes only OLD churn events; keeps recent churn AND all audit classes', () => {
+    const raw = new DatabaseSync(dbPath);
+    backdate(raw, 'A', 'idle_detected', 30);        // old churn → prune
+    backdate(raw, 'A', 'activity_detected', 30);    // old churn → prune
+    backdate(raw, 'A', 'idle_detected', 1);         // recent churn → keep (window)
+    backdate(raw, 'A', 'killed', 30);               // old AUDIT → keep (scope proof)
+    backdate(raw, 'A', 'session_death_alert_sent', 30); // old AUDIT → keep
+    backdate(raw, 'A', 'idle_timeout_exceeded', 30);    // dead firehose, EXCLUDED from retention → keep
+    raw.close();
+
+    const pruned = db.pruneChurnEvents(14);
+    assert.equal(pruned, 2, 'exactly the two >14d churn rows');
+
+    assert.equal(countEvent('idle_detected'), 1, 'recent idle_detected retained');
+    assert.equal(countEvent('activity_detected'), 0, 'old activity_detected pruned');
+    assert.equal(countEvent('killed'), 1, 'audit class never pruned');
+    assert.equal(countEvent('session_death_alert_sent'), 1, 'audit class never pruned');
+    assert.equal(countEvent('idle_timeout_exceeded'), 1, 'excluded dead class untouched by retention');
+  });
+
+  it('batches a large backlog (drains via the loop, no single giant delete)', () => {
+    const raw = new DatabaseSync(dbPath);
+    for (let i = 0; i < 12; i++) backdate(raw, 'A', 'idle_detected', 30);
+    raw.close();
+
+    const pruned = db.pruneChurnEvents(14, 5); // batchSize 5 → 5+5+2
+    assert.equal(pruned, 12, 'all backlog drained across batches');
+    assert.equal(countEvent('idle_detected'), 0);
+  });
+
+  it('respects the maxBatches cap (bounded work per invocation)', () => {
+    const raw = new DatabaseSync(dbPath);
+    for (let i = 0; i < 10; i++) backdate(raw, 'A', 'idle_detected', 30);
+    raw.close();
+
+    const pruned = db.pruneChurnEvents(14, 2, 3); // batchSize 2 × maxBatches 3 = at most 6
+    assert.equal(pruned, 6, 'capped at batchSize*maxBatches');
+    assert.equal(countEvent('idle_detected'), 4, 'remainder cleared on a later run');
   });
 });

@@ -398,11 +398,27 @@ const staleProxyTimer = setInterval(() => {
   }
 }, 30_000);
 
+// ── Maintenance: cap high-volume churn-event bloat (GAP-026 T0) ──
+// Off the hot path (6h tick). db.pruneChurnEvents is batched by construction, so
+// even a large backlog can never hold SQLite's single-writer lock long enough to
+// stall heartbeat processing — the exact false-proxy-disconnect failure this
+// mitigates. Audit-relevant event classes are never touched; only idle/activity
+// churn older than the retention window. See docs/gap-026-loadspike-rootcause.md.
+const eventRetentionTimer = setInterval(() => {
+  try {
+    const pruned = db.pruneChurnEvents(14);
+    if (pruned > 0) console.log(`[maintenance] Pruned ${pruned} churn events older than 14d`);
+  } catch (err) {
+    console.error('[maintenance] Churn-event retention failed:', err);
+  }
+}, 6 * 60 * 60 * 1000);
+
 // ── Graceful Shutdown ──
 
 async function shutdown(): Promise<void> {
   console.log('[orchestrator] Shutting down...');
   clearInterval(staleProxyTimer);
+  clearInterval(eventRetentionTimer);
   telegramDispatcher.stopPolling();
   healthMonitor.stop();
   messageDispatcher.stop();
