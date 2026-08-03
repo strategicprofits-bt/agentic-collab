@@ -32,6 +32,7 @@
  */
 'use strict';
 const { DatabaseSync } = require('node:sqlite');
+const fs = require('node:fs');
 
 const TARGET = 'idle_timeout_exceeded';
 const DB_FILE = process.env.DB_FILE || '/data/.agentic-collab/orchestrator.db';
@@ -48,6 +49,37 @@ function histogram(db) {
   return h;
 }
 function total(h) { return Object.values(h).reduce((a, b) => a + b, 0); }
+
+// Event types the ONGOING pruneChurnEvents retention job legitimately deletes post-deploy. Their
+// count may move in EITHER direction during an --execute run (live inserts up, a retention tick
+// down), so their direction is NOT a safety signal for THIS delete → excluded from the cross-class
+// check. Kept in sync with Database.CHURN_EVENT_TYPES.
+const RETENTION_MANAGED = new Set(['idle_detected', 'activity_detected']);
+
+/**
+ * LIVE-ROBUST verify (no quiescence assumed). The orchestrator writes continuously DURING the run,
+ * so an equality/"every class unchanged" check false-fails a CORRECT delete — and its spurious
+ * "rollback" advice would drop every audit row written since backup = real forensic loss. Robust
+ * invariants that hold on a live DB:
+ *   - HARD: after[TARGET] === 0          — dead emitter, nothing re-writes the target.
+ *   - HARD: deletedSum === targetCount   — only this script touches TARGET; bounds total deletion to
+ *                                          exactly the target rows (also the over-deletion backstop:
+ *                                          deleting any non-target row would push deletedSum > target).
+ *   - AUDIT classes (everything except TARGET and the retention-managed churn) may only stay-equal
+ *     or INCREASE; a DECREASE means my delete wrongly removed a non-target row = real violation.
+ * Total-count equality is intentionally NOT asserted (concurrent inserts + the retention tick both
+ * move it legitimately) — printed as informational only.
+ */
+function verifyCleanup(before, after, deletedSum, targetCount) {
+  const problems = [];
+  if ((after[TARGET] || 0) !== 0) problems.push(`target '${TARGET}' not fully removed: ${after[TARGET] || 0} remain`);
+  if (deletedSum !== targetCount) problems.push(`deletedSum ${deletedSum} != before target ${targetCount}`);
+  for (const [k, v] of Object.entries(before)) {
+    if (k === TARGET || RETENTION_MANAGED.has(k)) continue;
+    if ((after[k] || 0) < v) problems.push(`class '${k}' DECREASED ${v} -> ${after[k] || 0} (my delete must never remove a non-target row)`);
+  }
+  return { ok: problems.length === 0, problems };
+}
 
 function main() {
   const db = new DatabaseSync(DB_FILE);
@@ -69,6 +101,18 @@ function main() {
     console.log('No writes performed. Re-run with --execute (under gate + merge-auth) to apply.');
     db.close();
     return;
+  }
+
+  // 0) FREE-SPACE PRE-CHECK — VACUUM INTO writes a full copy; require free >= current DB size.
+  //    Checked BEFORE any write (fail-safe ordering) so we never half-run on a full disk.
+  const dbBytes = fs.statSync(DB_FILE).size;
+  const vfs = fs.statfsSync(DB_FILE);
+  const freeBytes = vfs.bavail * vfs.bsize;
+  console.log(`\n[0/3] free space: DB=${(dbBytes / 1e6).toFixed(0)}MB  free=${(freeBytes / 1e6).toFixed(0)}MB`);
+  if (freeBytes < dbBytes) {
+    console.error(`      ✗ insufficient free space for VACUUM INTO backup (need >= ${(dbBytes / 1e6).toFixed(0)}MB). Aborting before any write.`);
+    db.close();
+    process.exit(1);
   }
 
   // 1) BACKUP-FIRST (consistent copy; does not lock out the orchestrator)
@@ -93,27 +137,23 @@ function main() {
   }
   console.log(`      deleted ${deletedSum} rows across ${batches} batches.`);
 
-  // 3) COUNT-VERIFY every invariant
+  // 3) COUNT-VERIFY (live-robust — see verifyCleanup)
   console.log('[3/3] VERIFY ...');
   const after = histogram(db);
   const afterTotal = total(after);
-  const problems = [];
-  if ((after[TARGET] || 0) !== 0) problems.push(`target not fully removed: ${after[TARGET]} remain`);
-  if (deletedSum !== targetCount) problems.push(`deletedSum ${deletedSum} != before target ${targetCount}`);
-  if (afterTotal !== beforeTotal - targetCount) problems.push(`total ${afterTotal} != expected ${beforeTotal - targetCount}`);
-  for (const [k, v] of Object.entries(before)) {
-    if (k === TARGET) continue;
-    if ((after[k] || 0) !== v) problems.push(`class '${k}' changed: ${v} -> ${after[k] || 0} (MUST be unchanged)`);
-  }
+  const { ok, problems } = verifyCleanup(before, after, deletedSum, targetCount);
   db.close();
 
-  if (problems.length) {
-    console.error('\nVERIFY FAILED — no live class should have changed:');
+  if (!ok) {
+    console.error('\nVERIFY FAILED:');
     for (const p of problems) console.error(`  ✗ ${p}`);
     console.error(`Backup preserved at ${backup} for rollback.`);
     process.exit(1);
   }
-  console.log(`      OK: '${TARGET}' -> 0; all ${Object.keys(before).length - 1} other classes unchanged; total ${beforeTotal} -> ${afterTotal} (-${targetCount}).`);
+  console.log(`      OK: '${TARGET}' -> 0; deletedSum ${deletedSum} == target ${targetCount}; no audit class decreased.`);
+  console.log(`      totals (informational, live-DB moves legitimately): ${beforeTotal} -> ${afterTotal}.`);
   console.log(`\nDONE. Backup: ${backup}  (file-size VACUUM reclamation is a separate deferred maintenance-window op).`);
 }
-main();
+
+if (require.main === module) main();
+module.exports = { verifyCleanup, RETENTION_MANAGED, TARGET };
