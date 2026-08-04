@@ -26,6 +26,7 @@ import type { ProxyCommand, ProxyResponse, ProxyRegistration } from '../shared/t
 import { getVersion } from '../shared/version.ts';
 import { handleVoiceUpgrade, type VoiceProxyOptions } from './voice-proxy.ts';
 import { DEFAULT_ENGINE_CONFIGS } from './default-engine-configs.ts';
+import { sweepStaleProxies } from './proxy-sweep.ts';
 
 const PORT = parseInt(process.env['PORT'] ?? '3000', 10);
 const DB_PATH = process.env['DB_PATH'] ?? join(process.env['HOME'] ?? '/data', '.agentic-collab', 'orchestrator.db');
@@ -378,24 +379,37 @@ if (touchedProxies > 0) {
   console.log(`[proxy] Refreshed heartbeat for ${touchedProxies} existing proxy(s)`);
 }
 
+// ── Proxy liveness: GAP-026 T1 bounded heartbeat-grace ──
+// A stale proxy enters a GRACE window instead of failing immediately, so a live-but-slow proxy
+// (heartbeat delayed by a host-load stall) is not false-disconnected and its agents are not falsely
+// session-death-alerted (the panic-page / queue-flood noise). Death authority stays on the
+// push-heartbeat age — a proxy is failed iff its heartbeat age exceeds PROXY_FAIL_S; there is no
+// reverse-direction HTTP check, so a proxy whose HTTP answers but whose heartbeat is wedged still
+// dies at PROXY_FAIL_S. DETECTION-only; the kill/reap interlock is untouched.
+// See proxy-sweep.ts + docs/gap-026-t1-proxy-grace.md.
+const PROXY_STALE_S = 45; // 3 missed heartbeats → stale (enters grace)
+const PROXY_GRACE_S = Number(process.env['PROXY_GRACE_S'] ?? 45); // grace before failing
+const PROXY_FAIL_S = PROXY_STALE_S + PROXY_GRACE_S; // 90s = 6 missed heartbeats → disconnected
+const proxyGraceState = new Set<string>();
 const staleProxyTimer = setInterval(() => {
-  const stale = db.listStaleProxies(45); // 45s = 3 missed heartbeats
-  for (const proxy of stale) {
-    console.log(`[proxy] Removing stale proxy: ${proxy.proxyId} (last heartbeat: ${proxy.lastHeartbeat})`);
-    db.removeProxy(proxy.proxyId);
-
-    // Mark agents on this proxy as failed
-    const agents = db.listAgents().filter((a) => a.proxyId === proxy.proxyId);
-    for (const agent of agents) {
-      if (isRunning(agent)) {
+  sweepStaleProxies(
+    {
+      listStaleProxies: (s) => db.listStaleProxies(s),
+      removeProxy: (id) => db.removeProxy(id),
+      listAgents: () => db.listAgents(),
+      isRunning,
+      failAgent: (agent, proxyId) => {
         db.updateAgentState(agent.name, 'failed', agent.version, {
           failedAt: new Date().toISOString(),
           failureReason: 'Proxy disconnected',
         });
-        db.logEvent(agent.name, 'proxy_disconnected', undefined, { proxyId: proxy.proxyId });
-      }
-    }
-  }
+        db.logEvent(agent.name, 'proxy_disconnected', undefined, { proxyId });
+      },
+      log: (msg) => console.log(msg),
+    },
+    { staleSeconds: PROXY_STALE_S, failSeconds: PROXY_FAIL_S },
+    proxyGraceState,
+  );
 }, 30_000);
 
 // ── Maintenance: cap high-volume churn-event bloat (GAP-026 T0) ──
