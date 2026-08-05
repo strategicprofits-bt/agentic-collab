@@ -35,6 +35,26 @@ services:
     labels:
       io.agentic-collab.role: orchestrator
     restart: unless-stopped
+    # OOM-protect the orchestrator (2026-08-05 incident, lane-a durable fix). The
+    # orchestrator is the fleet coordination substrate; under host-global OOM the kernel
+    # OOM-killer must cull a WORKER/agent process (respawn-recoverable) rather than the
+    # orchestrator. oom_score_adj -1000 makes it the last process the kernel picks.
+    # NOT oom_kill_disable: that FREEZES the container under OOM (a hung orchestrator,
+    # worse than killed+restarted) and is cgroup-v1-only. Tradeoff consciously ratified
+    # (Brienne): -1000 = effectively never-kill, so a genuinely-leaking orchestrator would
+    # have the kernel cull all workers first — accepted because orchestrator-death is
+    # categorically worse and workers are respawn-recoverable.
+    oom_score_adj: -1000
+    # Healthcheck loosened (same incident) — belt-and-suspenders with the Dockerfile bake.
+    # Old 5s/3-retry false-killed under transient event-loop load; 30s/5/60s keeps
+    # genuine-hang protection while tolerating transient load. Permanent (was an emergency
+    # override 2026-08-05); do not tighten without the incident context.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/orchestrator/status || exit 1"]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
 
 volumes:
   orchestrator-data:
