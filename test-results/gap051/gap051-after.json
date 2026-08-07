@@ -1,0 +1,12 @@
+{
+  "label": "AFTER",
+  "tmuxPath": "/home/agent/wt-gap051-named-buffer/src/proxy/tmux.ts",
+  "K": 8,
+  "N": 100,
+  "totalPanes": 800,
+  "crossPanes": 0,
+  "crossTrials": 0,
+  "crossPaneRate": 0,
+  "crossTrialRate": 0,
+  "examples": []
+}

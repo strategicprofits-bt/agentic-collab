@@ -531,9 +531,23 @@ export function pasteText(sessionName: string, text: string, pressEnter: boolean
     // buffer per delivery (GAP-051) prevents a concurrent delivery to another
     // agent from racing the shared top-of-stack and cross-pasting its text here.
     // `-d` deletes the buffer immediately after pasting so the stack can't grow.
+    //
+    // `-d` deletes ONLY on a successful paste. If paste-buffer throws AFTER
+    // load-buffer created the buffer, the uniquely-named buffer would ORPHAN —
+    // and unlike the old unnamed stack (bounded by tmux's buffer-limit eviction),
+    // an explicitly-named buffer persists, so repeated paste failures could
+    // accumulate buffers. Best-effort delete-buffer on the failure path bounds
+    // that. It is qualified (`-b <name>`) so it never touches the shared stack;
+    // cleanup errors are swallowed (e.g. load-buffer itself failed → no buffer).
+    // Re-throw preserves the not-submitted signal the dispatcher needs to retry.
     const bufferName = nextPasteBufferName(sessionName);
-    await tmuxLoadBuffer(text, bufferName);
-    await tmuxExec(['paste-buffer', '-b', bufferName, '-d', '-t', sessionName]);
+    try {
+      await tmuxLoadBuffer(text, bufferName);
+      await tmuxExec(['paste-buffer', '-b', bufferName, '-d', '-t', sessionName]);
+    } catch (err) {
+      await tmuxExec(['delete-buffer', '-b', bufferName]).catch(() => {});
+      throw err;
+    }
 
     if (pressEnter) {
       await new Promise<void>((r) => setTimeout(r, pasteEnterDelay(text.length)));

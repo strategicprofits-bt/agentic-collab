@@ -1,0 +1,19 @@
+{
+  "label": "BEFORE",
+  "tmuxPath": "/home/agent/agentic-collab/src/proxy/tmux.ts",
+  "K": 8,
+  "N": 100,
+  "totalPanes": 800,
+  "crossPanes": 614,
+  "crossTrials": 90,
+  "crossPaneRate": 0.7675,
+  "crossTrialRate": 0.9,
+  "examples": [
+    "trial 0: pane s0 showed s7's marker (MKt0s7u1u)",
+    "trial 0: pane s1 showed s7's marker (MKt0s7u1u)",
+    "trial 0: pane s2 showed s7's marker (MKt0s7u1u)",
+    "trial 0: pane s3 showed s1's marker (MKt0s1uo)",
+    "trial 0: pane s4 showed s1's marker (MKt0s1uo)",
+    "trial 0: pane s5 showed s1's marker (MKt0s1uo)"
+  ]
+}
