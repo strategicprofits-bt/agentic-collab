@@ -22,7 +22,13 @@ ENV HOME=/data
 
 EXPOSE 3000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+# Loosened 2026-08-05 (incident: host-global OOM + transient event-loop stalls
+# under full-fleet load false-killed the orchestrator via the old 5s/3-retry probe,
+# turning a transient stall into a restart kill-loop). 30s timeout + 5 retries +
+# 60s start-period keeps GENUINE-hang protection (a real sustained ~2.5min hang still
+# restarts) while tolerating transient load. Belt-and-suspenders with the compose
+# healthcheck override (both loosened). See data/knowledge/lessons + incident record.
+HEALTHCHECK --interval=30s --timeout=30s --start-period=60s --retries=5 \
   CMD curl -sf http://localhost:${PORT}/api/orchestrator/status || exit 1
 
 CMD ["node", "src/orchestrator/main.ts"]

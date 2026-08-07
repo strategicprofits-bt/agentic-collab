@@ -58,6 +58,37 @@ export type HealthMonitorOptions = {
 const DEFAULT_POLL_MS = 30_000;
 const DEFAULT_IDLE_SUSPEND_MS = 5 * 60 * 1000;
 
+/**
+ * Parse a positive-integer env var with a FAIL-SAFE fallback (2026-08-05 lane-a).
+ * Missing / empty / non-integer / <= 0 → returns `dflt` (fail-CLOSED to the safe
+ * default, never NaN). Used to make fast-poll load env-tunable without a rebuild,
+ * while guaranteeing the DEFAULTS reproduce today's behavior exactly.
+ */
+export function parseIntEnv(name: string, dflt: number, env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[name];
+  if (raw === undefined || raw === '') return dflt;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : dflt;
+}
+
+/**
+ * Select which active agents get fast-polled, honoring an optional cap (2026-08-05 lane-a).
+ * `cap <= 0` (the INERT default) → returns `agents` unchanged: a literal no-op, so shipping
+ * the mechanism changes NOTHING until a Ben-tuned FAST_POLL_MAX_AGENTS lands. When `cap > 0`
+ * and the fleet exceeds it, fast-poll the `cap` MOST-RECENTLY-ACTIVE agents (by last-activity
+ * timestamp); the rest fall back to the normal 30s poll. Pure + injectable for testing.
+ */
+export function selectFastPollAgents<T extends { name: string }>(
+  agents: T[],
+  cap: number,
+  lastActivityTs: Map<string, number>,
+): T[] {
+  if (cap <= 0 || agents.length <= cap) return agents;
+  return [...agents]
+    .sort((a, b) => (lastActivityTs.get(b.name) ?? 0) - (lastActivityTs.get(a.name) ?? 0))
+    .slice(0, cap);
+}
+
 export class HealthMonitor {
   private timer: ReturnType<typeof setInterval> | null = null;
   private fastTimer: ReturnType<typeof setInterval> | null = null;
@@ -105,7 +136,11 @@ export class HealthMonitor {
   private readonly idleSuspendMs: number;
   /** When true, auto-recovery is globally suppressed (incident kill-switch). */
   private readonly autoRecoverDisabled: boolean;
-  static readonly FAST_POLL_MS = 2_000;
+  // Env-tunable fast-poll load (2026-08-05 lane-a). DEFAULTS ARE INERT: FAST_POLL_MS=2000
+  // (today's interval) and FAST_POLL_MAX_AGENTS=0 (no cap = today). Values are raised/capped
+  // via env per host sizing WITHOUT a rebuild (Ben-tuned); the mechanism ships as a no-op.
+  static readonly FAST_POLL_MS = parseIntEnv('FAST_POLL_MS', 2_000);
+  static readonly FAST_POLL_MAX_AGENTS = parseIntEnv('FAST_POLL_MAX_AGENTS', 0); // 0 = unlimited (inert)
   private readonly onAgentUpdate: (agentName: string) => void;
   private readonly onQueueUpdate: (message: PendingMessage) => void;
   private readonly onDashboardMessage: (message: DashboardMessage) => void;
@@ -394,8 +429,10 @@ export class HealthMonitor {
    * Unchanged across IDLE_THRESHOLD consecutive polls → idle.
    */
   async pollActiveAgents(): Promise<void> {
-    const agents = this.db.listAgents().filter(
-      (a) => a.state === 'active' && a.proxyId,
+    const agents = selectFastPollAgents(
+      this.db.listAgents().filter((a) => a.state === 'active' && a.proxyId),
+      HealthMonitor.FAST_POLL_MAX_AGENTS,
+      this.lastActivityTs,
     );
     for (const agent of agents) {
       try {

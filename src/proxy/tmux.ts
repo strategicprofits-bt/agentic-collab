@@ -37,23 +37,75 @@ async function tmuxExec(args: string[], opts: { timeout?: number } = {}): Promis
 }
 
 /**
- * Load text into a tmux paste buffer via stdin (`load-buffer -`), async.
- * Passing the text on stdin keeps message content off the argv/command line.
- * execFile's async form has no `input` option, so we write to stdin directly.
+ * Load text into a NAMED tmux paste buffer via stdin (`load-buffer -b <name> -`),
+ * async. Passing the text on stdin keeps message content off the argv/command
+ * line. execFile's async form has no `input` option, so we write to stdin.
+ *
+ * The `-b <name>` is load-bearing (GAP-051): every agent session shares ONE tmux
+ * server, hence ONE global paste-buffer stack. An UNNAMED `load-buffer -` pushes
+ * the top of that shared stack, and a later UNNAMED `paste-buffer` pastes the
+ * top — so a concurrent delivery to ANOTHER agent, landing its own load-buffer
+ * between this agent's load and paste, makes this agent paste the WRONG text
+ * (cross-agent content injection). A unique named buffer sidesteps the shared
+ * top-of-stack entirely: we load into and paste from a name only this delivery
+ * uses. See nextPasteBufferName.
  */
-function tmuxLoadBuffer(text: string): Promise<void> {
+function tmuxLoadBuffer(text: string, bufferName: string): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const child = execFile(
       'tmux',
-      ['load-buffer', '-'],
+      ['load-buffer', '-b', bufferName, '-'],
       { encoding: 'utf-8', timeout: EXEC_TIMEOUT_MS },
       (err) => {
-        if (err) reject(new Error(`tmux command failed: tmux load-buffer -\n${err.message}`));
+        if (err)
+          reject(
+            new Error(`tmux command failed: tmux load-buffer -b ${bufferName} -\n${err.message}`),
+          );
         else resolve();
       },
     );
     child.stdin?.end(text);
   });
+}
+
+/**
+ * Process-global monotonic counter for paste-buffer names. GLOBAL (not
+ * per-session) is load-bearing (GAP-051, DrRobby's sanitization-injectivity
+ * catch): a per-session counter would let session-A-1 and session-B-1 collide
+ * whenever two DISTINCT sessions sanitize to the same string. With ONE
+ * process-global counter every delivery in this process gets a DISTINCT value
+ * regardless of session, so `pid`+`seq` alone is already globally + temporally
+ * unique on a single host — the session prefix is debuggability only, never
+ * load-bearing for uniqueness, so a non-injective sanitize cannot cause a
+ * collision.
+ */
+let pasteBufferSeq = 0;
+
+/**
+ * Sanitize a session name into a tmux-buffer-name-safe token (non-[A-Za-z0-9_]
+ * → `_`). Debuggability/readability ONLY — uniqueness rests on the pid+seq
+ * suffix, so this sanitize being non-injective (`a/b` and `a_b` both → `a_b`) is
+ * harmless. Session names reaching here are already validated to [a-zA-Z0-9_-],
+ * so this is defense-in-depth.
+ */
+function sanitizeForBufferName(session: string): string {
+  return session.replace(/[^A-Za-z0-9_]/g, '_');
+}
+
+/**
+ * Build a globally + temporally unique tmux paste-buffer name for ONE delivery.
+ *   buf = `<sanitizedSession>-<pid>-<seq>`
+ *   - sanitizedSession: which agent this went to — debuggability, NOT load-bearing
+ *   - pid: disambiguates across proxy RESTARTS (a post-restart counter reset
+ *     cannot collide with a buffer lingering from a pre-restart process)
+ *   - seq: process-global monotonic counter — the SOLE guarantor of uniqueness
+ *     within a process, independent of session sanitization
+ * Exported for the uniqueness/injectivity tests. Advances the global counter on
+ * every call (each call names a distinct delivery).
+ */
+export function nextPasteBufferName(sessionName: string): string {
+  const seq = ++pasteBufferSeq;
+  return `${sanitizeForBufferName(sessionName)}-${process.pid}-${seq}`;
 }
 
 // Per-session paste serialization. Multiple pastes to the same tmux session
@@ -474,10 +526,28 @@ export function pasteText(sessionName: string, text: string, pressEnter: boolean
       await new Promise<void>((r) => setTimeout(r, 500));
     }
 
-    // Pass text via stdin (load-buffer -) to avoid all shell escaping issues
-    // and keep message content off the argv/command line.
-    await tmuxLoadBuffer(text);
-    await tmuxExec(['paste-buffer', '-t', sessionName]);
+    // Pass text via stdin (load-buffer -b <name> -) to avoid all shell escaping
+    // issues and keep message content off the argv/command line. A UNIQUE named
+    // buffer per delivery (GAP-051) prevents a concurrent delivery to another
+    // agent from racing the shared top-of-stack and cross-pasting its text here.
+    // `-d` deletes the buffer immediately after pasting so the stack can't grow.
+    //
+    // `-d` deletes ONLY on a successful paste. If paste-buffer throws AFTER
+    // load-buffer created the buffer, the uniquely-named buffer would ORPHAN —
+    // and unlike the old unnamed stack (bounded by tmux's buffer-limit eviction),
+    // an explicitly-named buffer persists, so repeated paste failures could
+    // accumulate buffers. Best-effort delete-buffer on the failure path bounds
+    // that. It is qualified (`-b <name>`) so it never touches the shared stack;
+    // cleanup errors are swallowed (e.g. load-buffer itself failed → no buffer).
+    // Re-throw preserves the not-submitted signal the dispatcher needs to retry.
+    const bufferName = nextPasteBufferName(sessionName);
+    try {
+      await tmuxLoadBuffer(text, bufferName);
+      await tmuxExec(['paste-buffer', '-b', bufferName, '-d', '-t', sessionName]);
+    } catch (err) {
+      await tmuxExec(['delete-buffer', '-b', bufferName]).catch(() => {});
+      throw err;
+    }
 
     if (pressEnter) {
       await new Promise<void>((r) => setTimeout(r, pasteEnterDelay(text.length)));

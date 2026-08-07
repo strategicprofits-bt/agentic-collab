@@ -1,6 +1,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { sendKeys, buildCreateSessionArgs, classifyModal, dismissBlockingModalWith } from './tmux.ts';
+import {
+  sendKeys,
+  buildCreateSessionArgs,
+  classifyModal,
+  dismissBlockingModalWith,
+  nextPasteBufferName,
+} from './tmux.ts';
 
 // Assert that the flat tmux argv contains an `-e VAR=VALUE` pair (i.e. some
 // index i where args[i] === '-e' and args[i+1] === pair).
@@ -266,5 +272,82 @@ describe('dismissBlockingModalWith (verified + retried dismissal)', () => {
     const { io, sent } = makeIO([modal]); // capture always returns the modal
     assert.equal(await dismissBlockingModalWith(io), false);
     assert.ok(sent.length >= 2, 'must retry multiple times before giving up');
+  });
+});
+
+// GAP-051: the delivery path pastes into a UNIQUE named tmux buffer per delivery
+// so a concurrent delivery to another agent cannot race the shared, fleet-global
+// paste-buffer stack and cross-paste its text. These assert the uniqueness
+// contract of the buffer NAME, plus a behavioral red/green model of the race
+// itself proving the named-buffer discipline eliminates the cross-paste.
+describe('nextPasteBufferName (GAP-051 buffer-name uniqueness)', () => {
+  it('advances a process-global counter → successive calls are DISTINCT', () => {
+    const a = nextPasteBufferName('AgentX');
+    const b = nextPasteBufferName('AgentX');
+    const c = nextPasteBufferName('AgentX');
+    assert.notEqual(a, b);
+    assert.notEqual(b, c);
+    assert.notEqual(a, c);
+  });
+
+  it('uniqueness survives a NON-INJECTIVE session sanitize (DrRobby injectivity catch)', () => {
+    // `a/b` and `a_b` both sanitize to `a_b`; the process-global counter — not
+    // the session prefix — carries uniqueness, so the full names must still differ.
+    const n1 = nextPasteBufferName('a/b');
+    const n2 = nextPasteBufferName('a_b');
+    assert.equal(n1.startsWith('a_b-'), true, 'both sanitize to a_b prefix');
+    assert.equal(n2.startsWith('a_b-'), true, 'both sanitize to a_b prefix');
+    assert.notEqual(n1, n2, 'colliding sanitized sessions must still yield distinct buffer names');
+  });
+
+  it('embeds the pid so a counter reset after a proxy RESTART cannot collide', () => {
+    const name = nextPasteBufferName('AgentX');
+    assert.ok(
+      name.includes(`-${process.pid}-`),
+      `buffer name must contain -<pid>- for restart disambiguation, got ${name}`,
+    );
+  });
+
+  it('is tmux-buffer-name-safe (only [A-Za-z0-9_-]) even for a hostile session token', () => {
+    const name = nextPasteBufferName('a b/c.d$e;f');
+    assert.match(name, /^[A-Za-z0-9_-]+$/);
+  });
+
+  it('names are globally distinct ACROSS different agent sessions (shared-server invariant)', () => {
+    const names = new Set<string>();
+    for (let i = 0; i < 50; i++) {
+      names.add(nextPasteBufferName(i % 2 === 0 ? 'AgentX' : 'AgentY'));
+    }
+    assert.equal(names.size, 50, 'every delivery, across agents, must get a unique buffer name');
+  });
+});
+
+describe('named-buffer discipline eliminates the cross-paste race (GAP-051 red/green)', () => {
+  // Model the ONE fleet-global tmux paste-buffer stack. load(text) pushes; an
+  // unnamed paste() returns the TOP; a named load(name,text)/paste(name) keys by
+  // name. We interleave two deliveries the way concurrent deliveries to two
+  // different sessions can (each session serializes independently, but they
+  // share this stack): A.load → B.load → A.paste.
+  it('RED: unnamed load/paste cross-pastes — A pastes B’s text', () => {
+    const stack: string[] = [];
+    const load = (text: string) => stack.unshift(text); // push top
+    const paste = () => stack[0]; // top-of-stack
+    load('for-A'); // A.load
+    load('for-B'); // B.load races in before A pastes
+    const whatAPasted = paste(); // A.paste → TOP === 'for-B'  ← the bug
+    assert.equal(whatAPasted, 'for-B');
+  });
+
+  it('GREEN: unique named buffers — A always pastes A’s text despite the interleave', () => {
+    const buffers = new Map<string, string>();
+    const load = (name: string, text: string) => buffers.set(name, text);
+    const paste = (name: string) => buffers.get(name);
+    const bufA = nextPasteBufferName('AgentA');
+    const bufB = nextPasteBufferName('AgentB');
+    assert.notEqual(bufA, bufB);
+    load(bufA, 'for-A'); // A.load
+    load(bufB, 'for-B'); // B.load races in
+    assert.equal(paste(bufA), 'for-A'); // A.paste → its OWN buffer, race-proof
+    assert.equal(paste(bufB), 'for-B');
   });
 });
