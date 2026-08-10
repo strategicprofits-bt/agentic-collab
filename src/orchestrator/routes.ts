@@ -32,6 +32,11 @@ import { shutdownAgents, restoreAllAgents } from './network.ts';
 import { sessionName } from '../shared/agent-entity.ts';
 import type { MessageDispatcher } from './message-dispatcher.ts';
 import type { UsagePoller } from './usage-poller.ts';
+import { reportServerDeath } from './server-death-alert.ts';
+import type { TmuxServerDeathReport } from '../shared/types.ts';
+
+/** GAP-056: (proxyId|newPid) → seen, so one server death pages the monitors once. */
+const serverDeathDedupe = new Set<string>();
 
 /** Validates agent and persona names: 1-63 chars, alphanumeric start, [a-zA-Z0-9_-]. */
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$/;
@@ -634,6 +639,31 @@ route('POST', '/api/proxy/heartbeat', async (req, res, _match, ctx) => {
 
   const updated = ctx.db.updateProxyHeartbeat(body.proxyId);
   if (!updated) return json(res, 404, { error: 'Proxy not registered' });
+
+  // GAP-056: additive optional field — a tmux server death+recreate on this host.
+  // Log it durably and page the monitors (Chloe + Sydney), deduped per (proxy,newPid).
+  const death = body['tmuxServerDied'] as TmuxServerDeathReport | undefined;
+  if (death && typeof death === 'object') {
+    try {
+      reportServerDeath(
+        {
+          logEvent: (agent, event, meta) => ctx.db.logEvent(agent, event, undefined, meta),
+          enqueue: (target, envelope) =>
+            ctx.db.enqueueMessage({ sourceAgent: null, targetAgent: target, envelope }),
+          notify: (target) =>
+            ctx.messageDispatcher.tryDeliver(target).catch((err) => {
+              console.error(`[routes] server-death alert delivery failed for ${target}:`, (err as Error).message);
+            }),
+        },
+        serverDeathDedupe,
+        body['proxyId'] as string,
+        death,
+      );
+    } catch (err) {
+      // Observability must never fail a heartbeat.
+      console.error('[routes] server-death report handling failed (ignored):', (err as Error).message);
+    }
+  }
 
   json(res, 200, { ok: true });
 });

@@ -1,6 +1,18 @@
 # GAP-056: tmux Server-Death Observability — Scoped Design
 
-**Owner:** Gilfoyle · **Status:** for Brienne+Roz gate · **Priority:** re-prioritized-important (not emergency) · **Date:** 2026-08-07
+**Owner:** Gilfoyle · **Status:** PRIMARY implemented — for Brienne+Roz gate · **Priority:** re-prioritized-important (not emergency) · **Date:** 2026-08-07 (impl 2026-08-10)
+
+## Implementation (PRIMARY, this branch)
+
+| File | What |
+|---|---|
+| `src/proxy/server-death-watcher.ts` (new) | `ServerDeathWatcher` (injectable `ServerProbe` seam) — polls tmux server PID (`display-message -p '#{pid}'`) + socket inode (`stat`), fires a `TmuxServerDeathReport` only on a change from a **non-null** baseline; transient-null holds the baseline (no false death); snapshot is `Promise.all` + per-probe `.catch(null)` (bounded, failure-swallowed). Ships `hostProbe` (read-only `free`/`who`/`last`/`dmesg`, 3s timeout, 64 KiB cap each). |
+| `src/proxy/main.ts` | Heartbeat calls `watcher.poll(nowIso)` (wrapped in try/catch — observability can never wedge the heartbeat) and attaches `tmuxServerDied` to the existing 15s heartbeat body **only when present**. |
+| `src/orchestrator/server-death-alert.ts` (new) | `reportServerDeath(deps, dedupe, proxyId, report)` — `logEvent('system','tmux_server_died', …full snapshot)` + pages **Chloe + Sydney** via `enqueue`+`notify` (same path as the circuit-breaker). Deduped on `(proxyId,newPid)`. Surfaces an OOM hint when `dmesg` carries killer lines. |
+| `src/orchestrator/routes.ts` | `POST /api/proxy/heartbeat` reads the additive optional field, calls `reportServerDeath` (module-level dedupe set); wrapped in try/catch so a bad report never fails the heartbeat. |
+| `src/shared/types.ts` | `TmuxServerDeathReport` + `TmuxDeathSnapshot` shared across proxy↔orchestrator. |
+
+Tests: `server-death-watcher.test.ts` (10 — baseline/no-change/PID-change/inode-change/death→recreate/null-hold/fire-once/snapshot-capture/probe-failure-swallow/throwing-probe/inode-backfill), `server-death-alert.test.ts` (7 — event-logged/pages-Chloe+Sydney/envelope-shape/dedupe-same/dedupe-per-newPid/dedupe-per-proxy/OOM-hint). `tsc` adds zero non-baseline errors.
 
 ## Problem
 

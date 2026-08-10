@@ -19,6 +19,7 @@ import { generateToken } from '../shared/sanitize.ts';
 import { resolveSecret, waitForSecret, discoverOrchestrator, getSecretPath, hasDocker } from '../shared/config.ts';
 import { getVersion } from '../shared/version.ts';
 import * as tmux from './tmux.ts';
+import { ServerDeathWatcher, hostProbe } from './server-death-watcher.ts';
 import type { ProxyCommand, ProxyResponse } from '../shared/types.ts';
 
 // Ensure the collab CLI (bin/collab) is on PATH for spawned tmux sessions.
@@ -38,6 +39,9 @@ let token = generateToken();
 const proxyVersion = getVersion();
 let registered = false;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+// GAP-056: detect tmux server death+recreate on the heartbeat cadence (no new timer).
+const serverDeathWatcher = new ServerDeathWatcher(hostProbe);
 
 function authHeaders(): Record<string, string> {
   const headers: Record<string, string> = { 'content-type': 'application/json' };
@@ -77,11 +81,23 @@ async function register(): Promise<void> {
 }
 
 async function heartbeat(): Promise<void> {
+  // GAP-056: poll for tmux server death. Fully failure-swallowed — the watcher
+  // never throws, but guard anyway so observability can never wedge the heartbeat.
+  let tmuxServerDied: Awaited<ReturnType<ServerDeathWatcher['poll']>> = null;
+  try {
+    tmuxServerDied = await serverDeathWatcher.poll(new Date().toISOString());
+    if (tmuxServerDied) {
+      console.warn(`[proxy] tmux server death detected: PID ${tmuxServerDied.oldPid}→${tmuxServerDied.newPid}`);
+    }
+  } catch (err) {
+    console.warn('[proxy] server-death watcher poll failed (ignored):', (err as Error).message);
+  }
+
   try {
     const resp = await fetch(`${orchestratorUrl}/api/proxy/heartbeat`, {
       method: 'POST',
       headers: authHeaders(),
-      body: JSON.stringify({ proxyId: PROXY_ID }),
+      body: JSON.stringify(tmuxServerDied ? { proxyId: PROXY_ID, tmuxServerDied } : { proxyId: PROXY_ID }),
     });
 
     if (!resp.ok) {
