@@ -272,6 +272,36 @@ export type ProxyRegistration = {
   registeredAt: string;
 };
 
+// ── GAP-056: tmux server-death observability ──
+
+/**
+ * Best-effort forensic snapshot captured host-side at the moment a tmux
+ * server-death+recreate is detected. Every field is optional — probes are
+ * bounded and failure-swallowed, so a null field means "probe unavailable at
+ * uid1000 (e.g. dmesg EPERM) or failed", never a hard error. Read-only.
+ */
+export type TmuxDeathSnapshot = {
+  free: string | null; // `free -m` — memory pressure → OOM hint only
+  who: string | null; // active login sessions at death
+  last: string | null; // `last -n 20` — recent logins
+  dmesg: string | null; // kernel tail — OOM-killer lines (EPERM if dmesg_restrict=1)
+};
+
+/**
+ * Additive optional field on the proxy→orchestrator heartbeat. Present ONLY on
+ * the one heartbeat immediately after a tmux server identity change (PID or
+ * socket inode differs from a non-null baseline). If the orchestrator ignores
+ * it, behavior is unchanged.
+ */
+export type TmuxServerDeathReport = {
+  oldPid: string | null;
+  oldInode: string | null;
+  newPid: string | null;
+  newInode: string | null;
+  detectedAt: string; // ISO timestamp
+  snapshot: TmuxDeathSnapshot;
+};
+
 // ── WebSocket Events (Orchestrator → Dashboard) ──
 
 export type WsInitEvent = {
