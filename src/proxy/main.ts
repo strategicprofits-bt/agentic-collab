@@ -42,6 +42,9 @@ let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
 // GAP-056: detect tmux server death+recreate on the heartbeat cadence (no new timer).
 const serverDeathWatcher = new ServerDeathWatcher(hostProbe);
+// One-time log so "watcher armed + reading a real baseline" is observable in the
+// proxy log post-restart (deploy-verify (a)) — without per-poll spam.
+let serverDeathBaselineLogged = false;
 
 function authHeaders(): Record<string, string> {
   const headers: Record<string, string> = { 'content-type': 'application/json' };
@@ -88,6 +91,13 @@ async function heartbeat(): Promise<void> {
     tmuxServerDied = await serverDeathWatcher.poll(new Date().toISOString());
     if (tmuxServerDied) {
       console.warn(`[proxy] tmux server death detected: PID ${tmuxServerDied.oldPid}→${tmuxServerDied.newPid}`);
+    }
+    if (!serverDeathBaselineLogged) {
+      const b = serverDeathWatcher.getBaseline();
+      if (b?.pid) {
+        console.log(`[proxy] server-death watcher armed: baseline tmux server PID=${b.pid} inode=${b.inode ?? 'n/a'}`);
+        serverDeathBaselineLogged = true;
+      }
     }
   } catch (err) {
     console.warn('[proxy] server-death watcher poll failed (ignored):', (err as Error).message);
