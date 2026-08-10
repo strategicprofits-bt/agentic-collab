@@ -53,6 +53,15 @@ node --test --test-timeout=90000 --watch 'src/**/*.test.ts'   # watch mode
 node --test src/orchestrator/*.test.ts   # subset
 ```
 
+## Deploy
+
+The orchestrator runs from an image **built from local src** (`build: context: .`) — merged/committed code does NOT reach the running orchestrator until the image is rebuilt and the container recreated. Two distinct actions, do not conflate them:
+
+- **DEPLOY** = `scripts/deploy.sh` — the sanctioned way to ship new code. `docker compose build` (**fails LOUD** on a broken build — never ships stale), then `up -d`, waits healthy, **asserts the container was recreated this run** (image-freshness), restarts the proxy (`KillMode=process` → tmux server untouched, no reap), and verifies. Use `--ref <sha>` to refuse unless `HEAD` matches. This is the only path that guarantees **deployed == current src**, verified not assumed.
+- **RESTART** = `systemctl restart agentic-orchestrator` — **recovery, not deploy**. The unit carries `ExecStartPre=-docker compose build`, so a restart *does* rebuild-from-current-src in the normal case; but the leading `-` means a **failed** build is tolerated and the orchestrator comes back on the **last-good image** (alive-on-stale > down, for the fleet-coordination substrate). So a plain restart is best-effort-fresh with a silent-stale fallback — fine for recovery, **not** a substitute for `deploy.sh` when you need a guaranteed-fresh, build-verified ship.
+
+Rule of thumb: shipping code → `scripts/deploy.sh`. Bouncing a wedged orchestrator → `systemctl restart`. Crash-recovery is automatic (Docker `restart: unless-stopped`, no rebuild — avoids rebuild-in-crash-loop). See `docs/orchestrator-deploy-mechanism.md` for the unit delta + rationale.
+
 ## Commits
 
 Use conventional commits: `feat:`, `fix:`, `chore:`, `refactor:`, `test:`, `docs:`
