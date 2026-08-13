@@ -18,6 +18,7 @@ import { UsagePoller } from './usage-poller.ts';
 import { ReminderDispatcher } from './reminder-dispatcher.ts';
 import { shutdownAgents, restoreAllAgents } from './network.ts';
 import type { LifecycleContext } from './lifecycle.ts';
+import { RecoveryScaleTracker } from './recovery-scale-tracker.ts';
 import { syncPersonasToDb, syncPersonasWithDiff, getPersonasDir } from './persona.ts';
 import { AccountStore } from './accounts.ts';
 import { isRunning } from '../shared/agent-entity.ts';
@@ -47,6 +48,9 @@ const STORES_DIR = join(dirname(DB_PATH), 'stores');
 mkdirSync(STORES_DIR, { recursive: true });
 
 const db = new Database(DB_PATH);
+// GAP-056 ADD-2: one stateful blast-radius tracker, shared by every recovery path
+// (health-monitor auto-recover + routes API recover) so the trailing window is global.
+const recoveryScaleTracker = new RecoveryScaleTracker();
 const wss = new WebSocketServer();
 const locks = new LockManager(db.rawDb);
 
@@ -169,6 +173,7 @@ const healthMonitor = new HealthMonitor({
   proxyDispatch,
   orchestratorHost: ORCHESTRATOR_HOST,
   idleSuspendMs: IDLE_SUSPEND_MS,
+  recoveryScaleTracker,
   onAgentUpdate: (agentName) => {
     const agent = db.getAgent(agentName);
     if (agent) {
@@ -229,6 +234,7 @@ const lifecycleCtx: LifecycleContext = {
   proxyDispatch,
   orchestratorHost: ORCHESTRATOR_HOST,
   accountStore,
+  recoveryScaleTracker,
 };
 
 // Voice proxy config
@@ -264,6 +270,7 @@ const routeCtx: RouteContext = {
   pagesDir: PAGES_DIR,
   storesDir: STORES_DIR,
   telegramDispatcher,
+  recoveryScaleTracker,
 };
 
 const router = createRouter(routeCtx);

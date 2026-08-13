@@ -106,9 +106,12 @@ export class ServerDeathWatcher {
   }
 
   /**
-   * Bounded, best-effort forensic snapshot. Each probe's failure is mapped to
-   * null via allSettled — the snapshot always resolves and never throws, so it
-   * cannot wedge the heartbeat.
+   * Bounded, best-effort forensic snapshot. Each probe is individually
+   * `.catch(() => null)`-guarded, so no probe ever rejects and the enclosing
+   * `Promise.all` cannot reject — the snapshot always resolves and never throws,
+   * so it cannot wedge the heartbeat. (Per-probe catch, not `Promise.allSettled`:
+   * same never-throws guarantee, but each result is already unwrapped to value|null
+   * rather than a settled-result object.)
    */
   private async snapshot(): Promise<TmuxDeathSnapshot> {
     const [free, who, last, dmesg] = await Promise.all([

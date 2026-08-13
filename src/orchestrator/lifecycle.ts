@@ -31,6 +31,7 @@ import { resolveHook } from './hook-resolver.ts';
 import type { HookResult, TemplateVars } from './hook-resolver.ts';
 import type { AccountStore } from './accounts.ts';
 import { resolveEffectiveConfig } from './engine-config-resolver.ts';
+import { RecoveryScaleTracker, RECOVERY_SCALE_WINDOW_MS } from './recovery-scale-tracker.ts';
 
 export type LifecycleContext = {
   db: Database;
@@ -43,6 +44,12 @@ export type LifecycleContext = {
    * Used to coordinate cool-down periods with the message dispatcher (Race 2 fix).
    */
   onLifecycleOp?: (agentName: string) => void;
+  /**
+   * GAP-056 ADD-2: blast-radius scale tracker for context-lost reaps. Single stateful
+   * instance shared across all recovery paths (auto + API). Optional — when absent,
+   * recovery proceeds unchanged (shadow-only observability, never lifecycle-critical).
+   */
+  recoveryScaleTracker?: RecoveryScaleTracker | undefined;
 };
 
 // Timeouts and delays — configurable via env vars for tuning in different environments
@@ -1182,6 +1189,42 @@ async function isAgentClaudeRunning(
   return false;
 }
 
+/**
+ * GAP-056 ADD-2: record the blast-radius scale signal for a COMPLETED recovery.
+ * Shadow-mode: emits a `recovery_scale_fresh_sid` event (the events table = the
+ * baseline-measurement substrate) when a non-null prior sid rotated to a new sid
+ * (= context-lost reap). Observability only — wrapped so it can NEVER throw into
+ * the lifecycle path. Paging stays gated OFF in the tracker until a threshold is measured.
+ */
+export function recordRecoveryScale(
+  ctx: LifecycleContext,
+  name: string,
+  priorSid: string | null,
+  newSid: string,
+): void {
+  const tracker = ctx.recoveryScaleTracker;
+  if (!tracker) return;
+  try {
+    const activeAgents = ctx.db.listAgents().filter((a) => a.state === 'active').length;
+    const res = tracker.record({ agentName: name, priorSid, newSid, activeAgents, nowMs: Date.now() });
+    if (res.isFreshSid) {
+      ctx.db.logEvent(name, 'recovery_scale_fresh_sid', undefined, {
+        windowCount: res.windowCount,
+        activeAgents,
+        windowSec: Math.round(RECOVERY_SCALE_WINDOW_MS / 1000),
+      });
+    }
+    if (res.alert) {
+      // Paging path — gated OFF in shadow mode; when a measured threshold enables it,
+      // this event is the mass-reap page trigger (deduped to one per episode by the tracker).
+      ctx.db.logEvent(name, 'recovery_scale_alert', undefined, res.alert);
+    }
+  } catch (err) {
+    // Observability must NEVER break recovery.
+    console.error(`[recovery-scale] record failed for ${name}:`, (err as Error).message);
+  }
+}
+
 export async function recoverAgent(
   ctx: LifecycleContext,
   name: string,
@@ -1330,7 +1373,7 @@ export async function recoverAgent(
     await sleep(POST_SPAWN_ACTIVE_DELAY_MS);
 
     // ── Phase 3: finalize ──
-    return await finalizeToActive(ctx, name, 'spawning', 'recover_interrupted', {
+    const recovered = await finalizeToActive(ctx, name, 'spawning', 'recover_interrupted', {
       tmuxSession,
       spawnCount: spawnCount + 1,
       lastContextPct: 0,
@@ -1341,6 +1384,14 @@ export async function recoverAgent(
       sessionId: generatedSessionId,
       reason: 'auto-recovery from failed state',
     }, 'recover');
+
+    // ── ADD-2: blast-radius scale signal (shadow; only on a successful finalize) ──
+    // prior sid = the reaped session (survives the failed→spawning transition, which sets
+    // only failedAt/failureReason); new = generatedSessionId. A non-null prior rotated to a
+    // new sid = a context-lost reap, counted in the tracker's trailing window.
+    recordRecoveryScale(ctx, name, phase1.current.currentSessionId, generatedSessionId);
+
+    return recovered;
   } finally {
     clearTimeout(watchdog);
   }

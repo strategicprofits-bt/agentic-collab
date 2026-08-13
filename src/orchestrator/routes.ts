@@ -69,6 +69,8 @@ export type RouteContext = {
   pagesDir: string;
   storesDir: string;
   telegramDispatcher: TelegramDispatcher;
+  /** GAP-056 ADD-2: shared blast-radius tracker, threaded into API-triggered recovery ctx. */
+  recoveryScaleTracker?: import('./recovery-scale-tracker.ts').RecoveryScaleTracker | undefined;
 };
 
 /**
@@ -2389,6 +2391,7 @@ function makeLifecycleCtx(ctx: RouteContext): LifecycleContext {
     proxyDispatch: ctx.proxyDispatch,
     orchestratorHost: ctx.orchestratorHost,
     accountStore: ctx.accountStore,
+    recoveryScaleTracker: ctx.recoveryScaleTracker,
   };
 }
 
