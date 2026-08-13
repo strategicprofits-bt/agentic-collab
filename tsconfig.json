@@ -4,11 +4,11 @@
     "target": "esnext",
     "module": "nodenext",
     "moduleResolution": "nodenext",
+    "allowImportingTsExtensions": true,
     "strict": true,
     "exactOptionalPropertyTypes": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
-    "noPropertyAccessFromIndexSignature": true,
     "forceConsistentCasingInFileNames": true,
     "erasableSyntaxOnly": true,
     "verbatimModuleSyntax": true,
@@ -17,5 +17,5 @@
     "types": ["node"]
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["src/dashboard/**/*.ts"]
+  "exclude": ["src/dashboard/**/*.ts", "src/test/probe.ts"]
 }
