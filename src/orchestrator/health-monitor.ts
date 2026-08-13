@@ -21,6 +21,7 @@ import type { ProxyCommand, ProxyResponse, AgentRecord, PendingMessage, Dashboar
 import { sessionName, canSuspend } from '../shared/agent-entity.ts';
 import { getAdapter } from './adapters/index.ts';
 import { reloadAgent, recoverAgent, suspendAgent, type LifecycleContext } from './lifecycle.ts';
+import type { RecoveryScaleTracker } from './recovery-scale-tracker.ts';
 import { resolveEffectiveConfig } from './engine-config-resolver.ts';
 import { StrandedWatchdog } from './stranded-watchdog.ts';
 import { classifyPaneCommand } from './pane-liveness.ts';
@@ -38,6 +39,8 @@ export type HealthMonitorOptions = {
   locks: LockManager;
   proxyDispatch: (proxyId: string, command: ProxyCommand) => Promise<ProxyResponse>;
   orchestratorHost: string;
+  /** GAP-056 ADD-2: shared blast-radius scale tracker, injected into recovery ctx. */
+  recoveryScaleTracker?: RecoveryScaleTracker | undefined;
   onAgentUpdate?: (agentName: string) => void;
   onQueueUpdate?: (message: PendingMessage) => void;
   onDashboardMessage?: (message: DashboardMessage) => void;
@@ -132,6 +135,7 @@ export class HealthMonitor {
   private readonly locks: LockManager;
   private readonly proxyDispatch: (proxyId: string, command: ProxyCommand) => Promise<ProxyResponse>;
   private readonly orchestratorHost: string;
+  private readonly recoveryScaleTracker?: RecoveryScaleTracker | undefined;
   private readonly pollIntervalMs: number;
   private readonly idleSuspendMs: number;
   /** When true, auto-recovery is globally suppressed (incident kill-switch). */
@@ -185,6 +189,7 @@ export class HealthMonitor {
     this.locks = opts.locks;
     this.proxyDispatch = opts.proxyDispatch;
     this.orchestratorHost = opts.orchestratorHost;
+    this.recoveryScaleTracker = opts.recoveryScaleTracker;
     this.onAgentUpdate = opts.onAgentUpdate ?? (() => {});
     this.onQueueUpdate = opts.onQueueUpdate ?? (() => {});
     this.onDashboardMessage = opts.onDashboardMessage ?? (() => {});
@@ -1398,6 +1403,7 @@ export class HealthMonitor {
       locks: this.locks,
       proxyDispatch: this.proxyDispatch,
       orchestratorHost: this.orchestratorHost,
+      recoveryScaleTracker: this.recoveryScaleTracker,
     };
   }
 }
