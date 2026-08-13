@@ -39,9 +39,11 @@ window drains).
 
 ## Wiring
 - One stateful `RecoveryScaleTracker` instance (holds the trailing window) is created in
-  `main.ts` and shared by **every** recovery path:
-  - health-monitor auto-recover (`makeLifecycleCtx()`),
-  - routes API recover (`lifecycleCtx`).
+  `main.ts` and shared by **every** recovery path — each path builds its own `LifecycleContext`,
+  so the single instance is threaded into all of them:
+  - health-monitor auto-recover — `HealthMonitor` opts → its `makeLifecycleCtx()`,
+  - routes API recover (`POST /agents/:name/recover`) — `routeCtx` → `RouteContext.recoveryScaleTracker`
+    → routes' own `makeLifecycleCtx(ctx)` (a distinct builder from HealthMonitor's same-named method).
 - `recoverAgent` calls `recordRecoveryScale(ctx, name, priorSid, newSid)` **only on a
   successful finalize**. It is wrapped so it can **never** throw into the lifecycle path —
   observability must not break recovery.

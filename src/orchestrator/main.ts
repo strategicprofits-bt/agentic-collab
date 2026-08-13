@@ -270,6 +270,7 @@ const routeCtx: RouteContext = {
   pagesDir: PAGES_DIR,
   storesDir: STORES_DIR,
   telegramDispatcher,
+  recoveryScaleTracker,
 };
 
 const router = createRouter(routeCtx);
