@@ -2116,9 +2116,19 @@ route('POST', '/api/projects/:id/respond', async (req, res, match, ctx) => {
     return { chatId, ok };
   })).then((attempts) => {
     const dropped = droppedRecipients(attempts);
+    if (dropped.length === 0) return;
+    // Same cooldown as /api/notify (F1): a retried board-response drop must not re-page
+    // the monitors uncooldowned. Keyed per-project so distinct boards alert independently.
+    const now = Date.now();
+    const dropHash = `board:${id}:drop`;
+    const lastDrop = notifyDropHashes.get(dropHash);
+    if (lastDrop !== undefined && (now - lastDrop) < NOTIFY_COOLDOWN_MS) return;
+    notifyDropHashes.set(dropHash, now);
     alertNotifyDrop({
       droppedChatIds: dropped,
-      context: `project-board:${projectTitle}`,
+      // Title is source-metadata (which board), not the dropped page body; bound it so a
+      // crafted title cannot bloat/mislead the internal alert (it is DB data, never shell).
+      context: `project-board:${projectTitle.slice(0, 60)}`,
       enqueue: (target, envelope) => { ctx.db.enqueueMessage({ sourceAgent: null, targetAgent: target, envelope }); },
       logEvent: (event, meta) => { ctx.db.logEvent('system', event, undefined, meta); },
     });
