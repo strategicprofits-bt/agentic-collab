@@ -119,33 +119,60 @@ export class ClaudeAdapter implements EngineAdapter {
   parseContextPercent(paneOutput: string): ContextResult {
     const lines = paneOutput.split('\n');
 
-    // Search bottom-up for status bar indicators.
-    // Claude Code v2.x shows token count ("NNNNN tokens") in the status bar.
-    // Older versions may show "XX% context used".
+    // GAP-012: current-window OCCUPANCY and CUMULATIVE session tokens are two
+    // distinct quantities and must be extracted independently. The "NNNNN tokens"
+    // figure in the v2.x status bar (e.g. "/clear to save 202k tokens") is a
+    // CUMULATIVE session count — it exceeds the window and keeps climbing across
+    // compactions, so it is NOT window occupancy and must NEVER be divided by
+    // 200k to fabricate a context %. It is recorded as totalTokens only.
+    // contextPct is populated ONLY from a genuine occupancy line, else stays null.
+    let contextPct: number | null = null;
+    let totalTokens: number | undefined;
+
+    // Search bottom-up through the status-bar region (last 20 lines), capturing
+    // the first occurrence of each signal.
     for (let i = lines.length - 1; i >= Math.max(0, lines.length - 20); i--) {
       const line = lines[i] ?? '';
 
-      // Percentage format: "XX% context"
-      const pctMatch = line.match(/(\d+)%\s*context/i);
-      if (pctMatch) {
-        return { contextPct: parseInt(pctMatch[1]!, 10), confident: true };
+      // Genuine occupancy signal #1 (the one Claude v2.x actually exposes):
+      // "Context left until auto-compact: N%" reports REMAINING headroom, so
+      // occupancy used = 100 - N (a near-full "7%" reads as 93).
+      if (contextPct === null) {
+        const autoCompact = line.match(/Context left until auto-compact:\s*(\d+)%/i);
+        if (autoCompact) {
+          contextPct = Math.max(0, Math.min(100, 100 - parseInt(autoCompact[1]!, 10)));
+        }
       }
 
-      // Token count format: "24.9k tokens", "150k tokens", "NNNNN tokens", or "↓ 24.9k tokens"
-      const tokenMatch = line.match(/↓?\s*(\d+(?:[.,]\d+)?)\s*([kKmM])?\s*tokens/);
-      if (tokenMatch) {
-        let tokens = parseFloat(tokenMatch[1]!.replace(/,/g, ''));
-        const suffix = tokenMatch[2];
-        if (suffix === 'k' || suffix === 'K') tokens *= 1_000;
-        else if (suffix === 'm' || suffix === 'M') tokens *= 1_000_000;
-        tokens = Math.round(tokens);
-        const maxTokens = 200_000; // Claude's context window
-        const pct = Math.min(100, Math.round((tokens / maxTokens) * 100));
-        return { contextPct: pct, totalTokens: tokens, confident: true };
+      // Genuine occupancy signal #2 (legacy): "XX% context" — taken as-is.
+      if (contextPct === null) {
+        const pctMatch = line.match(/(\d+)%\s*context/i);
+        if (pctMatch) {
+          contextPct = Math.min(100, parseInt(pctMatch[1]!, 10));
+        }
       }
+
+      // Cumulative session tokens: "24.9k tokens", "150K tokens", "NNNNN tokens",
+      // "↓ 24.9k tokens", "/clear to save 202k tokens". Recorded as totalTokens
+      // ONLY — never converted to a context %.
+      if (totalTokens === undefined) {
+        const tokenMatch = line.match(/↓?\s*(\d+(?:[.,]\d+)?)\s*([kKmM])?\s*tokens/);
+        if (tokenMatch) {
+          let tokens = parseFloat(tokenMatch[1]!.replace(/,/g, ''));
+          const suffix = tokenMatch[2];
+          if (suffix === 'k' || suffix === 'K') tokens *= 1_000;
+          else if (suffix === 'm' || suffix === 'M') tokens *= 1_000_000;
+          totalTokens = Math.round(tokens);
+        }
+      }
+
+      if (contextPct !== null && totalTokens !== undefined) break;
     }
 
-    return { contextPct: null, confident: false };
+    const confident = contextPct !== null || totalTokens !== undefined;
+    return totalTokens !== undefined
+      ? { contextPct, totalTokens, confident }
+      : { contextPct, confident };
   }
 
   buildExitCommand(): string {
