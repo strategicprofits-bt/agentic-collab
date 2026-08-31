@@ -684,28 +684,37 @@ export class HealthMonitor {
         if (match?.[1]) {
           const rawValue = parseInt(match[1].replace(/,/g, ''), 10);
           // Determine if value is a percentage or token count:
-          // If the matched text contains '%', treat as direct percentage.
-          // Otherwise assume token count and convert (200k context window).
+          // If the matched text contains '%', treat as direct occupancy percentage.
           if (match[0].includes('%')) {
             contextPct = Math.min(100, rawValue);
           } else {
+            // GAP-012: a bare token count is CUMULATIVE session tokens, NOT window
+            // occupancy — record it as totalTokens but do NOT divide by 200k to
+            // fabricate a context %. Leave contextPct null so the adapter fallback
+            // can populate it from a genuine occupancy line (or leave it null).
             totalTokens = rawValue;
-            contextPct = Math.min(100, Math.round((rawValue / 200_000) * 100));
           }
           break;
         }
       }
     }
 
-    // Fall back to adapter if contextPattern didn't match
+    // Fall back to adapter if contextPattern didn't match a genuine occupancy %.
+    // (For claude the default contextPattern only matches token counts, so the
+    // adapter is the authoritative source of occupancy — GAP-012.)
     if (contextPct === null) {
       const adapter = getAdapter(agent.engine);
       const contextResult = adapter.parseContextPercent(paneOutput);
       contextPct = contextResult.contextPct;
-      totalTokens = contextResult.totalTokens;
+      if (contextResult.totalTokens !== undefined) totalTokens = contextResult.totalTokens;
     }
 
-    if (contextPct === null) return;
+    // Nothing parseable at all (no occupancy %, no token count) — leave the last
+    // reading untouched (a transient/garbled capture must not wipe a good value).
+    // But a token count with no occupancy line DOES proceed: it records the token
+    // snapshot and honestly writes lastContextPct = null (GAP-012: null = unknown,
+    // never a fabricated or stale %).
+    if (contextPct === null && totalTokens === undefined) return;
 
     // Record token snapshot for usage time series (skip duplicates — only record when count changes)
     if (totalTokens !== undefined) {

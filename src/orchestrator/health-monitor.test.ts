@@ -239,6 +239,52 @@ describe('HealthMonitor', () => {
     assert.equal(writeActions.length, 0, 'should not send any compact/reload commands');
   });
 
+  // GAP-012 (Option A): a bare "NNNNN tokens" status-bar figure is CUMULATIVE
+  // session tokens (matched by the CLAUDE default contextPattern). It must be
+  // recorded as a token snapshot, but MUST NOT be divided by 200k to fabricate a
+  // lastContextPct — that is the clamp GAP-012 is fixing.
+  it('records cumulative tokens as a snapshot without fabricating lastContextPct', async () => {
+    db.createAgent({ name: 'health-tok', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent('health-tok')!;
+    db.updateAgentState('health-tok', 'active', a.version, {
+      tmuxSession: 'agent-health-tok',
+      proxyId: 'p1',
+    });
+
+    captureOutput = 'some output\n                              160000 tokens\n> ';
+
+    const monitor = makeMonitor();
+    proxyCommands = [];
+    await monitor.pollAll();
+
+    const updated = db.getAgent('health-tok')!;
+    assert.equal(updated.lastContextPct, null, 'must not derive 80% from 160000/200000');
+
+    const snaps = db.getTokenSnapshots('health-tok');
+    assert.equal(snaps.length, 1, 'cumulative tokens still recorded as a snapshot');
+    assert.equal(snaps[0]!.totalTokens, 160000);
+  });
+
+  // GAP-012 (Option A): the ONE genuine occupancy signal — "Context left until
+  // auto-compact: N%" — populates lastContextPct as used = 100 - N.
+  it('records genuine occupancy from the auto-compact line as 100 - N', async () => {
+    db.createAgent({ name: 'health-occ', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent('health-occ')!;
+    db.updateAgentState('health-occ', 'active', a.version, {
+      tmuxSession: 'agent-health-occ',
+      proxyId: 'p1',
+    });
+
+    captureOutput = 'some output\n                       Context left until auto-compact: 12%\n> ';
+
+    const monitor = makeMonitor();
+    proxyCommands = [];
+    await monitor.pollAll();
+
+    const updated = db.getAgent('health-occ')!;
+    assert.equal(updated.lastContextPct, 88, 'occupancy used = 100 - 12');
+  });
+
   it('fires onMessageDelivered callback after successful delivery', async () => {
     db.createAgent({ name: 'health-cb-deliver', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
     const a = db.getAgent('health-cb-deliver')!;

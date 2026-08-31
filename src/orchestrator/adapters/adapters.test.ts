@@ -262,36 +262,74 @@ describe('Engine Adapters', () => {
       assert.equal(result.confident, true);
     });
 
-    it('parses context percent from token count format', () => {
+    // GAP-012 (Option A): a "tokens" figure is CUMULATIVE session tokens, NOT
+    // current-window occupancy. It is recorded as totalTokens (a real signal) but
+    // MUST NOT be divided by 200k to fabricate a context %. contextPct stays null.
+    it('records token count as totalTokens without fabricating a context %', () => {
       const result = adapter.parseContextPercent('some output\n                                                                  15048 tokens');
-      assert.equal(result.contextPct, 8); // 15048/200000 ≈ 7.5% rounds to 8%
+      assert.equal(result.contextPct, null);
+      assert.equal(result.totalTokens, 15048);
       assert.equal(result.confident, true);
     });
 
-    it('parses context percent from large token count', () => {
+    it('does not derive a context % from a large cumulative token count', () => {
       const result = adapter.parseContextPercent('  160000 tokens');
-      assert.equal(result.contextPct, 80);
+      assert.equal(result.contextPct, null);
+      assert.equal(result.totalTokens, 160000);
       assert.equal(result.confident, true);
     });
 
-    it('parses context percent from k-suffix format (24.9k tokens)', () => {
+    it('records k-suffix token count as totalTokens, contextPct null (24.9k tokens)', () => {
       const result = adapter.parseContextPercent('Gusting… (33m 58s · ↓ 24.9k tokens · thought for 17s)');
-      assert.equal(result.contextPct, 12); // 24900/200000 ≈ 12.45% rounds to 12%
+      assert.equal(result.contextPct, null);
       assert.equal(result.totalTokens, 24900);
       assert.equal(result.confident, true);
     });
 
-    it('parses context percent from K-suffix format (150K tokens)', () => {
+    it('records K-suffix token count as totalTokens, contextPct null (150K tokens)', () => {
       const result = adapter.parseContextPercent('Working… (5m · ↓ 150K tokens)');
-      assert.equal(result.contextPct, 75);
+      assert.equal(result.contextPct, null);
       assert.equal(result.totalTokens, 150000);
       assert.equal(result.confident, true);
     });
 
-    it('parses context percent from k-suffix without arrow (88.5k tokens)', () => {
+    it('records k-suffix token count as totalTokens, contextPct null (88.5k tokens)', () => {
       const result = adapter.parseContextPercent('  88.5k tokens');
-      assert.equal(result.contextPct, 44); // 88500/200000 = 44.25% rounds to 44%
+      assert.equal(result.contextPct, null);
       assert.equal(result.totalTokens, 88500);
+      assert.equal(result.confident, true);
+    });
+
+    // GAP-012 live-defect regression: the v2.x idle status bar shows
+    // "new task? /clear to save 202k tokens" — a CUMULATIVE figure that exceeds
+    // the window and pinned ctx% to a false 100. Must be totalTokens only.
+    it('does not fabricate 100% from the "/clear to save Nk tokens" idle hint', () => {
+      const result = adapter.parseContextPercent('                          new task? /clear to save 202k tokens');
+      assert.equal(result.contextPct, null);
+      assert.equal(result.totalTokens, 202000);
+      assert.equal(result.confident, true);
+    });
+
+    // GAP-012: the ONE genuine current-window occupancy signal Claude exposes.
+    // "Context left until auto-compact: N%" reports REMAINING headroom, so
+    // occupancy used = 100 - N (a near-full "7%" must read as 93, not 7).
+    it('parses genuine occupancy from "Context left until auto-compact: N%" as 100 - N', () => {
+      const result = adapter.parseContextPercent('  ⏵⏵ bypass permissions on\n                       Context left until auto-compact: 7%');
+      assert.equal(result.contextPct, 93);
+      assert.equal(result.confident, true);
+    });
+
+    // Decoupling: when both a cumulative token line and a genuine occupancy line
+    // are present, contextPct comes from the occupancy line, totalTokens from the
+    // token line — the two quantities are recorded independently.
+    it('decouples occupancy % (from the auto-compact line) from cumulative totalTokens', () => {
+      const pane = [
+        '  new task? /clear to save 202k tokens',
+        '                       Context left until auto-compact: 10%',
+      ].join('\n');
+      const result = adapter.parseContextPercent(pane);
+      assert.equal(result.contextPct, 90);
+      assert.equal(result.totalTokens, 202000);
       assert.equal(result.confident, true);
     });
 
