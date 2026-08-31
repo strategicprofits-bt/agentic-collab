@@ -518,6 +518,80 @@ describe('StrandedWatchdog', () => {
     assert.equal(sentKeys.length, 0);
   });
 
+  // ── TEST 2g–2j: SUSTAINED silent s1-no-correspondence → ALERT (the fix) ──
+  // s1-no-correspondence is logged-but-never-alerted today (stranded-watchdog.ts
+  // :229-236) — a genuinely wedged agent holding an undrained message can sit
+  // silent (the PepperPotts 36h class). The fix pages the Telegram-reaching
+  // monitors when the strand is SUSTAINED (message delivered ≥ DWELL ago) AND the
+  // agent has done ZERO durable work since delivery (hasActivitySince(deliveredAt)
+  // === false — the blessed ground-truth primitive, no context_pct / GAP-012).
+  // deliveredAt anchors both the dwell-age and the activity check (a real DB
+  // timestamp — no injected-now()/DB-clock skew), and IS the episode anchor: the
+  // silent strand began when the message landed undrained.
+  it('TEST 2g: SUSTAINED silent strand (delivered > DWELL ago, zero activity since) → pages both monitors ONCE', async () => {
+    const agent = makeAgent('silent');
+    const ageS = WATCHDOG.SILENT_STRAND_ALERT_SECONDS + 300; // comfortably past dwell
+    seedDeliveredMessage('silent', 'CoachBeard', ageS);
+    // NO snapshot after delivery → hasActivitySince(deliveredAt) === false (silent).
+    scripts.set('silent', { pane: OWN_DRAFT_S1_PANE, frozenSecs: 300 });
+
+    const [outcome] = await makeWatchdog().sweep([agent]);
+    assert.ok(outcome);
+
+    assert.equal(outcome.result, 's1-no-correspondence');
+    const targets = alerts.map((a) => a.target).sort();
+    assert.deepEqual(targets, ['DrRobby', 'SydneyAdamu'], 'both Telegram-reaching monitors paged');
+    assert.ok(alerts.every((a) => a.topic === 'stranded-silent-alert'), 'distinct silent-strand topic');
+    assert.equal(respawned.length, 0, 'ALERT ONLY — the ambiguous s1-no-corr case is never auto-recovered');
+    assert.equal(sentKeys.length, 0, 'no nudge/kill keystrokes');
+  });
+
+  it('TEST 2h: RECENT strand (delivered < DWELL ago) → NO alert (dwell gate rules out transients)', async () => {
+    const agent = makeAgent('recent');
+    seedDeliveredMessage('recent', 'CoachBeard', 300); // 5min ≪ DWELL
+    scripts.set('recent', { pane: OWN_DRAFT_S1_PANE, frozenSecs: 300 });
+    const [outcome] = await makeWatchdog().sweep([agent]);
+    assert.ok(outcome);
+    assert.equal(outcome.result, 's1-no-correspondence');
+    assert.equal(alerts.length, 0, 'a strand younger than DWELL never pages (own-draft/placeholder blips self-clear)');
+  });
+
+  it('TEST 2i: aged strand BUT activity since delivery → NO alert (agent is alive)', async () => {
+    const agent = makeAgent('alive');
+    const ageS = WATCHDOG.SILENT_STRAND_ALERT_SECONDS + 300;
+    seedDeliveredMessage('alive', 'CoachBeard', ageS);
+    seedSnapshot('alive', 60); // a token snapshot 60s ago — AFTER delivery → hasActivitySince=true
+    scripts.set('alive', { pane: OWN_DRAFT_S1_PANE, frozenSecs: 300 });
+    const [outcome] = await makeWatchdog().sweep([agent]);
+    assert.ok(outcome);
+    assert.equal(outcome.result, 's1-no-correspondence');
+    assert.equal(alerts.length, 0, 'ANY durable work since delivery proves alive → the silent-strand alert must not fire');
+  });
+
+  it('TEST 2j: silent-strand alert fires ONCE per episode, RE-ARMS after recovery', async () => {
+    const agent = makeAgent('once');
+    const ageS = WATCHDOG.SILENT_STRAND_ALERT_SECONDS + 300;
+    seedDeliveredMessage('once', 'CoachBeard', ageS);
+    const wd = makeWatchdog();
+
+    // Two consecutive sweeps while still stranded → page ONCE (2 targets = 2 rows).
+    scripts.set('once', { pane: OWN_DRAFT_S1_PANE, frozenSecs: 300 });
+    await wd.sweep([agent]);
+    scripts.set('once', { pane: OWN_DRAFT_S1_PANE, frozenSecs: 300 });
+    await wd.sweep([agent]);
+    assert.equal(alerts.length, 2, 'once-per-episode: a persistent strand does not re-page every sweep');
+
+    // Agent reads healthy (clean composer) → leaves s1-no-correspondence → re-arm.
+    scripts.set('once', { pane: REAL_CLEAN_PANE, frozenSecs: 0 });
+    const [recovered] = await wd.sweep([agent]);
+    assert.notEqual(recovered!.result, 's1-no-correspondence', 'episode ended');
+
+    // A FRESH strand on the same (still-aged, still-silent) message pages again.
+    scripts.set('once', { pane: OWN_DRAFT_S1_PANE, frozenSecs: 300 });
+    await wd.sweep([agent]);
+    assert.equal(alerts.length, 4, 'a NEW episode re-arms and pages fresh (not silenced forever)');
+  });
+
   // ── TEST 3: re-enqueue BEFORE kill (order invariant) ──
   it('TEST 3: unconsumed message is re-enqueued as pending BEFORE the kill', async () => {
     const agent = makeAgent('order');

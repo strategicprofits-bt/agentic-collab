@@ -60,6 +60,13 @@ export const WATCHDOG = {
   /** Re-escalate an unresolved wedge at most once per this interval (seconds).
    *  30 min — clear of alarm-fatigue while never silently dropping a real one. */
   ESCALATE_REMINDER_SECONDS: 1800,
+  /** Dwell before a SUSTAINED s1-no-correspondence strand pages the monitors
+   *  (seconds). The s1-no-correspondence state is ambiguous on a single sweep (an
+   *  agent's own draft / the TUI placeholder trips it transiently), so we only
+   *  alert once a message has sat delivered-but-undrained this long AND the agent
+   *  has done zero durable work since delivery. 30 min rules out transient blips
+   *  while catching the silent-strand class (PepperPotts 36h) far below 36h. */
+  SILENT_STRAND_ALERT_SECONDS: 1800,
 } as const;
 
 export interface StrandedWatchdogDeps {
@@ -151,6 +158,9 @@ export class StrandedWatchdog {
   /** Agents whose s1-no-correspondence was already logged this episode — log the
    *  event once, not every sweep (Chloe accrued 310 rows in one episode). */
   private readonly noCorrLogged = new Set<string>();
+  /** Agents already paged for a SUSTAINED silent strand this episode — page once,
+   *  not every sweep (mirrors noCorrLogged/escalations dedup); cleared on state-exit. */
+  private readonly strandAlerted = new Set<string>();
 
   constructor(deps: StrandedWatchdogDeps) {
     this.db = deps.db;
@@ -187,6 +197,7 @@ export class StrandedWatchdog {
       // that state, so a later re-entry logs once again (not silence forever).
       if (outcome.result !== 's1-no-correspondence') {
         this.noCorrLogged.delete(agent.name);
+        this.strandAlerted.delete(agent.name);
       }
     }
     return out;
@@ -232,6 +243,37 @@ export class StrandedWatchdog {
             composerPreview: (composerText ?? '').slice(0, 80),
           });
           this.noCorrLogged.add(name);
+        }
+        // Logged-but-never-alerted is the gap this closes: a SUSTAINED silent
+        // strand (message delivered ≥ DWELL ago with ZERO durable activity since
+        // delivery) must page the Telegram-reaching monitors. hasActivitySince()
+        // is the blessed ground-truth primitive (a token snapshot / activity event
+        // after the timestamp) — it reads NO context_pct, so this detector never
+        // depends on the GAP-012 telemetry it would otherwise be undermined by.
+        // deliveredAt anchors BOTH legs (a real DB timestamp → no injected-now()/
+        // DB-clock skew) and IS the episode anchor: the strand began when the
+        // message landed undrained. Once per episode (strandAlerted, re-armed on
+        // state-exit) mirrors the escalation dedup — never re-page every ~30s.
+        // In-memory checks (arithmetic, Set) gate the DB query for cheap short-circuit.
+        const deliveredMs = Date.parse(msg.deliveredAt);
+        const ageSecs = Math.floor((this.now() - deliveredMs) / 1000);
+        if (
+          ageSecs >= WATCHDOG.SILENT_STRAND_ALERT_SECONDS &&
+          !this.strandAlerted.has(name) &&
+          !this.db.hasActivitySince(name, msg.deliveredAt)
+        ) {
+          const mins = Math.floor(ageSecs / 60);
+          const body =
+            `⚠️ ${name} has been silently stranded for ${mins}min holding an undrained ` +
+            `message it never consumed (S1: composer shows its own draft/the TUI ` +
+            `placeholder, not the delivered message). ZERO durable activity since ` +
+            `delivery — NOT auto-recovering (the ambiguous s1-no-correspondence case). ` +
+            `Needs operator: check the pane, then unwedge or /clear.`;
+          for (const target of WATCHDOG.ESCALATE_TARGETS) {
+            this.alert(target, 'stranded-silent-alert', body);
+          }
+          this.strandAlerted.add(name);
+          this.logEvent(name, 'stranded_s1_alerted', { deliveredAt: msg.deliveredAt, ageSecs });
         }
         return { agent: name, result: 's1-no-correspondence' };
       }
