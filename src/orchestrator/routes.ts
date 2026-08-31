@@ -17,6 +17,7 @@ import type { WebSocketServer } from '../shared/websocket-server.ts';
 import type { AgentState, DashboardMessage, DestinationRecord, EngineType, PendingMessage, ProxyCommand, ProxyResponse, ProxyRegistration } from '../shared/types.ts';
 import type { TelegramDispatcher } from './telegram.ts';
 import { relayReplyToOperator } from './relay-policy.ts';
+import { droppedRecipients, alertNotifyDrop, type SendAttempt } from './notify-drop.ts';
 import { sanitizeMessage, generateMessageId } from '../shared/sanitize.ts';
 import { getVersion, versionsMatch } from '../shared/version.ts';
 import type { LockManager } from '../shared/lock.ts';
@@ -1952,6 +1953,9 @@ route('DELETE', '/api/accounts/:name', async (_req, res, match, ctx) => {
 // Telegram dedup: hash → timestamp of last send. 4-hour cooldown window.
 const NOTIFY_COOLDOWN_MS = 4 * 60 * 60 * 1000;
 const notifySentHashes = new Map<string, number>();
+// Dedup for the System-B drop alert — do not re-page the monitors for the same dropped
+// message within the cooldown window (mirrors the notifySentHashes shape).
+const notifyDropHashes = new Map<string, number>();
 
 function notifyHash(agent: string | undefined, message: string): string {
   let h = 0x811c9dc5;
@@ -1987,18 +1991,42 @@ route('POST', '/api/notify', async (req, res, _match, ctx) => {
   let sent = 0;
 
   if (!dedupSkip) {
+    const attempts: SendAttempt[] = [];
     for (const dest of destinations) {
+      if (dest.type !== 'telegram') continue;
       const text = agent ? `[${agent}] ${message}` : message;
+      const chatId = dest.config.chatId as string;
+      let ok = false;
       try {
-        if (dest.type === 'telegram') {
-          const botToken = dest.config.botToken as string;
-          const chatId = dest.config.chatId as string;
-          const ok = await ctx.telegramDispatcher.send(botToken, chatId, text);
-          if (ok) sent++;
-        }
-      } catch { /* best-effort per destination */ }
+        ok = await ctx.telegramDispatcher.send(dest.config.botToken as string, chatId, text);
+      } catch (err) {
+        // A send that THREW is a candidate drop — surface it, never swallow.
+        console.error(`[notify] telegram send to dest ${dest.name} threw:`, err);
+        ok = false;
+      }
+      if (!ok) console.error(`[notify] telegram send to dest ${dest.name} FAILED (recipient did not receive)`);
+      if (ok) sent++;
+      attempts.push({ chatId, ok });
     }
     if (sent > 0) notifySentHashes.set(hash, now);
+
+    // Per-recipient drop: any Telegram recipient that got ZERO of its attempted sends never
+    // reached the phone. Surface it (durable logEvent + collab alert to the monitors) instead
+    // of silently swallowing the false/throw. Deduped so a repeat does not re-page.
+    const dropped = droppedRecipients(attempts);
+    if (dropped.length > 0) {
+      const dropHash = `${hash}:drop`;
+      const lastDrop = notifyDropHashes.get(dropHash);
+      if (lastDrop === undefined || (now - lastDrop) >= NOTIFY_COOLDOWN_MS) {
+        notifyDropHashes.set(dropHash, now);
+        alertNotifyDrop({
+          droppedChatIds: dropped,
+          context: 'api/notify',
+          enqueue: (target, envelope) => { ctx.db.enqueueMessage({ sourceAgent: null, targetAgent: target, envelope }); },
+          logEvent: (event, meta) => { ctx.db.logEvent('system', event, undefined, meta); },
+        });
+      }
+    }
   }
 
   // Dashboard notification always fires (dedup only applies to Telegram)
@@ -2069,18 +2097,32 @@ route('POST', '/api/projects/:id/respond', async (req, res, match, ctx) => {
     }
   }
 
-  // Post to all enabled Telegram destinations
-  const destinations = ctx.db.listDestinations();
-  for (const dest of destinations) {
-    if (dest.type === 'telegram' && dest.enabled) {
-      const botToken = dest.config.botToken as string;
-      const chatId = dest.config.chatId as string;
-      const text = `📋 Board response — ${project.title}\n\n${messageText}`;
-      ctx.telegramDispatcher.send(botToken, chatId, text).catch((err: any) => {
-        console.error(`[projects] Telegram send failed for dest ${dest.name}:`, err);
-      });
+  // Post to all enabled Telegram destinations. Non-blocking (does not delay the response),
+  // but the send RESULT is no longer discarded: a recipient that got zero of its attempted
+  // sends is surfaced (durable logEvent + collab alert) instead of silently dropped.
+  const telegramDests = ctx.db.listDestinations().filter(d => d.type === 'telegram' && d.enabled);
+  const projectTitle = project.title;
+  void Promise.all(telegramDests.map(async (dest): Promise<SendAttempt> => {
+    const chatId = dest.config.chatId as string;
+    const text = `📋 Board response — ${projectTitle}\n\n${messageText}`;
+    let ok = false;
+    try {
+      ok = await ctx.telegramDispatcher.send(dest.config.botToken as string, chatId, text);
+    } catch (err: any) {
+      console.error(`[projects] Telegram send failed for dest ${dest.name}:`, err);
+      ok = false;
     }
-  }
+    if (!ok) console.error(`[projects] Telegram send to dest ${dest.name} FAILED (recipient did not receive)`);
+    return { chatId, ok };
+  })).then((attempts) => {
+    const dropped = droppedRecipients(attempts);
+    alertNotifyDrop({
+      droppedChatIds: dropped,
+      context: `project-board:${projectTitle}`,
+      enqueue: (target, envelope) => { ctx.db.enqueueMessage({ sourceAgent: null, targetAgent: target, envelope }); },
+      logEvent: (event, meta) => { ctx.db.logEvent('system', event, undefined, meta); },
+    });
+  }).catch((err) => console.error('[projects] notify-drop detection failed:', err));
 
   // Auto-move out of awaiting_ben if it was there
   if (project.status === 'awaiting_ben') {
