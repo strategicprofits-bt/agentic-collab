@@ -1437,10 +1437,23 @@ export async function interruptAgent(
 export async function compactAgent(
   ctx: LifecycleContext,
   name: string,
+  opts?: { requireIdle?: boolean },
 ): Promise<void> {
   await ctx.locks.withLock(name, async () => {
     const agent = ctx.db.getAgent(name);
     if (!agent) throw new Error(`Agent "${name}" not found`);
+
+    // Fire-time idle re-check UNDER LOCK (auto-compact safety, condition 2d).
+    // /compact is context-destroying; an auto-fired compact is only safe on a genuinely
+    // idle agent. The health-monitor gates on state at poll time, but the agent can go
+    // active in the window before the lock is acquired — so re-verify here, inside the
+    // lock, and skip if it is no longer idle. The manual route omits requireIdle, so its
+    // "compact an active agent on demand" behavior is unchanged.
+    if (opts?.requireIdle && agent.state !== 'idle') {
+      ctx.db.logEvent(name, 'auto_compact_skipped', undefined, { reason: 'not_idle', state: agent.state });
+      return;
+    }
+
     const proxyId = requireProxy(agent);
 
     // Resolve engine config defaults for hook fields

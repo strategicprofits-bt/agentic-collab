@@ -20,7 +20,7 @@ import type { LockManager } from '../shared/lock.ts';
 import type { ProxyCommand, ProxyResponse, AgentRecord, PendingMessage, DashboardMessage, IndicatorDefinition, ActiveIndicator, PipelineStep, DetectionConfig } from '../shared/types.ts';
 import { sessionName, canSuspend } from '../shared/agent-entity.ts';
 import { getAdapter } from './adapters/index.ts';
-import { reloadAgent, recoverAgent, suspendAgent, type LifecycleContext } from './lifecycle.ts';
+import { reloadAgent, recoverAgent, suspendAgent, compactAgent, type LifecycleContext } from './lifecycle.ts';
 import type { RecoveryScaleTracker } from './recovery-scale-tracker.ts';
 import { resolveEffectiveConfig } from './engine-config-resolver.ts';
 import { StrandedWatchdog } from './stranded-watchdog.ts';
@@ -56,6 +56,14 @@ export type HealthMonitorOptions = {
    * active injection/IR. Defaults to the DISABLE_AUTO_RECOVER env var ('1'). Reversible.
    */
   autoRecoverDisabled?: boolean;
+  /** Auto-compact token threshold (default AUTOCOMPACT_TOKEN_THRESHOLD). */
+  autoCompactTokenThreshold?: number;
+  /** Min continuous idle (ms) before an eligible agent is auto-compacted (default AUTOCOMPACT_MIN_IDLE_MS). */
+  autoCompactMinIdleMs?: number;
+  /** Per-agent cooldown (ms) between auto-compacts (default AUTOCOMPACT_COOLDOWN_MS). */
+  autoCompactCooldownMs?: number;
+  /** Global kill-switch for auto-compact (incident lever). Defaults to DISABLE_AUTO_COMPACT env. */
+  autoCompactDisabled?: boolean;
 };
 
 const DEFAULT_POLL_MS = 30_000;
@@ -140,6 +148,23 @@ export class HealthMonitor {
   private readonly idleSuspendMs: number;
   /** When true, auto-recovery is globally suppressed (incident kill-switch). */
   private readonly autoRecoverDisabled: boolean;
+  // ── Auto-compact-on-idle-token-threshold (GAP-012 cluster fix; 2b re-keyed to total_tokens) ──
+  // Config, not hardcoded (dodges the stale-constant trap). Env-tunable without a rebuild.
+  // Threshold is on total_tokens (reliable, resets-on-compaction) NOT context_pct (saturated).
+  // Defaults: 700k (>> the 500-650k legit working band); 60s sustained idle (> poll interval —
+  // the load-bearing false-idle guard); 15min cooldown (anti-rapid-refire).
+  static readonly AUTOCOMPACT_TOKEN_THRESHOLD = parseIntEnv('AUTOCOMPACT_TOKEN_THRESHOLD', 700_000);
+  static readonly AUTOCOMPACT_MIN_IDLE_MS = parseIntEnv('AUTOCOMPACT_MIN_IDLE_MS', 60_000);
+  static readonly AUTOCOMPACT_COOLDOWN_MS = parseIntEnv('AUTOCOMPACT_COOLDOWN_MS', 15 * 60 * 1000);
+  private readonly autoCompactTokenThreshold: number;
+  private readonly autoCompactMinIdleMs: number;
+  private readonly autoCompactCooldownMs: number;
+  /** When true, auto-compact is globally suppressed (incident kill-switch). */
+  private readonly autoCompactDisabled: boolean;
+  /** Agents currently being auto-compacted — prevents duplicate concurrent attempts. */
+  private readonly autoCompacting = new Set<string>();
+  /** Timestamp of last auto-compact fire per agent — enforces the cooldown. */
+  private readonly lastAutoCompact = new Map<string, number>();
   // Env-tunable fast-poll load (2026-08-05 lane-a). DEFAULTS ARE INERT: FAST_POLL_MS=2000
   // (today's interval) and FAST_POLL_MAX_AGENTS=0 (no cap = today). Values are raised/capped
   // via env per host sizing WITHOUT a rebuild (Ben-tuned); the mechanism ships as a no-op.
@@ -201,6 +226,13 @@ export class HealthMonitor {
     this.autoRecoverDisabled = opts.autoRecoverDisabled ?? (process.env['DISABLE_AUTO_RECOVER'] === '1');
     if (this.autoRecoverDisabled) {
       console.warn('[health] DISABLE_AUTO_RECOVER active — auto-recovery suppressed; failed agents need manual recovery');
+    }
+    this.autoCompactTokenThreshold = opts.autoCompactTokenThreshold ?? HealthMonitor.AUTOCOMPACT_TOKEN_THRESHOLD;
+    this.autoCompactMinIdleMs = opts.autoCompactMinIdleMs ?? HealthMonitor.AUTOCOMPACT_MIN_IDLE_MS;
+    this.autoCompactCooldownMs = opts.autoCompactCooldownMs ?? HealthMonitor.AUTOCOMPACT_COOLDOWN_MS;
+    this.autoCompactDisabled = opts.autoCompactDisabled ?? (process.env['DISABLE_AUTO_COMPACT'] === '1');
+    if (this.autoCompactDisabled) {
+      console.warn('[health] DISABLE_AUTO_COMPACT active — auto-compact suppressed; high-context idle agents need manual /compact');
     }
 
     this.strandedWatchdog = new StrandedWatchdog({
@@ -584,6 +616,10 @@ export class HealthMonitor {
       this.handleIdleTransitions(agent, isIdle);
     }
 
+    // Auto-compact a high-context idle agent BEFORE the suspend check. compactAgent
+    // transitions idle→active, which resets the idle clock (blocking immediate suspend
+    // and giving compaction room); it re-idles afterward with a lower token count.
+    this.autoCompactIfEligible(agent.name);
     this.checkIdleSuspendTimeout(agent.name);
 
     const currentAgent = this.db.getAgent(agent.name);
@@ -774,6 +810,70 @@ export class HealthMonitor {
         this.onAgentUpdate(agent.name);
       }
     }
+  }
+
+  /**
+   * Auto-compact an idle agent whose context has grown past the token threshold —
+   * the cause-agnostic fix for the ctx:100% cluster / growing manual peer-/compact toil
+   * (GAP-012 cluster; fix-shape 2b, re-keyed to total_tokens which is reliable and resets
+   * on compaction, sidestepping the saturated context_pct field entirely).
+   *
+   * Multi-gate safety — /compact is a context-DESTROYING action whose entire safety rests
+   * on the agent being genuinely idle (a misclassified mid-stream compact degrades in-context
+   * working memory to a 5-section summary — bounded harm, not lost committed work, but real):
+   *   1. state===idle — the base gate (same classifier the fleet trusts to gate auto-suspend).
+   *   2. sustained idle ≥ autoCompactMinIdleMs — NOT first-idle. A genuinely-working agent is
+   *      not silently frozen (no spinner, no tool line, frozen pane) for this long; this is the
+   *      load-bearing false-idle guard. Must exceed the poll interval.
+   *   3. total_tokens > threshold — reliable signal; codex never sets total_tokens (it reports
+   *      a context %) so it is excluded here for free (compactAgent skip is the backstop).
+   *   4. cooldown — no re-fire within autoCompactCooldownMs (stamped BEFORE the async fires so a
+   *      concurrent poll cannot double-fire). Anti-rapid-refire.
+   *   5. fire-time re-check under lock — compactAgent(requireIdle:true) re-verifies idle inside
+   *      the name lock, closing the poll→fire race structurally.
+   * Anti-loop: after a successful compact tokens drop below threshold (sawtooth), so gate 3
+   * blocks the next fire even before the cooldown elapses.
+   */
+  private autoCompactIfEligible(agentName: string): void {
+    if (this.autoCompactDisabled) return;
+    if (this.autoCompacting.has(agentName)) return;
+
+    const agent = this.db.getAgent(agentName);
+    if (!agent || agent.state !== 'idle' || !agent.lastActivity) return;
+
+    // Gate 2: sustained idle.
+    const idleDuration = Date.now() - new Date(agent.lastActivity).getTime();
+    if (idleDuration < this.autoCompactMinIdleMs) return;
+
+    // Gate 3: token threshold (undefined ⇒ never captured, e.g. codex % context ⇒ excluded).
+    const tokens = this.lastTokenCount.get(agentName);
+    if (tokens === undefined || tokens < this.autoCompactTokenThreshold) return;
+
+    // Gate 4: cooldown.
+    const last = this.lastAutoCompact.get(agentName);
+    const now = Date.now();
+    if (last !== undefined && now - last < this.autoCompactCooldownMs) return;
+
+    // Commit to firing: stamp cooldown + in-flight guard BEFORE the async so a concurrent
+    // poll cannot double-fire during the compaction round-trip.
+    this.lastAutoCompact.set(agentName, now);
+    this.autoCompacting.add(agentName);
+    console.log(`[health] ${agentName}: auto-compacting (tokens=${tokens} ≥ ${this.autoCompactTokenThreshold}, idle=${Math.round(idleDuration / 1000)}s)`);
+    this.db.logEvent(agentName, 'auto_compact', undefined, {
+      tokens,
+      thresholdTokens: this.autoCompactTokenThreshold,
+      idleDurationMs: idleDuration,
+    });
+
+    const lifecycleCtx = this.makeLifecycleCtx();
+    // Gate 5: requireIdle → fire-time re-check under the name lock inside compactAgent.
+    compactAgent(lifecycleCtx, agentName, { requireIdle: true }).then(() => {
+      this.onAgentUpdate(agentName);
+    }).catch((err) => {
+      console.error(`[health] ${agentName}: auto-compact failed:`, (err as Error).message);
+    }).finally(() => {
+      this.autoCompacting.delete(agentName);
+    });
   }
 
   /**

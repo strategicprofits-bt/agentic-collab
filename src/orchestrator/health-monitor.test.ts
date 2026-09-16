@@ -1064,6 +1064,172 @@ describe('HealthMonitor', () => {
     assert.equal(after?.state, 'suspending', 'should auto-suspend with distant reminder');
     monitor.stop();
   });
+
+  // Remove auto-compact test agents so a later test's monitor doesn't re-poll a leftover
+  // idle high-token agent from the shared db and fire a stray compact (suspend-based tests
+  // self-exclude by leaving the pollable set; auto-compact leaves the agent idle).
+  afterEach(() => {
+    for (const n of [
+      'health-autocompact', 'health-autocompact-below', 'health-autocompact-fresh',
+      'health-autocompact-cooldown', 'health-autocompact-disabled',
+    ]) {
+      if (db.getAgent(n)) db.deleteAgent(n);
+    }
+  });
+
+  // ── Auto-compact-on-idle-token-threshold (GAP-012 cluster fix, 2b re-keyed to total_tokens) ──
+  //
+  // Drives the real path: a pane containing "<N> tokens" makes recordContextPercent set the
+  // in-memory token count; two unchanged polls mark the agent idle; then eligibility fires
+  // compactAgent(requireIdle:true). idleSuspendMs is set huge to isolate compact from suspend.
+  // targetSession scoping: return the high-token pane ONLY for this test's own agent, so a
+  // leftover idle agent from a prior test in the shared db reads a neutral (token-less) pane
+  // and can't draw a stray compact into this test's paste counter.
+  function makeCompactMonitor(
+    targetName: string,
+    captureRef: () => string,
+    pasted: string[],
+    overrides?: Partial<ConstructorParameters<typeof HealthMonitor>[0]>,
+  ): HealthMonitor {
+    const targetSession = `agent-${targetName}`;
+    const isTarget = (command: ProxyCommand) =>
+      'sessionName' in command && command.sessionName === targetSession;
+    return makeMonitor({
+      idleSuspendMs: 999_999,
+      autoCompactTokenThreshold: 700_000,
+      autoCompactMinIdleMs: 50,
+      autoCompactCooldownMs: 10_000,
+      proxyDispatch: async (_p: string, command: ProxyCommand): Promise<ProxyResponse> => {
+        proxyCommands.push(command);
+        if (command.action === 'capture') return { ok: true, data: isTarget(command) ? captureRef() : '> \n' };
+        if (command.action === 'has_session') return { ok: true, data: true };
+        if (command.action === 'pane_activity') return { ok: true, data: 1 };
+        if (command.action === 'paste' && isTarget(command)) pasted.push((('text' in command && command.text) as string) ?? '');
+        return { ok: true };
+      },
+      ...overrides,
+    });
+  }
+
+  async function driveToIdle(monitor: HealthMonitor, name: string): Promise<void> {
+    await monitor.pollAll(); // baseline snapshot
+    await monitor.pollAll(); // unchanged → idle; token count recorded
+    const idle = db.getAgent(name);
+    assert.equal(idle?.state, 'idle', 'precondition: agent should be idle');
+    // Push lastActivity into the past to exceed autoCompactMinIdleMs
+    db.updateAgentState(name, 'idle', idle!.version, {
+      lastActivity: new Date(Date.now() - 10_000).toISOString(),
+    });
+  }
+
+  it('auto-compacts an idle agent above the token threshold', async () => {
+    const name = 'health-autocompact';
+    db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent(name)!;
+    db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
+
+    let cap = 'working\n750000 tokens\n> \n';
+    const pasted: string[] = [];
+    const monitor = makeCompactMonitor(name, () => cap, pasted);
+
+    await driveToIdle(monitor, name);
+    await monitor.pollAll(); // eligible → auto-compact
+    await new Promise(r => setTimeout(r, 200));
+
+    assert.ok(pasted.some(t => t.includes('/compact')), 'should paste /compact');
+    const events = db.getEvents(name, 20);
+    assert.ok(events.some(e => e.event === 'auto_compact'), 'should log auto_compact');
+    void cap;
+    monitor.stop();
+  });
+
+  it('does NOT auto-compact when tokens are below threshold', async () => {
+    const name = 'health-autocompact-below';
+    db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent(name)!;
+    db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
+
+    const cap = 'working\n523000 tokens\n> \n'; // legit working band — must NOT fire
+    const pasted: string[] = [];
+    const monitor = makeCompactMonitor(name, () => cap, pasted);
+
+    await driveToIdle(monitor, name);
+    await monitor.pollAll();
+    await new Promise(r => setTimeout(r, 200));
+
+    assert.ok(!pasted.some(t => t.includes('/compact')), 'must not compact below the token threshold');
+    monitor.stop();
+  });
+
+  it('does NOT auto-compact before the minimum idle duration', async () => {
+    const name = 'health-autocompact-fresh';
+    db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent(name)!;
+    db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
+
+    const cap = 'working\n750000 tokens\n> \n';
+    const pasted: string[] = [];
+    // Large min-idle so a freshly-idle agent is not yet eligible
+    const monitor = makeCompactMonitor(name, () => cap, pasted, { autoCompactMinIdleMs: 999_999 });
+
+    await monitor.pollAll();
+    await monitor.pollAll(); // idle, but only just now
+    await monitor.pollAll(); // still within min-idle
+    await new Promise(r => setTimeout(r, 200));
+
+    assert.ok(!pasted.some(t => t.includes('/compact')), 'must not compact a freshly-idle agent');
+    monitor.stop();
+  });
+
+  it('does NOT re-fire within the cooldown window', async () => {
+    const name = 'health-autocompact-cooldown';
+    db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent(name)!;
+    db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
+
+    const cap = 'working\n750000 tokens\n> \n';
+    const pasted: string[] = [];
+    const monitor = makeCompactMonitor(name, () => cap, pasted, { autoCompactCooldownMs: 999_999 });
+
+    await driveToIdle(monitor, name);
+    await monitor.pollAll(); // first fire
+    await new Promise(r => setTimeout(r, 200));
+    const firstCount = pasted.filter(t => t.includes('/compact')).length;
+    assert.equal(firstCount, 1, 'should fire once');
+
+    // Force back to idle + stale lastActivity, poll again inside cooldown
+    const cur = db.getAgent(name)!;
+    db.updateAgentState(name, 'idle', cur.version, {
+      lastActivity: new Date(Date.now() - 10_000).toISOString(),
+    });
+    await monitor.pollAll();
+    await new Promise(r => setTimeout(r, 200));
+
+    assert.equal(
+      pasted.filter(t => t.includes('/compact')).length,
+      1,
+      'must not re-fire within cooldown',
+    );
+    monitor.stop();
+  });
+
+  it('does NOT auto-compact when disabled', async () => {
+    const name = 'health-autocompact-disabled';
+    db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent(name)!;
+    db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
+
+    const cap = 'working\n750000 tokens\n> \n';
+    const pasted: string[] = [];
+    const monitor = makeCompactMonitor(name, () => cap, pasted, { autoCompactDisabled: true });
+
+    await driveToIdle(monitor, name);
+    await monitor.pollAll();
+    await new Promise(r => setTimeout(r, 200));
+
+    assert.ok(!pasted.some(t => t.includes('/compact')), 'must not compact when auto-compact disabled');
+    monitor.stop();
+  });
 });
 
 describe('HealthMonitor.stripAnsi', () => {
