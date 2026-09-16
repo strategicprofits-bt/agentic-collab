@@ -1070,8 +1070,8 @@ describe('HealthMonitor', () => {
   // self-exclude by leaving the pollable set; auto-compact leaves the agent idle).
   afterEach(() => {
     for (const n of [
-      'health-autocompact', 'health-autocompact-below', 'health-autocompact-fresh',
-      'health-autocompact-cooldown', 'health-autocompact-disabled',
+      'health-autocompact', 'health-autocompact-sustained', 'health-autocompact-below',
+      'health-autocompact-fresh', 'health-autocompact-cooldown', 'health-autocompact-disabled',
     ]) {
       if (db.getAgent(n)) db.deleteAgent(n);
     }
@@ -1111,15 +1111,15 @@ describe('HealthMonitor', () => {
     });
   }
 
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  // Drive an active agent to idle via real polls (stamps the idle-onset clock at the
+  // transition). NO backdating — sustained idle is exercised with real elapsed time so the
+  // per-poll agent.lastActivity refresh cannot mask a broken gate.
   async function driveToIdle(monitor: HealthMonitor, name: string): Promise<void> {
     await monitor.pollAll(); // baseline snapshot
-    await monitor.pollAll(); // unchanged → idle; token count recorded
-    const idle = db.getAgent(name);
-    assert.equal(idle?.state, 'idle', 'precondition: agent should be idle');
-    // Push lastActivity into the past to exceed autoCompactMinIdleMs
-    db.updateAgentState(name, 'idle', idle!.version, {
-      lastActivity: new Date(Date.now() - 10_000).toISOString(),
-    });
+    await monitor.pollAll(); // unchanged → idle; idleSince stamped, token count recorded
+    assert.equal(db.getAgent(name)?.state, 'idle', 'precondition: agent should be idle');
   }
 
   it('auto-compacts an idle agent above the token threshold', async () => {
@@ -1133,13 +1133,37 @@ describe('HealthMonitor', () => {
     const monitor = makeCompactMonitor(name, () => cap, pasted);
 
     await driveToIdle(monitor, name);
+    await sleep(120); // real sustained idle beyond minIdle (50ms)
     await monitor.pollAll(); // eligible → auto-compact
-    await new Promise(r => setTimeout(r, 200));
+    await sleep(200);
 
     assert.ok(pasted.some(t => t.includes('/compact')), 'should paste /compact');
     const events = db.getEvents(name, 20);
     assert.ok(events.some(e => e.event === 'auto_compact'), 'should log auto_compact');
     void cap;
+    monitor.stop();
+  });
+
+  it('measures SUSTAINED idle across continuous polls, not time-since-last-poll (regression)', async () => {
+    const name = 'health-autocompact-sustained';
+    db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent(name)!;
+    db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
+
+    const cap = 'working\n750000 tokens\n> \n';
+    const pasted: string[] = [];
+    // minIdle 250ms; NO backdating. The idle clock must survive continuous polling (the
+    // production path — health-monitor refreshes agent.lastActivity every poll, so a gate
+    // keyed on that never accrues sustained idle).
+    const monitor = makeCompactMonitor(name, () => cap, pasted, { autoCompactMinIdleMs: 250, autoCompactCooldownMs: 999_999 });
+    await monitor.pollAll();
+    await monitor.pollAll();
+    assert.equal(db.getAgent(name)?.state, 'idle', 'precondition: idle');
+    // Simulate production cadence: poll continuously across > minIdle of REAL elapsed time.
+    const start = Date.now();
+    while (Date.now() - start < 500) { await monitor.pollAll(); await new Promise(r => setTimeout(r, 40)); }
+    await new Promise(r => setTimeout(r, 250));
+    assert.ok(pasted.some(t => t.includes('/compact')), 'must fire after SUSTAINED idle despite continuous polling');
     monitor.stop();
   });
 
@@ -1154,8 +1178,9 @@ describe('HealthMonitor', () => {
     const monitor = makeCompactMonitor(name, () => cap, pasted);
 
     await driveToIdle(monitor, name);
+    await sleep(120); // sustained idle beyond minIdle → the ONLY blocker is the token gate
     await monitor.pollAll();
-    await new Promise(r => setTimeout(r, 200));
+    await sleep(200);
 
     assert.ok(!pasted.some(t => t.includes('/compact')), 'must not compact below the token threshold');
     monitor.stop();
@@ -1192,18 +1217,18 @@ describe('HealthMonitor', () => {
     const monitor = makeCompactMonitor(name, () => cap, pasted, { autoCompactCooldownMs: 999_999 });
 
     await driveToIdle(monitor, name);
+    await sleep(120);
     await monitor.pollAll(); // first fire
-    await new Promise(r => setTimeout(r, 200));
-    const firstCount = pasted.filter(t => t.includes('/compact')).length;
-    assert.equal(firstCount, 1, 'should fire once');
+    await sleep(200);
+    assert.equal(pasted.filter(t => t.includes('/compact')).length, 1, 'should fire once');
 
-    // Force back to idle + stale lastActivity, poll again inside cooldown
-    const cur = db.getAgent(name)!;
-    db.updateAgentState(name, 'idle', cur.version, {
-      lastActivity: new Date(Date.now() - 10_000).toISOString(),
-    });
+    // compact transitioned the agent active; drive it back to idle via real polls (stamps a
+    // FRESH idleSince), wait past minIdle so it is eligible again — the ONLY remaining blocker
+    // is the cooldown.
+    await driveToIdle(monitor, name);
+    await sleep(120);
     await monitor.pollAll();
-    await new Promise(r => setTimeout(r, 200));
+    await sleep(200);
 
     assert.equal(
       pasted.filter(t => t.includes('/compact')).length,
@@ -1224,8 +1249,9 @@ describe('HealthMonitor', () => {
     const monitor = makeCompactMonitor(name, () => cap, pasted, { autoCompactDisabled: true });
 
     await driveToIdle(monitor, name);
+    await sleep(120); // sustained idle beyond minIdle → the ONLY blocker is the disabled flag
     await monitor.pollAll();
-    await new Promise(r => setTimeout(r, 200));
+    await sleep(200);
 
     assert.ok(!pasted.some(t => t.includes('/compact')), 'must not compact when auto-compact disabled');
     monitor.stop();

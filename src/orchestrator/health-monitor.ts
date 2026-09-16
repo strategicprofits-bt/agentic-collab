@@ -165,6 +165,15 @@ export class HealthMonitor {
   private readonly autoCompacting = new Set<string>();
   /** Timestamp of last auto-compact fire per agent — enforces the cooldown. */
   private readonly lastAutoCompact = new Map<string, number>();
+  /**
+   * Timestamp of the active→idle transition per agent — the TRUE idle-onset clock for the
+   * auto-compact sustained-idle gate. Deliberately NOT agent.lastActivity: that DB field is
+   * refreshed to now on EVERY successful poll (dashboard freshness), so it measures
+   * time-since-last-poll, not sustained idle. Set once at the active→idle transition, cleared
+   * on idle→active — untouched by the per-poll refresh. In-memory (best-effort): lost on
+   * restart, so a still-idle agent is not auto-compacted until its next real transition (safe).
+   */
+  private readonly idleSince = new Map<string, number>();
   // Env-tunable fast-poll load (2026-08-05 lane-a). DEFAULTS ARE INERT: FAST_POLL_MS=2000
   // (today's interval) and FAST_POLL_MAX_AGENTS=0 (no cap = today). Values are raised/capped
   // via env per host sizing WITHOUT a rebuild (Ben-tuned); the mechanism ships as a no-op.
@@ -616,9 +625,10 @@ export class HealthMonitor {
       this.handleIdleTransitions(agent, isIdle);
     }
 
-    // Auto-compact a high-context idle agent BEFORE the suspend check. compactAgent
-    // transitions idle→active, which resets the idle clock (blocking immediate suspend
-    // and giving compaction room); it re-idles afterward with a lower token count.
+    // Auto-compact a high-context idle agent BEFORE the suspend check. compactAgent's
+    // idle→active flip lands asynchronously (one tick later, under its lock), then it
+    // re-idles with a lower token count — so it naturally spaces compaction from suspend;
+    // the 60s-compact / 5min-suspend margin makes the exact ordering non-critical.
     this.autoCompactIfEligible(agent.name);
     this.checkIdleSuspendTimeout(agent.name);
 
@@ -796,6 +806,7 @@ export class HealthMonitor {
           lastActivity: new Date().toISOString(),
         });
         this.db.logEvent(agent.name, 'idle_detected');
+        this.idleSince.set(agent.name, Date.now()); // idle-onset clock for auto-compact
         this.onAgentUpdate(agent.name);
         this.onIdleDetected(agent.name);
       }
@@ -807,6 +818,7 @@ export class HealthMonitor {
           lastActivity: new Date().toISOString(),
         });
         this.db.logEvent(agent.name, 'activity_detected');
+        this.idleSince.delete(agent.name); // no longer idle — reset the idle-onset clock
         this.onAgentUpdate(agent.name);
       }
     }
@@ -839,10 +851,15 @@ export class HealthMonitor {
     if (this.autoCompacting.has(agentName)) return;
 
     const agent = this.db.getAgent(agentName);
-    if (!agent || agent.state !== 'idle' || !agent.lastActivity) return;
+    if (!agent || agent.state !== 'idle') return;
 
-    // Gate 2: sustained idle.
-    const idleDuration = Date.now() - new Date(agent.lastActivity).getTime();
+    // Gate 2: SUSTAINED idle — measured from the active→idle transition (idleSince), NOT
+    // agent.lastActivity (which the per-poll refresh resets, making it time-since-last-poll).
+    // Undefined ⇒ no observed transition yet (e.g. idle since before the monitor started) ⇒
+    // skip until a real transition establishes the clock.
+    const idleStart = this.idleSince.get(agentName);
+    if (idleStart === undefined) return;
+    const idleDuration = Date.now() - idleStart;
     if (idleDuration < this.autoCompactMinIdleMs) return;
 
     // Gate 3: token threshold (undefined ⇒ never captured, e.g. codex % context ⇒ excluded).
@@ -1151,6 +1168,7 @@ export class HealthMonitor {
     this.consecutiveFailures.delete(`shell_${name}`);
     this.consecutiveFailures.delete(`heal_${name}`);
     this.lastActivityTs.delete(name);
+    this.idleSince.delete(name);
     this.healedAt.delete(name);
     this.activeIndicators.delete(name);
     this.compiledIndicators.delete(name);
