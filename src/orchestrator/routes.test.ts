@@ -1,7 +1,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Database } from './database.ts';
@@ -24,9 +24,17 @@ describe('API Routes', () => {
   let port: number;
   let tmpDir: string;
   let proxyCommands: ProxyCommand[];
+  let savedPersonasDir: string | undefined;
 
   before(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'agentic-routes-test-'));
+    // GAP-066: isolate PERSONAS_DIR so POST /api/agents persona-file writes land in tmp, NOT
+    // the default dir which symlinks to the live orchestrator's watched persistent-agents —
+    // persona-watch would otherwise create orphan void DB rows in the live fleet from these
+    // test fixtures. The create handler reads getPersonasDir() fresh per request, so setting
+    // the env before any request is sufficient.
+    savedPersonasDir = process.env['PERSONAS_DIR'];
+    process.env['PERSONAS_DIR'] = join(tmpDir, 'personas');
     db = new Database(join(tmpDir, 'test.db'));
     wss = new WebSocketServer();
     proxyCommands = [];
@@ -85,6 +93,8 @@ describe('API Routes', () => {
     wss.close();
     server.close();
     db.close();
+    if (savedPersonasDir === undefined) delete process.env['PERSONAS_DIR'];
+    else process.env['PERSONAS_DIR'] = savedPersonasDir;
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -141,6 +151,18 @@ describe('API Routes', () => {
     // Verify the group actually persisted
     const { data: agent } = await api('GET', '/api/agents/api-agent-grouped');
     assert.equal((agent as Record<string, unknown>).agentGroup, 'platform');
+  });
+
+  it('PATCH /api/agents/:name/group writes the persona file to the ISOLATED PERSONAS_DIR', async () => {
+    // GAP-066 residual (Roz): the PATCH /group write goes through resolvePersonaPath, which
+    // must honor the runtime PERSONAS_DIR (getPersonasDir), NOT a frozen import-time constant —
+    // else the frontmatter update lands in the real watched dir. api-agent-grouped was POSTed
+    // (group:infra) then PATCHed to platform above; the update must be visible in the ISOLATED
+    // dir's file. On the old static-const path the PATCH resolves elsewhere (no-op here) and the
+    // isolated file keeps group:infra → this assertion fails; with the fix it lands here.
+    const personaFile = join(tmpDir, 'personas', 'api-agent-grouped.md');
+    assert.ok(existsSync(personaFile), 'persona file must exist in the isolated PERSONAS_DIR');
+    assert.match(readFileSync(personaFile, 'utf-8'), /group:\s*platform/, 'PATCH group update must land in the isolated file (resolvePersonaPath honors runtime PERSONAS_DIR)');
   });
 
   it('PATCH /api/agents/:name/group returns 404 for unknown agent', async () => {

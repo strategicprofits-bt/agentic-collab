@@ -762,7 +762,7 @@ export function scanPersonas(personasDir?: string): ParsedPersona[] {
  * 2. Check personasDir/<name>.md (convention)
  * 3. If neither found, return null
  */
-export function resolvePersonaPath(agentName: string, explicitPath?: string | null, personasDir: string = PERSONAS_DIR): string | null {
+export function resolvePersonaPath(agentName: string, explicitPath?: string | null, personasDir: string = getPersonasDir()): string | null {
   if (explicitPath) {
     // Use realpathSync as the primary check — resolves symlinks and validates existence
     // in a single atomic call, eliminating the TOCTOU between existsSync and realpathSync

@@ -24,9 +24,17 @@ describe('Integration: full lifecycle via HTTP', () => {
   let tmpDir: string;
   let proxyCommands: ProxyCommand[];
   let sessions: Set<string>; // simulate tmux session tracking
+  let savedPersonasDir: string | undefined;
 
   before(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'integration-test-'));
+    // GAP-066: isolate PERSONAS_DIR so POST /api/agents persona-file writes land in tmp, NOT
+    // the default dir which symlinks to the live orchestrator's watched persistent-agents —
+    // otherwise persona-watch creates orphan void DB rows in the live fleet from these
+    // fixtures (they leak even though the test destroys them, because the live row is made
+    // before the destroy removes the file). Handler reads getPersonasDir() fresh per request.
+    savedPersonasDir = process.env['PERSONAS_DIR'];
+    process.env['PERSONAS_DIR'] = join(tmpDir, 'personas');
     db = new Database(join(tmpDir, 'test.db'));
     wss = new WebSocketServer();
     proxyCommands = [];
@@ -96,6 +104,8 @@ describe('Integration: full lifecycle via HTTP', () => {
     wss.close();
     server.close();
     db.close();
+    if (savedPersonasDir === undefined) delete process.env['PERSONAS_DIR'];
+    else process.env['PERSONAS_DIR'] = savedPersonasDir;
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
