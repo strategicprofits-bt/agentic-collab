@@ -32,6 +32,14 @@ services:
       # on actual timeout, so healthy spawns are unaffected. See data/knowledge/
       # decisions/2026-04-30-eames-spawn-failure.md for the full diagnosis.
       - SPAWN_TIMEOUT_MS=120000
+      # Auto-compact-on-idle-token-threshold (GAP-012 cluster fix) — tunables + incident
+      # kill-switch, passed through so they are settable via host env WITHOUT a rebuild.
+      # Empty/unset → code defaults (threshold 700k / minIdle 60s / cooldown 15min).
+      # DISABLE_AUTO_COMPACT=1 disarms the auto-op fleet-wide (the incident lever).
+      - DISABLE_AUTO_COMPACT=${DISABLE_AUTO_COMPACT:-}
+      - AUTOCOMPACT_TOKEN_THRESHOLD=${AUTOCOMPACT_TOKEN_THRESHOLD:-}
+      - AUTOCOMPACT_MIN_IDLE_MS=${AUTOCOMPACT_MIN_IDLE_MS:-}
+      - AUTOCOMPACT_COOLDOWN_MS=${AUTOCOMPACT_COOLDOWN_MS:-}
     labels:
       io.agentic-collab.role: orchestrator
     restart: unless-stopped

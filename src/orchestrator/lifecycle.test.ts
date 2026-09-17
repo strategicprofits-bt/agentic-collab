@@ -526,6 +526,47 @@ describe('Lifecycle', () => {
       const events = db.getEvents('compact-codex', 5);
       assert.ok(events.some((e: { event: string }) => e.event === 'compact_skipped'), 'should log compact_skipped event');
     });
+
+    it('with requireIdle skips compaction when the agent is not idle (fire-time re-check)', async () => {
+      db.createAgent({ name: 'compact-active', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      const a = db.getAgent('compact-active')!;
+      db.updateAgentState('compact-active', 'active', a.version, {
+        tmuxSession: 'agent-compact-active',
+        proxyId: 'p1',
+      });
+
+      proxyCommands = [];
+      await compactAgent(ctx, 'compact-active', { requireIdle: true });
+      assert.ok(!proxyCommands.some(c => c.action === 'paste'), 'must not paste /compact into a non-idle agent when requireIdle');
+      const events = db.getEvents('compact-active', 5);
+      assert.ok(events.some((e: { event: string }) => e.event === 'auto_compact_skipped'), 'should log auto_compact_skipped');
+    });
+
+    it('with requireIdle compacts when the agent is idle', async () => {
+      db.createAgent({ name: 'compact-idle', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      const a = db.getAgent('compact-idle')!;
+      db.updateAgentState('compact-idle', 'idle', a.version, {
+        tmuxSession: 'agent-compact-idle',
+        proxyId: 'p1',
+      });
+
+      proxyCommands = [];
+      await compactAgent(ctx, 'compact-idle', { requireIdle: true });
+      assert.ok(proxyCommands.some(c => c.action === 'paste'), 'should paste /compact when idle + requireIdle');
+    });
+
+    it('without requireIdle still compacts an active agent (manual-route behavior unchanged)', async () => {
+      db.createAgent({ name: 'compact-manual', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      const a = db.getAgent('compact-manual')!;
+      db.updateAgentState('compact-manual', 'active', a.version, {
+        tmuxSession: 'agent-compact-manual',
+        proxyId: 'p1',
+      });
+
+      proxyCommands = [];
+      await compactAgent(ctx, 'compact-manual');
+      assert.ok(proxyCommands.some(c => c.action === 'paste'), 'manual route must still compact an active agent');
+    });
   });
 
   describe('killAgent', () => {
