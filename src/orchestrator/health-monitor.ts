@@ -25,6 +25,7 @@ import type { RecoveryScaleTracker } from './recovery-scale-tracker.ts';
 import { resolveEffectiveConfig } from './engine-config-resolver.ts';
 import { StrandedWatchdog } from './stranded-watchdog.ts';
 import { classifyPaneCommand } from './pane-liveness.ts';
+import { extractComposerText } from '../shared/composer.ts';
 
 type CompiledDetection = {
   json: string;
@@ -629,7 +630,7 @@ export class HealthMonitor {
     // idle→active flip lands asynchronously (one tick later, under its lock), then it
     // re-idles with a lower token count — so it naturally spaces compaction from suspend;
     // the 60s-compact / 5min-suspend margin makes the exact ordering non-critical.
-    this.autoCompactIfEligible(agent.name);
+    void this.autoCompactIfEligible(agent.name);
     this.checkIdleSuspendTimeout(agent.name);
 
     const currentAgent = this.db.getAgent(agent.name);
@@ -846,7 +847,7 @@ export class HealthMonitor {
    * Anti-loop: after a successful compact tokens drop below threshold (sawtooth), so gate 3
    * blocks the next fire even before the cooldown elapses.
    */
-  private autoCompactIfEligible(agentName: string): void {
+  private async autoCompactIfEligible(agentName: string): Promise<void> {
     if (this.autoCompactDisabled) return;
     if (this.autoCompacting.has(agentName)) return;
 
@@ -871,10 +872,27 @@ export class HealthMonitor {
     const now = Date.now();
     if (last !== undefined && now - last < this.autoCompactCooldownMs) return;
 
-    // Commit to firing: stamp cooldown + in-flight guard BEFORE the async so a concurrent
-    // poll cannot double-fire during the compaction round-trip.
-    this.lastAutoCompact.set(agentName, now);
+    // In-flight guard BEFORE the async composer read so a concurrent poll can't double-enter
+    // (the top-of-method autoCompacting.has check rejects a second poll while this one runs).
     this.autoCompacting.add(agentName);
+
+    // Gate 6 (Axis-C): don't auto-compact an idle agent that holds a REAL composer draft — an
+    // unattended /compact would paste into the draft and submit "draft/compact" as junk
+    // (bounded + non-wedge, but avoidable when firing unattended). extractComposerText returns
+    // null for an empty composer (bare ❯) and the draft text otherwise. DEFER (no cooldown
+    // stamp) so it fires once the draft clears; on capture failure do NOT fire (safe). This
+    // async read is reached only after the cheap gates, so it runs rarely.
+    const cap = agent.proxyId
+      ? await this.proxyDispatch(agent.proxyId, { action: 'capture', sessionName: sessionName(agent), lines: 20 })
+      : ({ ok: false } as ProxyResponse);
+    if (!cap.ok || extractComposerText((cap.data as string) ?? '') !== null) {
+      if (cap.ok) this.db.logEvent(agentName, 'auto_compact_deferred', undefined, { reason: 'composer_nonempty' });
+      this.autoCompacting.delete(agentName);
+      return;
+    }
+
+    // Commit to firing: stamp cooldown so the 15min cooldown blocks re-fire.
+    this.lastAutoCompact.set(agentName, now);
     console.log(`[health] ${agentName}: auto-compacting (tokens=${tokens} ≥ ${this.autoCompactTokenThreshold}, idle=${Math.round(idleDuration / 1000)}s)`);
     this.db.logEvent(agentName, 'auto_compact', undefined, {
       tokens,

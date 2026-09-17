@@ -1072,6 +1072,7 @@ describe('HealthMonitor', () => {
     for (const n of [
       'health-autocompact', 'health-autocompact-sustained', 'health-autocompact-below',
       'health-autocompact-fresh', 'health-autocompact-cooldown', 'health-autocompact-disabled',
+      'health-autocompact-draft', 'health-autocompact-emptyprompt', 'health-autocompact-capfail',
     ]) {
       if (db.getAgent(n)) db.deleteAgent(n);
     }
@@ -1254,6 +1255,95 @@ describe('HealthMonitor', () => {
     await sleep(200);
 
     assert.ok(!pasted.some(t => t.includes('/compact')), 'must not compact when auto-compact disabled');
+    monitor.stop();
+  });
+
+  // ── Axis-C guard: don't auto-compact an idle agent that holds a real composer draft ──
+  it('DEFERS auto-compact when the idle agent holds a composer draft', async () => {
+    const name = 'health-autocompact-draft';
+    db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent(name)!;
+    db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
+
+    // Composer holds a real draft (❯ + text) → extractComposerText returns non-null → defer.
+    const cap = 'working\n750000 tokens\n❯ half-typed draft the agent left\n';
+    const pasted: string[] = [];
+    const monitor = makeCompactMonitor(name, () => cap, pasted);
+
+    // A draft composer (❯ + text) doesn't match the idle-pattern, so idle is reached via
+    // screen-diff (unchanged across IDLE_THRESHOLD polls) — needs one extra poll vs driveToIdle.
+    await monitor.pollAll();
+    await monitor.pollAll();
+    await monitor.pollAll();
+    assert.equal(db.getAgent(name)?.state, 'idle', 'precondition: idle (with a draft)');
+    await sleep(120); // sustained idle beyond minIdle → the ONLY blocker is the draft guard
+    await monitor.pollAll();
+    await sleep(200);
+
+    assert.ok(!pasted.some(t => t.includes('/compact')), 'must NOT compact into a non-empty composer (would mangle the draft)');
+    const events = db.getEvents(name, 20);
+    assert.ok(events.some(e => e.event === 'auto_compact_deferred'), 'should log auto_compact_deferred');
+    monitor.stop();
+  });
+
+  it('FIRES when the composer is an empty ❯ prompt (no false-defer)', async () => {
+    const name = 'health-autocompact-emptyprompt';
+    db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent(name)!;
+    db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
+
+    // Real fleet idle composer is a bare ❯ — extractComposerText returns null → must FIRE
+    // (guarding against the inverse bug: false-deferring on an empty composer = inert again).
+    const cap = 'working\n750000 tokens\n❯ \n';
+    const pasted: string[] = [];
+    const monitor = makeCompactMonitor(name, () => cap, pasted);
+
+    await driveToIdle(monitor, name);
+    await sleep(120);
+    await monitor.pollAll();
+    await sleep(200);
+
+    assert.ok(pasted.some(t => t.includes('/compact')), 'must fire on an empty ❯ composer (bare prompt is not a draft)');
+    monitor.stop();
+  });
+
+  it('does NOT fire when the composer capture fails (cannot verify → safe)', async () => {
+    const name = 'health-autocompact-capfail';
+    db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent(name)!;
+    db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
+
+    const cap = 'working\n750000 tokens\n> \n';
+    const pasted: string[] = [];
+    // Fail ONLY the guard's capture (lines:20) for the target; leave the idle-detection
+    // captures working so the agent still reaches idle. Cannot-verify-composer → do NOT fire.
+    const targetSession = `agent-${name}`;
+    const monitor = makeMonitor({
+      idleSuspendMs: 999_999,
+      autoCompactTokenThreshold: 700_000,
+      autoCompactMinIdleMs: 50,
+      autoCompactCooldownMs: 10_000,
+      proxyDispatch: async (_p: string, command: ProxyCommand): Promise<ProxyResponse> => {
+        proxyCommands.push(command);
+        const isTarget = 'sessionName' in command && command.sessionName === targetSession;
+        if (command.action === 'capture') {
+          // the guard captures with lines:20 → fail that specific read for the target
+          if (isTarget && command.lines === 20) return { ok: false, error: 'capture failed' };
+          return { ok: true, data: isTarget ? cap : '> \n' };
+        }
+        if (command.action === 'has_session') return { ok: true, data: true };
+        if (command.action === 'pane_activity') return { ok: true, data: 1 };
+        if (command.action === 'paste' && isTarget) pasted.push((('text' in command && command.text) as string) ?? '');
+        return { ok: true };
+      },
+    });
+
+    await driveToIdle(monitor, name);
+    await sleep(120);
+    await monitor.pollAll();
+    await sleep(200);
+
+    assert.ok(!pasted.some(t => t.includes('/compact')), 'must not compact when the composer capture fails (cannot verify)');
     monitor.stop();
   });
 });
