@@ -27,6 +27,7 @@ import type { ProxyCommand, ProxyResponse, ProxyRegistration } from '../shared/t
 import { getVersion } from '../shared/version.ts';
 import { handleVoiceUpgrade, type VoiceProxyOptions } from './voice-proxy.ts';
 import { DEFAULT_ENGINE_CONFIGS } from './default-engine-configs.ts';
+import { migrateCompactHooks } from './compact-hook-migration.ts';
 import { sweepStaleProxies } from './proxy-sweep.ts';
 
 const PORT = parseInt(process.env['PORT'] ?? '3000', 10);
@@ -61,6 +62,17 @@ for (const config of DEFAULT_ENGINE_CONFIGS) {
     db.createEngineConfig(config);
     console.log(`[orchestrator] Seeded default engine config: ${config.name}`);
   }
+}
+
+// F1 (.274 harden): the seed above is insert-if-absent, so a change to the default compact
+// hook does NOT reach a running orchestrator. Migrate any live engine config still on a
+// known-old (raw-Enter, strand-prone) compact hook to the new verified-paste hook. Graceful:
+// a migration failure must never break startup (alive-on-old > down).
+try {
+  const migrated = migrateCompactHooks(db);
+  if (migrated > 0) console.log(`[orchestrator] Migrated ${migrated} compact hook(s) to the verified-submit form (F1 .274 harden)`);
+} catch (err) {
+  console.error('[orchestrator] compact-hook migration failed (continuing on existing config):', (err as Error).message);
 }
 
 // ── Proxy Dispatch ──

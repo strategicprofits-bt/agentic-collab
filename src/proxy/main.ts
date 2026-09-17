@@ -218,7 +218,9 @@ async function executeCommand(command: ProxyCommand): Promise<ProxyResponse> {
         return { ok: true };
 
       case 'paste':
-        await tmux.pasteText(command.sessionName, command.text, command.pressEnter);
+        await tmux.pasteText(command.sessionName, command.text, command.pressEnter, {
+          escapeBeforeSubmit: command.escapeBeforeSubmit ?? false,
+        });
         return { ok: true };
 
       case 'capture': {

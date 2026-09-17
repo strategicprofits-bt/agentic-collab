@@ -12,6 +12,7 @@ import {
   reloadAgent, recoverAgent, interruptAgent, compactAgent, killAgent, startWatchdog,
   executeCustomButton, type LifecycleContext,
 } from './lifecycle.ts';
+import { DEFAULT_ENGINE_CONFIGS } from './default-engine-configs.ts';
 
 // GAP-026 Stage 1 confirm-before-reap: zero the inter-sample delay so shell-read tests don't wait.
 process.env['LIVENESS_RESAMPLE_DELAY_MS'] = '0';
@@ -477,6 +478,38 @@ describe('Lifecycle', () => {
 
       await compactAgent(ctx, 'compact-test');
       assert.ok(proxyCommands.some(c => c.action === 'paste'));
+    });
+
+    it('submits /compact through the verified-submit path (F1 .274 harden)', async () => {
+      // Use the REAL default claude compact hook (runtime seeds this via DEFAULT_ENGINE_CONFIGS;
+      // the test DB does not seed engine configs, so set it on the agent to exercise the true
+      // production path rather than the adapter fallback).
+      const claudeHookCompact = DEFAULT_ENGINE_CONFIGS.find(c => c.name === 'claude')?.hookCompact;
+      assert.ok(claudeHookCompact, 'claude default config must define hookCompact');
+
+      db.createAgent({ name: 'compact-verified', engine: 'claude', cwd: '/tmp', proxyId: 'p1', hookCompact: claudeHookCompact });
+      const a = db.getAgent('compact-verified')!;
+      db.updateAgentState('compact-verified', 'active', a.version, {
+        tmuxSession: 'agent-compact-verified',
+        proxyId: 'p1',
+      });
+
+      proxyCommands = [];
+      await compactAgent(ctx, 'compact-verified');
+      // The default compact hook must dispatch /compact as a VERIFIED paste (pressEnter → the
+      // drop-tolerant retry) with escapeBeforeSubmit (slash-menu dismissal), NOT a bare paste +
+      // separate raw Enter (which stranded on the .274 Ink-drop). Asserts the config carries the
+      // flags AND the plumbing plumbs them end-to-end (hook JSON → resolver → dispatch → command).
+      const paste = proxyCommands.find(c => c.action === 'paste') as Extract<ProxyCommand, { action: 'paste' }>;
+      assert.ok(paste, 'compact must dispatch a paste');
+      assert.equal(paste.text, '/compact');
+      assert.equal(paste.pressEnter, true, 'must submit via pressEnter (verified retry)');
+      assert.equal(paste.escapeBeforeSubmit, true, 'must dismiss the slash-menu before submit');
+      // And NO separate raw Enter keystroke (the old stranding path).
+      assert.ok(
+        !proxyCommands.some(c => c.action === 'send_keys' && (c as Extract<ProxyCommand, { action: 'send_keys' }>).keys === 'Enter'),
+        'must not use a bare raw Enter to submit /compact',
+      );
     });
 
     it('skips compaction for engines that do not support it', async () => {

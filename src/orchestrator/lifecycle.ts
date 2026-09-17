@@ -154,7 +154,12 @@ async function dispatchHookResult(
           action: 'paste',
           sessionName: tmuxSession,
           text: action.paste,
-          pressEnter: false,
+          // Default false (legacy: paste-only, submit via a separate Enter keystroke).
+          // A paste action may opt into pressEnter (submit through the verified-submit
+          // retry) + escapeBeforeSubmit (dismiss a slash-command menu first) — used by the
+          // compact hook so /compact submission tolerates the .274 Ink-transition input-drop.
+          pressEnter: action.pressEnter ?? false,
+          escapeBeforeSubmit: action.escapeBeforeSubmit ?? false,
         });
       }
       const waitMs = action.post_wait_ms;
