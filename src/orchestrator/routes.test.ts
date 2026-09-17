@@ -24,9 +24,17 @@ describe('API Routes', () => {
   let port: number;
   let tmpDir: string;
   let proxyCommands: ProxyCommand[];
+  let savedPersonasDir: string | undefined;
 
   before(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'agentic-routes-test-'));
+    // GAP-066: isolate PERSONAS_DIR so POST /api/agents persona-file writes land in tmp, NOT
+    // the default dir which symlinks to the live orchestrator's watched persistent-agents —
+    // persona-watch would otherwise create orphan void DB rows in the live fleet from these
+    // test fixtures. The create handler reads getPersonasDir() fresh per request, so setting
+    // the env before any request is sufficient.
+    savedPersonasDir = process.env['PERSONAS_DIR'];
+    process.env['PERSONAS_DIR'] = join(tmpDir, 'personas');
     db = new Database(join(tmpDir, 'test.db'));
     wss = new WebSocketServer();
     proxyCommands = [];
@@ -85,6 +93,8 @@ describe('API Routes', () => {
     wss.close();
     server.close();
     db.close();
+    if (savedPersonasDir === undefined) delete process.env['PERSONAS_DIR'];
+    else process.env['PERSONAS_DIR'] = savedPersonasDir;
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
