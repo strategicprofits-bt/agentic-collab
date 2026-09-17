@@ -155,9 +155,12 @@ export const DEFAULT_ENGINE_CONFIGS: DefaultEngineConfig[] = [
     ]),
     hookCompact: JSON.stringify([
       { type: 'keystrokes', actions: [
-        { paste: '/compact', post_wait_ms: 200 },
-        { keystroke: 'Escape', post_wait_ms: 100 },
-        { keystroke: 'Enter' },
+        // F1 (.274 harden): submit /compact through the verified-submit retry (pressEnter)
+        // with the slash-menu dismissal folded in (escapeBeforeSubmit). Replaces the old raw
+        // paste→Escape→Enter, whose bare final Enter had NO retry and stranded /compact when
+        // .274 dropped it in the post-Escape Ink transition — the same drop the message-paste
+        // path already tolerates. Now the compact path tolerates it too.
+        { paste: '/compact', pressEnter: true, escapeBeforeSubmit: true },
       ]},
     ]),
     hookExit: JSON.stringify([

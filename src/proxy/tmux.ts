@@ -507,7 +507,12 @@ async function dismissBlockingModal(sessionName: string): Promise<boolean> {
   }
 }
 
-export function pasteText(sessionName: string, text: string, pressEnter: boolean): Promise<void> {
+export function pasteText(
+  sessionName: string,
+  text: string,
+  pressEnter: boolean,
+  opts?: { escapeBeforeSubmit?: boolean },
+): Promise<void> {
   validateSessionName(sessionName);
   // Serialize concurrent pastes to the same session so paste-then-Enter
   // sequences can't interleave and leave text stuck in the prompt.
@@ -550,6 +555,23 @@ export function pasteText(sessionName: string, text: string, pressEnter: boolean
     }
 
     if (pressEnter) {
+      // F1 (.274 harden): a slash command (e.g. /compact) opens an autocomplete menu when
+      // pasted; Escape dismisses the MENU while preserving the typed text, so the following
+      // Enter submits the command rather than selecting a menu item. Do this INSIDE the
+      // verified-submit block (not as a bare pre-Enter keystroke) so the drop-tolerant retry
+      // below still governs the actual submit — the raw Escape→Enter the compact hook used
+      // before had no retry and stranded /compact when .274 dropped the Enter in the
+      // post-Escape Ink transition. The settle wait is deliberately longer than that
+      // dropped-Enter window; the retry loop is the real guarantee.
+      if (opts?.escapeBeforeSubmit) {
+        // Let the slash-command autocomplete menu render before dismissing it (the old
+        // compact hook waited 200ms here), then Escape dismisses the menu (text preserved),
+        // then a settle wait longer than the .274 post-Escape Ink-drop window before the
+        // Enter block — the retry loop below is the actual guarantee against a dropped Enter.
+        await new Promise<void>((r) => setTimeout(r, 250));
+        await tmuxExec(['send-keys', '-t', sessionName, 'Escape']);
+        await new Promise<void>((r) => setTimeout(r, 500));
+      }
       await new Promise<void>((r) => setTimeout(r, pasteEnterDelay(text.length)));
       await tmuxExec(['send-keys', '-t', sessionName, 'Enter']);
 

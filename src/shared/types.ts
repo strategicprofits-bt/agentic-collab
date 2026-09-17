@@ -17,7 +17,7 @@ export type LaunchEnv = Record<string, string>;
 export type SendAction =
   | { keystroke: string; post_wait_ms?: number }
   | { text: string; post_wait_ms?: number }
-  | { paste: string; post_wait_ms?: number };
+  | { paste: string; post_wait_ms?: number; pressEnter?: boolean; escapeBeforeSubmit?: boolean };
 
 /** Preset hook: use engine adapter default with optional overrides. */
 export type PresetHook = {
@@ -364,7 +364,7 @@ export type WsEvent = WsInitEvent | WsAgentUpdateEvent | WsMessageEvent | WsProx
 
 export type ProxyCommand =
   | { action: 'create_session'; sessionName: string; cwd: string }
-  | { action: 'paste'; sessionName: string; text: string; pressEnter: boolean }
+  | { action: 'paste'; sessionName: string; text: string; pressEnter: boolean; escapeBeforeSubmit?: boolean }
   | { action: 'capture'; sessionName: string; lines: number }
   | { action: 'kill_session'; sessionName: string }
   | { action: 'list_sessions' }
