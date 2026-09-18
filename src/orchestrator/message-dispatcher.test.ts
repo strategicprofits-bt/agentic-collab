@@ -169,4 +169,112 @@ describe('MessageDispatcher', () => {
       dispatcher.stop();
     }
   });
+
+  // ── GAP-070 resume-on-message coupling ──
+  // A permissive proxy where a captured "> " prompt makes waitForCliReady detect readiness
+  // immediately, so resumeAgent completes fast in-test.
+  const readyProxy = async (_p: string, command: ProxyCommand): Promise<ProxyResponse> => {
+    if (command.action === 'capture') return { ok: true, data: 'ready\n> \n' };
+    if (command.action === 'has_session') return { ok: true, data: true };
+    return { ok: true };
+  };
+  function makeCoupledDispatcher(active: () => boolean, proxy = readyProxy): MessageDispatcher {
+    return new MessageDispatcher({
+      db,
+      locks: new LockManager(db.rawDb),
+      proxyDispatch: proxy,
+      orchestratorHost: 'http://localhost:3000',
+      isAutoSuspendActive: active,
+    });
+  }
+
+  it('GAP-070: resumes a SUSPENDED agent that has a message waiting, then delivers (coupling ACTIVE)', async () => {
+    db.createAgent({ name: 'sus-wake', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    setAgentState('sus-wake', 'suspended');
+    const msg = db.enqueueMessage({ sourceAgent: null, targetAgent: 'sus-wake', envelope: 'wake up' });
+
+    const dispatcher = makeCoupledDispatcher(() => true);
+    try {
+      await dispatcher.tryDeliver('sus-wake');
+      const after = db.getAgent('sus-wake');
+      assert.notEqual(after?.state, 'suspended', 'coupling must WAKE the suspended agent (resume attempted)');
+      assert.equal(db.getPendingMessageById(msg.id)?.status, 'delivered', 'and deliver the waiting message');
+    } finally {
+      dispatcher.stop();
+    }
+  });
+
+  it('GAP-070: does NOT resume a suspended agent when coupling is DORMANT (byte-unchanged legacy stall)', async () => {
+    db.createAgent({ name: 'sus-dormant', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    setAgentState('sus-dormant', 'suspended');
+    const msg = db.enqueueMessage({ sourceAgent: null, targetAgent: 'sus-dormant', envelope: 'held' });
+
+    const dispatcher = makeCoupledDispatcher(() => false); // dormant/halted
+    try {
+      const delivered = await dispatcher.tryDeliver('sus-dormant');
+      assert.equal(delivered, false, 'no delivery to a suspended agent when dormant');
+      assert.equal(db.getAgent('sus-dormant')?.state, 'suspended', 'must stay suspended (legacy behavior)');
+      assert.notEqual(db.getPendingMessageById(msg.id)?.status, 'delivered', 'message stays pending');
+    } finally {
+      dispatcher.stop();
+    }
+  });
+
+  it('GAP-070 HALT ATOMICITY: coupling gates on the SAME live getter as suspend — false ⇒ no wake', async () => {
+    // The dispatcher reads isAutoSuspendActive() live; in production this is the health monitor's
+    // single combined (enabled && !halted) field, so a halt stops resume-on-message in the same
+    // instant it stops suspend. Here a getter returning false (halted) ⇒ no resume.
+    db.createAgent({ name: 'sus-halted', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    setAgentState('sus-halted', 'suspended');
+    db.enqueueMessage({ sourceAgent: null, targetAgent: 'sus-halted', envelope: 'blocked by halt' });
+
+    let halted = true;
+    const dispatcher = makeCoupledDispatcher(() => !halted);
+    try {
+      await dispatcher.tryDeliver('sus-halted');
+      assert.equal(db.getAgent('sus-halted')?.state, 'suspended', 'halted ⇒ coupling must not wake');
+      // Re-arm live (un-halt) → next attempt wakes it (proves the same getter re-arms both).
+      halted = false;
+      await dispatcher.tryDeliver('sus-halted');
+      assert.notEqual(db.getAgent('sus-halted')?.state, 'suspended', 'un-halt ⇒ coupling wakes on next attempt');
+    } finally {
+      dispatcher.stop();
+    }
+  });
+
+  it('GAP-070 BOUNDED: does NOT wake a suspended agent with NO deliverable message', async () => {
+    db.createAgent({ name: 'sus-nomsg', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    setAgentState('sus-nomsg', 'suspended');
+    // no message enqueued
+    const dispatcher = makeCoupledDispatcher(() => true);
+    try {
+      await dispatcher.tryDeliver('sus-nomsg');
+      assert.equal(db.getAgent('sus-nomsg')?.state, 'suspended', 'never wake an agent for nothing');
+    } finally {
+      dispatcher.stop();
+    }
+  });
+
+  it('GAP-070 NON-SUSPENDED PATH UNCHANGED: active agent delivers normally with coupling ACTIVE (no resume)', async () => {
+    db.createAgent({ name: 'act-normal', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    setAgentState('act-normal', 'active');
+    const msg = db.enqueueMessage({ sourceAgent: null, targetAgent: 'act-normal', envelope: 'normal delivery' });
+
+    const events: string[] = [];
+    const proxy = async (_p: string, command: ProxyCommand): Promise<ProxyResponse> => {
+      events.push(command.action);
+      if (command.action === 'capture') return { ok: true, data: 'ready\n> \n' };
+      if (command.action === 'has_session') return { ok: true, data: true };
+      return { ok: true };
+    };
+    const dispatcher = makeCoupledDispatcher(() => true, proxy);
+    try {
+      const delivered = await dispatcher.tryDeliver('act-normal');
+      assert.equal(delivered, true, 'active agent delivers normally even with coupling active');
+      assert.equal(db.getPendingMessageById(msg.id)?.status, 'delivered');
+      assert.equal(db.getAgent('act-normal')?.state, 'active', 'state unchanged — never routed through resume');
+    } finally {
+      dispatcher.stop();
+    }
+  });
 });

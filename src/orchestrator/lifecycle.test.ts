@@ -265,6 +265,36 @@ describe('Lifecycle', () => {
         /expected active or idle/,
       );
     });
+
+    it('with requireIdle SKIPS suspend when the agent is not idle (fire-time re-check)', async () => {
+      db.createAgent({ name: 'suspend-active', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      const a = db.getAgent('suspend-active')!;
+      db.updateAgentState('suspend-active', 'active', a.version, { tmuxSession: 'agent-suspend-active', proxyId: 'p1' });
+
+      const result = await suspendAgent(ctx, 'suspend-active', { requireIdle: true });
+      assert.equal(result.state, 'active', 'must NOT suspend a now-active agent when requireIdle');
+      assert.ok(!proxyCommands.some(c => c.action === 'paste'), 'no exit hook pasted when skipped');
+      const events = db.getEvents('suspend-active', 10);
+      assert.ok(events.some(e => e.event === 'auto_suspend_skipped'), 'logs auto_suspend_skipped(not_idle)');
+    });
+
+    it('with requireIdle suspends when the agent IS idle', async () => {
+      db.createAgent({ name: 'suspend-idle', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      const a = db.getAgent('suspend-idle')!;
+      db.updateAgentState('suspend-idle', 'idle', a.version, { tmuxSession: 'agent-suspend-idle', proxyId: 'p1' });
+
+      const result = await suspendAgent(ctx, 'suspend-idle', { requireIdle: true });
+      assert.equal(result.state, 'suspended', 'suspends an idle agent under requireIdle');
+    });
+
+    it('without requireIdle still suspends an active agent (manual-route behavior unchanged)', async () => {
+      db.createAgent({ name: 'suspend-manual', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      const a = db.getAgent('suspend-manual')!;
+      db.updateAgentState('suspend-manual', 'active', a.version, { tmuxSession: 'agent-suspend-manual', proxyId: 'p1' });
+
+      const result = await suspendAgent(ctx, 'suspend-manual');
+      assert.equal(result.state, 'suspended', 'manual suspend of an active agent unchanged');
+    });
   });
 
   describe('resumeAgent', () => {

@@ -152,6 +152,11 @@ const messageDispatcher = new MessageDispatcher({
   onDashboardMessage: (msg) => {
     wss.broadcast(JSON.stringify({ type: 'message', msg }));
   },
+  // GAP-070: the dispatcher reads the SAME live auto-suspend state the health monitor's
+  // suspend path reads (via the forward ref), so an instant halt stops resume-on-message and
+  // suspend in the same instant. Default-false until the health monitor exists / is enabled.
+  isAutoSuspendActive: () => healthMonitorRef?.isAutoSuspendActive() ?? false,
+  onAgentResumed: (agentName) => { healthMonitorRef?.noteResume(agentName); },
   onMessageDelivered: (agentName) => {
     // Immediately mark idle agents as active for instant dashboard feedback
     try {
@@ -283,6 +288,9 @@ const routeCtx: RouteContext = {
   storesDir: STORES_DIR,
   telegramDispatcher,
   recoveryScaleTracker,
+  // GAP-070 instant emergency brake: authenticated halt/re-arm of auto-suspend, live next poll.
+  setAutoSuspendHalted: (halted) => healthMonitor.setAutoSuspendHalted(halted),
+  isAutoSuspendActive: () => healthMonitor.isAutoSuspendActive(),
 };
 
 const router = createRouter(routeCtx);

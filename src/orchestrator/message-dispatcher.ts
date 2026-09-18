@@ -17,7 +17,7 @@ import type { Database } from './database.ts';
 import type { LockManager } from '../shared/lock.ts';
 import type { ProxyCommand, ProxyResponse, PendingMessage, DashboardMessage } from '../shared/types.ts';
 import { canSuspend } from '../shared/agent-entity.ts';
-import { deliverToAgent, type LifecycleContext } from './lifecycle.ts';
+import { deliverToAgent, resumeAgent, type LifecycleContext } from './lifecycle.ts';
 
 export type MessageDispatcherOptions = {
   db: Database;
@@ -27,6 +27,15 @@ export type MessageDispatcherOptions = {
   onQueueUpdate?: (message: PendingMessage) => void;
   onDashboardMessage?: (message: DashboardMessage) => void;
   onMessageDelivered?: (agentName: string) => void;
+  /**
+   * GAP-070 resume-on-message coupling. Live combined auto-suspend state (enabled && !halted),
+   * read from the health monitor. When false (the default = dormant/halted) the dispatcher NEVER
+   * resumes a suspended agent — the normal delivery path is byte-unchanged. Reading the same
+   * getter the suspend path uses is what makes the halt atomic across both consumers.
+   */
+  isAutoSuspendActive?: () => boolean;
+  /** GAP-070 flap guard: notify the health monitor when a suspended agent is woken for delivery. */
+  onAgentResumed?: (agentName: string) => void;
 };
 
 export class MessageDispatcher {
@@ -37,9 +46,13 @@ export class MessageDispatcher {
   private readonly onQueueUpdate: (message: PendingMessage) => void;
   private readonly onDashboardMessage: (message: DashboardMessage) => void;
   private readonly onMessageDelivered: (agentName: string) => void;
+  private readonly isAutoSuspendActive: () => boolean;
+  private readonly onAgentResumed: (agentName: string) => void;
   private readonly drainTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Guards against concurrent drain loops for the same agent. */
   private readonly draining = new Set<string>();
+  /** GAP-070: guards against concurrent resume-on-message wakes for the same agent. */
+  private readonly resuming = new Set<string>();
   /**
    * Cool-down timestamps per agent (Race 2 fix).
    * After compact/interrupt operations, delivery waits for the agent to
@@ -60,6 +73,41 @@ export class MessageDispatcher {
     this.onQueueUpdate = opts.onQueueUpdate ?? (() => {});
     this.onDashboardMessage = opts.onDashboardMessage ?? (() => {});
     this.onMessageDelivered = opts.onMessageDelivered ?? (() => {});
+    this.isAutoSuspendActive = opts.isAutoSuspendActive ?? (() => false);
+    this.onAgentResumed = opts.onAgentResumed ?? (() => {});
+  }
+
+  /**
+   * GAP-070 resume-on-message coupling. If auto-suspend is ACTIVE and a SUSPENDED agent has a
+   * deliverable message waiting, wake it so delivery can proceed. Returns true iff a resume was
+   * performed. Bounded + additive:
+   *   - Dormant/halted (default) → returns false BEFORE inspecting any agent → the normal
+   *     delivery path is byte-unchanged, and a halt stops this in the same instant it stops
+   *     the suspend path (both read the one live getter).
+   *   - Only state==='suspended' (never active/idle/void/failed/spawning) → non-suspended
+   *     delivery is untouched: no drop, no double, no altered path.
+   *   - Only when a message is actually deliverable → we never wake an agent for nothing.
+   *   - `resuming` set → no concurrent double-resume.
+   */
+  private async maybeResumeForDelivery(agentName: string): Promise<boolean> {
+    if (!this.isAutoSuspendActive()) return false;
+    if (this.resuming.has(agentName)) return false;
+    const agent = this.db.getAgent(agentName);
+    if (!agent || !agent.proxyId || agent.state !== 'suspended') return false;
+    if (this.db.getDeliverableMessages(agentName).length === 0) return false;
+
+    this.resuming.add(agentName);
+    try {
+      console.log(`[dispatcher] ${agentName}: suspended with a message waiting — resuming for delivery (GAP-070)`);
+      await resumeAgent(this.makeLifecycleCtx(), agentName);
+      this.onAgentResumed(agentName); // start the flap-debounce window on the health monitor
+      return true;
+    } catch (err) {
+      console.error(`[dispatcher] ${agentName}: resume-on-message failed:`, (err as Error).message);
+      return false;
+    } finally {
+      this.resuming.delete(agentName);
+    }
   }
 
   /**
@@ -73,6 +121,10 @@ export class MessageDispatcher {
   async tryDeliver(agentName: string): Promise<boolean> {
     // Recover any stale delivery attempts before trying
     this.db.resetStaleAttempts(MessageDispatcher.STALE_ATTEMPT_TIMEOUT_S);
+
+    // GAP-070: wake a suspended agent that has a message waiting (no-op unless auto-suspend
+    // is active AND the agent is suspended — the normal path below is otherwise unchanged).
+    await this.maybeResumeForDelivery(agentName);
 
     const agent = this.db.getAgent(agentName);
     if (!agent || !agent.proxyId || !canSuspend(agent)) {
@@ -177,6 +229,10 @@ export class MessageDispatcher {
       try {
         // Recover stale attempts before each drain cycle
         this.db.resetStaleAttempts(MessageDispatcher.STALE_ATTEMPT_TIMEOUT_S);
+
+        // GAP-070: same resume-on-message coupling as tryDeliver, for messages that queued
+        // while the agent was suspended and are drained on a later cycle (no-op when dormant).
+        await this.maybeResumeForDelivery(agentName);
 
         const agent = this.db.getAgent(agentName);
         if (!agent || !agent.proxyId || !canSuspend(agent)) {

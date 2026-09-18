@@ -65,6 +65,26 @@ export type HealthMonitorOptions = {
   autoCompactCooldownMs?: number;
   /** Global kill-switch for auto-compact (incident lever). Defaults to DISABLE_AUTO_COMPACT env. */
   autoCompactDisabled?: boolean;
+  /**
+   * Auto-suspend ACTIVATION lever (GAP-070). Default FALSE (dormant) — seeded from the
+   * AUTO_SUSPEND_ENABLED env at construction (restart-gated, deliberate). While false the
+   * fleet never auto-suspends (byte-identical to pre-GAP-070). Fail-safe: a restart with
+   * the env unset re-seeds to dormant.
+   */
+  autoSuspendEnabled?: boolean;
+  /**
+   * Auto-suspend INSTANT emergency brake (GAP-070). Runtime-mutable via setAutoSuspendHalted
+   * (flipped through the authenticated halt API) → read live each poll, so a flip stops
+   * auto-suspend on the NEXT poll with no restart. Independent of autoSuspendEnabled; the
+   * combined live state is isAutoSuspendActive() = enabled && !halted, which BOTH the suspend
+   * path and the dispatcher resume-on-message coupling read (no half-halted middle). Default false.
+   */
+  autoSuspendHalted?: boolean;
+  /**
+   * Grace window (ms) after a resume during which an agent is NOT auto-suspended — the
+   * flap guard against suspend→resume→re-suspend churn. Defaults to AUTOSUSPEND_RESUME_DEBOUNCE_MS.
+   */
+  resumeDebounceMs?: number;
 };
 
 const DEFAULT_POLL_MS = 30_000;
@@ -162,6 +182,16 @@ export class HealthMonitor {
   private readonly autoCompactCooldownMs: number;
   /** When true, auto-compact is globally suppressed (incident kill-switch). */
   private readonly autoCompactDisabled: boolean;
+  // ── Auto-suspend activation (GAP-070) — dormant by default; see options doc. ──
+  static readonly AUTOSUSPEND_RESUME_DEBOUNCE_MS = parseIntEnv('AUTOSUSPEND_RESUME_DEBOUNCE_MS', 60_000);
+  /** ACTIVATION lever — env-seeded, restart-gated. Deliberate. */
+  private readonly autoSuspendEnabled: boolean;
+  /** INSTANT emergency brake — runtime-mutable via setAutoSuspendHalted, read live per poll. */
+  private autoSuspendHalted: boolean;
+  /** Grace window (ms) after a resume during which auto-suspend is skipped (flap guard). */
+  private readonly resumeDebounceMs: number;
+  /** Timestamp of the last resume per agent — the resume-debounce clock. */
+  private readonly lastResumeAt = new Map<string, number>();
   /** Agents currently being auto-compacted — prevents duplicate concurrent attempts. */
   private readonly autoCompacting = new Set<string>();
   /** Timestamp of last auto-compact fire per agent — enforces the cooldown. */
@@ -243,6 +273,13 @@ export class HealthMonitor {
     this.autoCompactDisabled = opts.autoCompactDisabled ?? (process.env['DISABLE_AUTO_COMPACT'] === '1');
     if (this.autoCompactDisabled) {
       console.warn('[health] DISABLE_AUTO_COMPACT active — auto-compact suppressed; high-context idle agents need manual /compact');
+    }
+    // GAP-070 auto-suspend: dormant unless AUTO_SUSPEND_ENABLED=1 (fail-safe-to-dormant on restart).
+    this.autoSuspendEnabled = opts.autoSuspendEnabled ?? (process.env['AUTO_SUSPEND_ENABLED'] === '1');
+    this.autoSuspendHalted = opts.autoSuspendHalted ?? false;
+    this.resumeDebounceMs = opts.resumeDebounceMs ?? HealthMonitor.AUTOSUSPEND_RESUME_DEBOUNCE_MS;
+    if (this.autoSuspendEnabled) {
+      console.warn('[health] AUTO_SUSPEND_ENABLED active — idle agents will be auto-suspended after the idle-suspend timeout (halt live via POST /api/health/auto-suspend/halt)');
     }
 
     this.strandedWatchdog = new StrandedWatchdog({
@@ -912,17 +949,56 @@ export class HealthMonitor {
   }
 
   /**
-   * Auto-suspend an idle agent that has exceeded the suspend timeout,
-   * provided it has no pending messages and no imminent reminders.
+   * Combined LIVE auto-suspend state (GAP-070): enabled (activation lever) AND not halted
+   * (instant emergency brake). The SINGLE source of truth both consumers read — the suspend
+   * path here and the dispatcher's resume-on-message coupling (via an injected getter) — so a
+   * halt flip stops BOTH in the same instant (no half-halted middle). Read live per poll.
+   */
+  isAutoSuspendActive(): boolean {
+    return this.autoSuspendEnabled && !this.autoSuspendHalted;
+  }
+
+  /**
+   * Instant emergency brake for auto-suspend (GAP-070). Flipping true stops new auto-suspends
+   * AND new resume-on-message wakes from the next poll — no restart. Reversible (false re-arms
+   * both atomically). Called by the authenticated halt API route.
+   */
+  setAutoSuspendHalted(halted: boolean): void {
+    if (this.autoSuspendHalted === halted) return;
+    this.autoSuspendHalted = halted;
+    console.warn(`[health] auto-suspend ${halted ? 'HALTED' : 'RE-ARMED'} at runtime (enabled=${this.autoSuspendEnabled}, active=${this.isAutoSuspendActive()})`);
+  }
+
+  /** Record a resume (GAP-070 flap guard) — starts the resume-debounce window. */
+  noteResume(agentName: string): void {
+    this.lastResumeAt.set(agentName, Date.now());
+  }
+
+  /**
+   * Auto-suspend an idle agent that has exceeded the suspend timeout, provided auto-suspend is
+   * active, it is not within the post-resume debounce window, and it has no pending messages or
+   * imminent reminders.
+   *
+   * Idle duration is measured from the active→idle transition (idleSince), NOT agent.lastActivity
+   * — that DB field is refreshed to now on EVERY poll (dashboard freshness), so a gate keyed on
+   * it measures time-since-last-poll and never accrues sustained idle in the production regime
+   * (threshold >> poll interval). This is the GAP-070 dead-since-inception defect.
    */
   private autoSuspendIfEligible(agentName: string): void {
+    if (!this.isAutoSuspendActive()) return; // dormant/halted — the deploy-time no-op gate
     if (this.autoSuspending.has(agentName)) return;
 
     const agent = this.db.getAgent(agentName);
-    if (!agent || agent.state !== 'idle' || !agent.lastActivity) return;
+    if (!agent || agent.state !== 'idle') return;
 
-    const idleDuration = Date.now() - new Date(agent.lastActivity).getTime();
+    const idleStart = this.idleSince.get(agentName);
+    if (idleStart === undefined) return; // no idle-onset clock (e.g. restart) — wait for next transition
+    const idleDuration = Date.now() - idleStart;
     if (idleDuration <= this.idleSuspendMs) return;
+
+    // Flap guard: don't re-suspend within resumeDebounceMs of a wake.
+    const resumedAt = this.lastResumeAt.get(agentName);
+    if (resumedAt !== undefined && Date.now() - resumedAt < this.resumeDebounceMs) return;
 
     if (this.db.hasPendingMessages(agentName)) {
       return;
@@ -940,7 +1016,8 @@ export class HealthMonitor {
     });
 
     const lifecycleCtx = this.makeLifecycleCtx();
-    suspendAgent(lifecycleCtx, agent.name).then((updated) => {
+    // requireIdle: fire-time idle re-check under lock (the agent can go active in the poll→fire window).
+    suspendAgent(lifecycleCtx, agent.name, { requireIdle: true }).then((updated) => {
       console.log(`[health] ${agent.name}: auto-suspended (state=${updated.state})`);
       this.onAgentUpdate(agent.name);
       this.emitSystemMessage(agent.name, `Auto-suspended after ${Math.round(idleDuration / 1000)}s idle`);
@@ -1187,6 +1264,7 @@ export class HealthMonitor {
     this.consecutiveFailures.delete(`heal_${name}`);
     this.lastActivityTs.delete(name);
     this.idleSince.delete(name);
+    this.lastResumeAt.delete(name);
     this.healedAt.delete(name);
     this.activeIndicators.delete(name);
     this.compiledIndicators.delete(name);

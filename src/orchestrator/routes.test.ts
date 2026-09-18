@@ -1093,3 +1093,92 @@ describe('API Routes — Personas', () => {
     assert.equal(found, undefined, 'Old completed project should be auto-archived and hidden');
   });
 });
+
+// ── GAP-070: auto-suspend instant-halt route (auth + efficacy) ──
+describe('routes: auto-suspend halt', () => {
+  let db: Database;
+  let server: Server;
+  let wss: WebSocketServer;
+  let port: number;
+  let tmpDir: string;
+  const SECRET = 'halt-secret-abc';
+  // Model the health monitor's live combined state: active = enabled && !halted.
+  let enabled = true;
+  let halted = false;
+
+  before(async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'agentic-halt-test-'));
+    db = new Database(join(tmpDir, 'test.db'));
+    wss = new WebSocketServer();
+    const locks = new LockManager(db.rawDb);
+    const dispatch = async () => ({ ok: true as const });
+    const ctx: RouteContext = {
+      db, wss, locks,
+      proxyDispatch: dispatch,
+      getDashboardHtml: () => '<html>Dashboard</html>',
+      orchestratorHost: 'http://localhost:3000',
+      orchestratorSecret: SECRET,
+      messageDispatcher: makeTestDispatcher(db, locks, dispatch),
+      usagePoller: { getUsageData: () => ({}), pollNow: async () => {} } as any,
+      voiceEnabled: false,
+      accountStore: new AccountStore({ accountsDir: join(tmpDir, 'accounts'), agentHomesDir: join(tmpDir, 'agent-homes'), skipAutoRegister: true }),
+      pagesDir: join(tmpDir, 'pages'),
+      storesDir: join(tmpDir, 'stores'),
+      telegramDispatcher: { send: async () => {} } as any,
+      setAutoSuspendHalted: (h) => { halted = h; },
+      isAutoSuspendActive: () => enabled && !halted,
+    };
+    const router = createRouter(ctx);
+    server = createServer(async (req, res) => { await router(req, res); });
+    await new Promise<void>((resolve) => {
+      server.listen(0, () => {
+        const addr = server.address();
+        port = typeof addr === 'object' && addr ? addr.port : 0;
+        resolve();
+      });
+    });
+  });
+
+  after(() => { wss.close(); server.close(); db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
+
+  async function req(method: string, path: string, body?: unknown, token?: string): Promise<{ status: number; data: any }> {
+    const headers: Record<string, string> = {};
+    if (body) headers['content-type'] = 'application/json';
+    if (token) headers['authorization'] = `Bearer ${token}`;
+    const resp = await fetch(`http://localhost:${port}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
+    return { status: resp.status, data: await resp.json().catch(() => ({})) };
+  }
+
+  it('rejects an UNAUTHENTICATED halt (401) — fleet-control lever is not open', async () => {
+    const before = halted;
+    const { status } = await req('POST', '/api/health/auto-suspend/halt', { halted: true });
+    assert.equal(status, 401);
+    assert.equal(halted, before, 'unauth request must not flip the flag');
+  });
+
+  it('authenticated halt flips the live state (efficacy, not just 200)', async () => {
+    enabled = true; halted = false;
+    const { status, data } = await req('POST', '/api/health/auto-suspend/halt', { halted: true }, SECRET);
+    assert.equal(status, 200);
+    assert.equal(data.active, false, 'response reflects halted → inactive');
+    assert.equal(halted, true, 'underlying flag actually flipped (efficacy)');
+    // GET confirms the live state the consumers read.
+    const get = await req('GET', '/api/health/auto-suspend', undefined, SECRET);
+    assert.equal(get.data.active, false, 'GET reflects the halted state');
+  });
+
+  it('re-arm (halted:false) restores active', async () => {
+    enabled = true; halted = true;
+    const { status, data } = await req('POST', '/api/health/auto-suspend/halt', { halted: false }, SECRET);
+    assert.equal(status, 200);
+    assert.equal(data.active, true, 'un-halt restores active');
+    assert.equal(halted, false);
+  });
+
+  it('rejects a malformed body (400) without flipping', async () => {
+    enabled = true; halted = false;
+    const { status } = await req('POST', '/api/health/auto-suspend/halt', { nope: 1 }, SECRET);
+    assert.equal(status, 400);
+    assert.equal(halted, false, 'malformed request must not flip the flag');
+  });
+});

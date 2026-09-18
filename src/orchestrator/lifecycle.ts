@@ -829,11 +829,20 @@ export async function resumeAgent(
 export async function suspendAgent(
   ctx: LifecycleContext,
   name: string,
+  opts?: { requireIdle?: boolean },
 ): Promise<AgentRecord> {
   // ── Phase 1: validate + transition to 'suspending' ──
   const phase1 = await ctx.locks.withLock(name, async () => {
     const agent = ctx.db.getAgent(name);
     if (!agent) throw new Error(`Agent "${name}" not found`);
+    // Fire-time idle re-check UNDER LOCK (auto-suspend safety, GAP-070). The health monitor
+    // gates on idle at poll time, but the agent can go active in the window before the lock is
+    // acquired — suspending a now-active agent would interrupt real work. Re-verify here and
+    // skip if no longer idle. The manual route omits requireIdle, so its behavior is unchanged.
+    if (opts?.requireIdle && agent.state !== 'idle') {
+      ctx.db.logEvent(name, 'auto_suspend_skipped', undefined, { reason: 'not_idle', state: agent.state });
+      return { skipped: true as const, agent };
+    }
     if (!canSuspend(agent)) {
       throw new Error(`Agent "${name}" is in state "${agent.state}", expected active or idle`);
     }
@@ -843,8 +852,10 @@ export async function suspendAgent(
       lastActivity: new Date().toISOString(),
     });
 
-    return { current, proxyId, engine: agent.engine, hookExit: agent.hookExit, tmuxSession: sessionName(agent) };
+    return { skipped: false as const, current, proxyId, engine: agent.engine, hookExit: agent.hookExit, tmuxSession: sessionName(agent) };
   });
+
+  if (phase1.skipped) return phase1.agent;
 
   const { proxyId, tmuxSession } = phase1;
 
