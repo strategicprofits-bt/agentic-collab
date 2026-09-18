@@ -60,6 +60,15 @@ type EngineConfig = {
   spawnCommand: string;
   usageCommand: string;
   parser: (output: string) => UsageBucket[];
+  /**
+   * GAP-067 weekly-half fix: resize the dedicated session's window to this (width,height)
+   * BEFORE sending the usage command. The /usage dialog is an Ink in-place-redraw TUI (NOT
+   * scrollback-append); a ~09-02 CLI layout change pushed "Current week" below the default
+   * ~80x24 viewport, where it is never painted → no capture-lines count could ever see it.
+   * A tall pane renders the whole dialog in one viewport so a single capture gets every bucket.
+   * Omit for engines that fit the default viewport (codex) — a no-op keeps them byte-unchanged.
+   */
+  resizeBeforeQuery?: { width: number; height: number };
 };
 
 const BURST_POLL_MS = 2 * 60 * 1000; // 2 minutes between burst polls
@@ -256,6 +265,9 @@ export class UsagePoller {
         }),
         usageCommand: '/usage',
         parser: parseClaudeUsage,
+        // GAP-067: tall pane so the whole /usage dialog (Current session + Current week + extra)
+        // renders in one viewport — the ~09-02 layout change pushed "Current week" off the default fold.
+        resizeBeforeQuery: { width: 120, height: 100 },
       });
     }
 
@@ -315,6 +327,22 @@ export class UsagePoller {
       console.warn(`[usage] ${config.engine} session not ready, skipping`);
       await this.trackEmptyPoll(config);
       return;
+    }
+
+    // GAP-067 weekly-half fix: resize the window tall BEFORE the usage command so the whole
+    // in-place-redrawn /usage dialog fits one viewport (else "Current week" is painted below the
+    // ~80x24 fold and no capture ever sees it). Best-effort — a resize failure must not block the
+    // query (we still get Current session, the prior behavior), so it is not fatal.
+    if (config.resizeBeforeQuery) {
+      const r = await this.proxyDispatch(proxyId, {
+        action: 'resize_pane',
+        sessionName: config.sessionName,
+        width: config.resizeBeforeQuery.width,
+        height: config.resizeBeforeQuery.height,
+      });
+      if (!r.ok) {
+        console.warn(`[usage] ${config.engine}: resize_pane failed (${r.error ?? 'unknown'}) — proceeding; weekly bucket may be below the fold`);
+      }
     }
 
     // Send usage command

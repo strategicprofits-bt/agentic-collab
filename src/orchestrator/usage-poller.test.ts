@@ -295,3 +295,70 @@ describe('assessBucketQuality', () => {
     assert.equal(b.baselinePct, 50);
   });
 });
+
+// ── GAP-067 weekly-half fix: resize-before-/usage (viewport bug) ──
+describe('UsagePoller resize-before-query (GAP-067)', () => {
+  const TWO_BUCKET_USAGE = [
+    '  Current session',
+    '  Resets 3pm (America/Chicago)████████░░  40% used',
+    '  Current week (all models)',
+    '  Resets Sep 22, 12am (America/Chicago)██░░░░░░  18% used',
+  ].join('\n');
+
+  function makeRecordingPoller() {
+    const commands: ProxyCommandRec[] = [];
+    const stubDb = { listProxies: () => [], listAgents: () => [], logEvent: () => {} } as any;
+    const proxyDispatch = async (_p: string, c: any) => {
+      commands.push({ action: c.action, sessionName: c.sessionName, width: c.width, height: c.height, text: c.text });
+      if (c.action === 'has_session') return { ok: true, data: true };
+      if (c.action === 'capture') {
+        // waitForIdle uses lines:20 (needs an idle prompt); the usage loop uses lines:80.
+        return { ok: true, data: c.lines === 20 ? 'ready\n❯ \n' : TWO_BUCKET_USAGE };
+      }
+      return { ok: true };
+    };
+    const poller = new UsagePoller({ db: stubDb, proxyDispatch: proxyDispatch as any });
+    return { poller, commands };
+  }
+  type ProxyCommandRec = { action: string; sessionName?: string; width?: number; height?: number; text?: string };
+
+  const claudeConfig = {
+    engine: 'claude' as const, sessionName: 'usage-test', spawnCommand: 'x',
+    usageCommand: '/usage', parser: parseClaudeUsage,
+    resizeBeforeQuery: { width: 120, height: 100 },
+  };
+  const codexConfig = {
+    engine: 'codex' as const, sessionName: 'usage-codex-test', spawnCommand: 'x',
+    usageCommand: '/status', parser: parseCodexStatus,
+  };
+
+  it('resizes the pane tall BEFORE sending /usage for the Claude engine', async () => {
+    const { poller, commands } = makeRecordingPoller();
+    await (poller as any).pollEngine('p1', claudeConfig);
+    const resizeIdx = commands.findIndex(c => c.action === 'resize_pane' && c.sessionName === 'usage-test');
+    const pasteIdx = commands.findIndex(c => c.action === 'paste' && c.text === '/usage');
+    assert.ok(resizeIdx >= 0, 'must dispatch resize_pane for the claude usage session');
+    assert.equal(commands[resizeIdx]!.width, 120);
+    assert.equal(commands[resizeIdx]!.height, 100);
+    assert.ok(pasteIdx >= 0, 'must still paste /usage');
+    assert.ok(resizeIdx < pasteIdx, 'resize_pane must come BEFORE the /usage paste (so the dialog renders tall)');
+  });
+
+  it('parses BOTH Current session AND Current week once the tall pane makes them visible', async () => {
+    const { poller } = makeRecordingPoller();
+    await (poller as any).pollEngine('p1', claudeConfig);
+    const data = poller.getUsageData();
+    const claude = data['claude'];
+    assert.ok(claude, 'claude usage recorded');
+    const labels = claude!.buckets.map(b => b.label);
+    assert.ok(labels.some(l => /Current week/i.test(l) || /Resets Sep 22/i.test(l)), 'weekly bucket captured');
+    assert.ok(claude!.buckets.length >= 2, 'both session + week buckets captured');
+  });
+
+  it('does NOT resize for an engine without resizeBeforeQuery (codex unchanged)', async () => {
+    const { poller, commands } = makeRecordingPoller();
+    await (poller as any).pollEngine('p1', codexConfig);
+    assert.ok(!commands.some(c => c.action === 'resize_pane'), 'codex must not be resized (no regression)');
+    assert.ok(commands.some(c => c.action === 'paste' && c.text === '/status'), 'codex still queried normally');
+  });
+});
