@@ -998,8 +998,13 @@ export class HealthMonitor {
    */
   setAutoSuspendScope(agents: string[]): void {
     this.autoSuspendScope = new Set(agents.map(s => s.trim()).filter(Boolean));
-    const desc = this.autoSuspendScope.size === 0 ? 'FLEET-WIDE (empty scope)' : `${this.autoSuspendScope.size} agent(s): ${[...this.autoSuspendScope].join(', ')}`;
-    console.warn(`[health] auto-suspend scope set at runtime → ${desc} (enabled=${this.autoSuspendEnabled}, halted=${this.autoSuspendHalted})`);
+    if (this.autoSuspendScope.size === 0) {
+      // Runtime empty-scope = going FLEET-WIDE live = the highest-blast-radius action. Distinct + LOUD
+      // (parallels the startup guard) so it is never silent — even if the feature is currently dormant.
+      console.warn(`[health] ⚠ AUTO-SUSPEND SCOPE SET TO EMPTY AT RUNTIME → FLEET-WIDE (every idle agent eligible when enabled; enabled=${this.autoSuspendEnabled}, halted=${this.autoSuspendHalted}). Instant brake: POST /api/health/auto-suspend/halt`);
+    } else {
+      console.warn(`[health] auto-suspend scope set at runtime → ${this.autoSuspendScope.size} agent(s): ${[...this.autoSuspendScope].join(', ')} (enabled=${this.autoSuspendEnabled}, halted=${this.autoSuspendHalted})`);
+    }
   }
 
   /**

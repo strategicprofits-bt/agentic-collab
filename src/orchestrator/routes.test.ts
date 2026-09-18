@@ -1198,16 +1198,20 @@ describe('routes: auto-suspend halt', () => {
     const { status, data } = await req('POST', '/api/health/auto-suspend/scope', { agents: ['fixture-a'] }, SECRET);
     assert.equal(status, 200);
     assert.deepEqual(data.scope, ['fixture-a'], 'response echoes the live scope');
+    assert.equal(data.count, 1, 'response echoes cohort size');
+    assert.equal(data.fleetWide, false, 'non-empty scope is not fleet-wide');
     assert.deepEqual(scope, ['fixture-a'], 'underlying scope actually set (efficacy)');
     const get = await req('GET', '/api/health/auto-suspend', undefined, SECRET);
     assert.deepEqual(get.data.scope, ['fixture-a'], 'GET reflects the live scope');
   });
 
-  it('empty agents array = fleet-wide (accepted)', async () => {
+  it('empty agents array = fleet-wide (accepted) — response echoes count + fleetWide', async () => {
     scope = ['fixture-a'];
     const { status, data } = await req('POST', '/api/health/auto-suspend/scope', { agents: [] }, SECRET);
     assert.equal(status, 200);
     assert.deepEqual(data.scope, [], 'empty scope accepted = fleet-wide');
+    assert.equal(data.count, 0, 'response echoes resulting cohort size');
+    assert.equal(data.fleetWide, true, 'response flags fleet-wide unmistakably (never a silent 200)');
     assert.deepEqual(scope, []);
   });
 

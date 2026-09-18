@@ -1471,7 +1471,10 @@ route('POST', '/api/health/auto-suspend/scope', async (req, res, _match, ctx) =>
     return;
   }
   ctx.setAutoSuspendScope(agents as string[]);
-  json(res, 200, { ok: true, scope: ctx.getAutoSuspendScope?.() ?? [] });
+  const live = ctx.getAutoSuspendScope?.() ?? [];
+  // Echo the resulting cohort size + an explicit fleetWide flag — empty scope = fleet-wide is the
+  // highest-blast-radius outcome and must be unmistakable in the response, never a silent 200.
+  json(res, 200, { ok: true, scope: live, count: live.length, fleetWide: live.length === 0 });
 });
 
 // GET the live auto-suspend state + scope (authenticated read).

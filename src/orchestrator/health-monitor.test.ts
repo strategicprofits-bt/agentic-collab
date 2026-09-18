@@ -1468,6 +1468,24 @@ describe('HealthMonitor', () => {
     assert.equal(monitor.isAutoSuspendActive('a'), false, 'halt dominates even an in-scope agent');
     monitor.stop();
   });
+
+  it('runtime empty-scope-set emits a distinct LOUD fleet-wide warning (never silent); non-empty does not', () => {
+    const monitor = makeSuspendMonitor('unused', { autoSuspendScope: ['a'] });
+    const warns: string[] = [];
+    const orig = console.warn;
+    console.warn = (...args: unknown[]) => { warns.push(args.map(String).join(' ')); };
+    try {
+      monitor.setAutoSuspendScope(['a', 'b']); // non-empty → must NOT be the fleet-wide warning
+      const afterNonEmpty = warns.filter(w => /FLEET-WIDE/i.test(w)).length;
+      monitor.setAutoSuspendScope([]); // empty → going fleet-wide LIVE → LOUD warning
+      const afterEmpty = warns.filter(w => /FLEET-WIDE/i.test(w)).length;
+      assert.equal(afterNonEmpty, 0, 'a non-empty runtime scope-set must NOT emit the fleet-wide warning');
+      assert.equal(afterEmpty, 1, 'a runtime empty-scope-set MUST emit exactly one distinct FLEET-WIDE warning');
+    } finally {
+      console.warn = orig;
+    }
+    monitor.stop();
+  });
 });
 
 describe('HealthMonitor.stripAnsi', () => {
