@@ -1413,6 +1413,61 @@ describe('HealthMonitor', () => {
       if (saved !== undefined) process.env['AUTO_SUSPEND_ENABLED'] = saved;
     }
   });
+
+  // ── Per-agent rollout allowlist / gradual activation (GAP-070 scope-enable) ──
+  it('SCOPE gates suspend — an agent NOT in a non-empty scope is not auto-suspended', async () => {
+    const name = 'health-autosuspend-scoped-out';
+    await makeIdleAgentFor(name);
+    const monitor = makeSuspendMonitor(name, { idleSuspendMs: 60, autoSuspendScope: ['someone-else'] });
+    await driveToIdle(monitor, name);
+    await sleep(150); // past the idle threshold — the ONLY blocker is the scope
+    await monitor.pollAll();
+    await sleep(150);
+    assert.equal(db.getAgent(name)?.state, 'idle', 'out-of-scope agent must NOT auto-suspend');
+    monitor.stop();
+  });
+
+  it('SCOPE allows suspend — an agent IN the scope is auto-suspended', async () => {
+    const name = 'health-autosuspend-scoped-in';
+    await makeIdleAgentFor(name);
+    const monitor = makeSuspendMonitor(name, { idleSuspendMs: 60, autoSuspendScope: [name] });
+    await driveToIdle(monitor, name);
+    await sleep(150);
+    await monitor.pollAll();
+    await sleep(200);
+    const after = db.getAgent(name);
+    assert.ok(after?.state === 'suspending' || after?.state === 'suspended', `in-scope agent must suspend; got ${after?.state}`);
+    monitor.stop();
+  });
+
+  it('setAutoSuspendScope WIDENS live — an out-of-scope agent becomes suspendable after widening (no restart)', async () => {
+    const name = 'health-autosuspend-widen';
+    await makeIdleAgentFor(name);
+    const monitor = makeSuspendMonitor(name, { idleSuspendMs: 60, autoSuspendScope: ['other'] });
+    await driveToIdle(monitor, name);
+    await sleep(150);
+    await monitor.pollAll();
+    await sleep(120);
+    assert.equal(db.getAgent(name)?.state, 'idle', 'not yet in scope → not suspended');
+    monitor.setAutoSuspendScope([name]); // widen the cohort LIVE
+    await monitor.pollAll();
+    await sleep(200);
+    const after = db.getAgent(name);
+    assert.ok(after?.state === 'suspending' || after?.state === 'suspended', `after live widening must suspend; got ${after?.state}`);
+    monitor.stop();
+  });
+
+  it('isAutoSuspendActive semantics: no-arg = global armed; agent-arg = scope-filtered; empty scope = fleet-wide', () => {
+    const monitor = makeSuspendMonitor('unused', { autoSuspendScope: ['a'] }); // enabled, scope=[a]
+    assert.equal(monitor.isAutoSuspendActive(), true, 'no-arg = global armed (enabled && !halted), scope-agnostic');
+    assert.equal(monitor.isAutoSuspendActive('a'), true, 'in-scope agent active');
+    assert.equal(monitor.isAutoSuspendActive('b'), false, 'out-of-scope agent inactive');
+    monitor.setAutoSuspendScope([]); // empty = fleet-wide
+    assert.equal(monitor.isAutoSuspendActive('b'), true, 'empty scope = fleet-wide → any agent active');
+    monitor.setAutoSuspendHalted(true); // halt dominates scope
+    assert.equal(monitor.isAutoSuspendActive('a'), false, 'halt dominates even an in-scope agent');
+    monitor.stop();
+  });
 });
 
 describe('HealthMonitor.stripAnsi', () => {
