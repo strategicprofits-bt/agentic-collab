@@ -77,6 +77,10 @@ export type RouteContext = {
   setAutoSuspendHalted?: (halted: boolean) => void;
   /** GAP-070: read the live combined auto-suspend state (enabled && !halted) for halt efficacy. */
   isAutoSuspendActive?: () => boolean;
+  /** GAP-070 gradual activation: set the rollout allowlist at runtime (empty = fleet-wide). */
+  setAutoSuspendScope?: (agents: string[]) => void;
+  /** GAP-070: read the current rollout allowlist (empty = fleet-wide). */
+  getAutoSuspendScope?: () => string[];
 };
 
 /**
@@ -1451,9 +1455,31 @@ route('POST', '/api/health/auto-suspend/halt', async (req, res, _match, ctx) => 
   json(res, 200, { ok: true, halted: body['halted'], active: ctx.isAutoSuspendActive?.() ?? false });
 });
 
-// GET the live auto-suspend state (authenticated read).
+// ── Auto-suspend rollout allowlist (GAP-070 gradual activation) ──
+// POST sets the scope LIVE (empty array = fleet-wide) so the cohort widens fixture→cohort→fleet
+// without a restart. Authenticated by the same global gate. Response echoes the live scope (efficacy).
+// Scope gates BOTH suspend and resume-on-message identically (the getter is agent-parameterized).
+route('POST', '/api/health/auto-suspend/scope', async (req, res, _match, ctx) => {
+  const body = await readJson(req);
+  const agents = body['agents'];
+  if (!Array.isArray(agents) || !agents.every(a => typeof a === 'string')) {
+    json(res, 400, { error: 'body must include "agents": string[] (empty array = fleet-wide)' });
+    return;
+  }
+  if (!ctx.setAutoSuspendScope) {
+    json(res, 503, { error: 'auto-suspend control unavailable' });
+    return;
+  }
+  ctx.setAutoSuspendScope(agents as string[]);
+  const live = ctx.getAutoSuspendScope?.() ?? [];
+  // Echo the resulting cohort size + an explicit fleetWide flag — empty scope = fleet-wide is the
+  // highest-blast-radius outcome and must be unmistakable in the response, never a silent 200.
+  json(res, 200, { ok: true, scope: live, count: live.length, fleetWide: live.length === 0 });
+});
+
+// GET the live auto-suspend state + scope (authenticated read).
 route('GET', '/api/health/auto-suspend', async (_req, res, _match, ctx) => {
-  json(res, 200, { active: ctx.isAutoSuspendActive?.() ?? false });
+  json(res, 200, { active: ctx.isAutoSuspendActive?.() ?? false, scope: ctx.getAutoSuspendScope?.() ?? [] });
 });
 
 route('POST', '/api/agents/:name/kill', async (req, res, match, ctx) => {

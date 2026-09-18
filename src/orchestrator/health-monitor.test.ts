@@ -1413,6 +1413,79 @@ describe('HealthMonitor', () => {
       if (saved !== undefined) process.env['AUTO_SUSPEND_ENABLED'] = saved;
     }
   });
+
+  // ── Per-agent rollout allowlist / gradual activation (GAP-070 scope-enable) ──
+  it('SCOPE gates suspend — an agent NOT in a non-empty scope is not auto-suspended', async () => {
+    const name = 'health-autosuspend-scoped-out';
+    await makeIdleAgentFor(name);
+    const monitor = makeSuspendMonitor(name, { idleSuspendMs: 60, autoSuspendScope: ['someone-else'] });
+    await driveToIdle(monitor, name);
+    await sleep(150); // past the idle threshold — the ONLY blocker is the scope
+    await monitor.pollAll();
+    await sleep(150);
+    assert.equal(db.getAgent(name)?.state, 'idle', 'out-of-scope agent must NOT auto-suspend');
+    monitor.stop();
+  });
+
+  it('SCOPE allows suspend — an agent IN the scope is auto-suspended', async () => {
+    const name = 'health-autosuspend-scoped-in';
+    await makeIdleAgentFor(name);
+    const monitor = makeSuspendMonitor(name, { idleSuspendMs: 60, autoSuspendScope: [name] });
+    await driveToIdle(monitor, name);
+    await sleep(150);
+    await monitor.pollAll();
+    await sleep(200);
+    const after = db.getAgent(name);
+    assert.ok(after?.state === 'suspending' || after?.state === 'suspended', `in-scope agent must suspend; got ${after?.state}`);
+    monitor.stop();
+  });
+
+  it('setAutoSuspendScope WIDENS live — an out-of-scope agent becomes suspendable after widening (no restart)', async () => {
+    const name = 'health-autosuspend-widen';
+    await makeIdleAgentFor(name);
+    const monitor = makeSuspendMonitor(name, { idleSuspendMs: 60, autoSuspendScope: ['other'] });
+    await driveToIdle(monitor, name);
+    await sleep(150);
+    await monitor.pollAll();
+    await sleep(120);
+    assert.equal(db.getAgent(name)?.state, 'idle', 'not yet in scope → not suspended');
+    monitor.setAutoSuspendScope([name]); // widen the cohort LIVE
+    await monitor.pollAll();
+    await sleep(200);
+    const after = db.getAgent(name);
+    assert.ok(after?.state === 'suspending' || after?.state === 'suspended', `after live widening must suspend; got ${after?.state}`);
+    monitor.stop();
+  });
+
+  it('isAutoSuspendActive semantics: no-arg = global armed; agent-arg = scope-filtered; empty scope = fleet-wide', () => {
+    const monitor = makeSuspendMonitor('unused', { autoSuspendScope: ['a'] }); // enabled, scope=[a]
+    assert.equal(monitor.isAutoSuspendActive(), true, 'no-arg = global armed (enabled && !halted), scope-agnostic');
+    assert.equal(monitor.isAutoSuspendActive('a'), true, 'in-scope agent active');
+    assert.equal(monitor.isAutoSuspendActive('b'), false, 'out-of-scope agent inactive');
+    monitor.setAutoSuspendScope([]); // empty = fleet-wide
+    assert.equal(monitor.isAutoSuspendActive('b'), true, 'empty scope = fleet-wide → any agent active');
+    monitor.setAutoSuspendHalted(true); // halt dominates scope
+    assert.equal(monitor.isAutoSuspendActive('a'), false, 'halt dominates even an in-scope agent');
+    monitor.stop();
+  });
+
+  it('runtime empty-scope-set emits a distinct LOUD fleet-wide warning (never silent); non-empty does not', () => {
+    const monitor = makeSuspendMonitor('unused', { autoSuspendScope: ['a'] });
+    const warns: string[] = [];
+    const orig = console.warn;
+    console.warn = (...args: unknown[]) => { warns.push(args.map(String).join(' ')); };
+    try {
+      monitor.setAutoSuspendScope(['a', 'b']); // non-empty → must NOT be the fleet-wide warning
+      const afterNonEmpty = warns.filter(w => /FLEET-WIDE/i.test(w)).length;
+      monitor.setAutoSuspendScope([]); // empty → going fleet-wide LIVE → LOUD warning
+      const afterEmpty = warns.filter(w => /FLEET-WIDE/i.test(w)).length;
+      assert.equal(afterNonEmpty, 0, 'a non-empty runtime scope-set must NOT emit the fleet-wide warning');
+      assert.equal(afterEmpty, 1, 'a runtime empty-scope-set MUST emit exactly one distinct FLEET-WIDE warning');
+    } finally {
+      console.warn = orig;
+    }
+    monitor.stop();
+  });
 });
 
 describe('HealthMonitor.stripAnsi', () => {

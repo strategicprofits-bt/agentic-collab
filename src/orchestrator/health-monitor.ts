@@ -85,6 +85,15 @@ export type HealthMonitorOptions = {
    * flap guard against suspend→resume→re-suspend churn. Defaults to AUTOSUSPEND_RESUME_DEBOUNCE_MS.
    */
   resumeDebounceMs?: number;
+  /**
+   * Auto-suspend per-agent ROLLOUT ALLOWLIST (GAP-070 activation). Seeded from AUTO_SUSPEND_AGENTS
+   * (comma-separated). EMPTY = fleet-wide (every agent eligible when enabled); NON-EMPTY = ONLY the
+   * listed agents are eligible — the structural bound for the fixture empirical and the gradual
+   * activation mechanism (fixture → cohort → fleet=empty). Runtime-mutable via setAutoSuspendScope
+   * so the cohort widens LIVE without a restart. Gates BOTH suspend AND resume-on-message (the getter
+   * is agent-parameterized), so a scoped agent is the only one that suspends OR auto-resumes.
+   */
+  autoSuspendScope?: string[];
 };
 
 const DEFAULT_POLL_MS = 30_000;
@@ -188,6 +197,8 @@ export class HealthMonitor {
   private readonly autoSuspendEnabled: boolean;
   /** INSTANT emergency brake — runtime-mutable via setAutoSuspendHalted, read live per poll. */
   private autoSuspendHalted: boolean;
+  /** Per-agent rollout allowlist (GAP-070). Empty = fleet-wide; non-empty = only-these eligible. Runtime-mutable. */
+  private autoSuspendScope: Set<string>;
   /** Grace window (ms) after a resume during which auto-suspend is skipped (flap guard). */
   private readonly resumeDebounceMs: number;
   /** Timestamp of the last resume per agent — the resume-debounce clock. */
@@ -278,8 +289,16 @@ export class HealthMonitor {
     this.autoSuspendEnabled = opts.autoSuspendEnabled ?? (process.env['AUTO_SUSPEND_ENABLED'] === '1');
     this.autoSuspendHalted = opts.autoSuspendHalted ?? false;
     this.resumeDebounceMs = opts.resumeDebounceMs ?? HealthMonitor.AUTOSUSPEND_RESUME_DEBOUNCE_MS;
+    // GAP-070 rollout allowlist: seed from opts or AUTO_SUSPEND_AGENTS (csv). Empty = fleet-wide.
+    const scopeSeed = opts.autoSuspendScope ?? (process.env['AUTO_SUSPEND_AGENTS'] ?? '').split(',');
+    this.autoSuspendScope = new Set(scopeSeed.map(s => s.trim()).filter(Boolean));
     if (this.autoSuspendEnabled) {
-      console.warn('[health] AUTO_SUSPEND_ENABLED active — idle agents will be auto-suspended after the idle-suspend timeout (halt live via POST /api/health/auto-suspend/halt)');
+      if (this.autoSuspendScope.size === 0) {
+        // Enabled + empty scope = FLEET-WIDE. Loud so an accidental empty-scope activation is never silent.
+        console.warn('[health] AUTO_SUSPEND_ENABLED active with EMPTY scope — auto-suspend is FLEET-WIDE (every idle agent). Set AUTO_SUSPEND_AGENTS to bound it. Halt live via POST /api/health/auto-suspend/halt');
+      } else {
+        console.warn(`[health] AUTO_SUSPEND_ENABLED active, scoped to ${this.autoSuspendScope.size} agent(s): ${[...this.autoSuspendScope].join(', ')} (widen live via POST /api/health/auto-suspend/scope; halt via …/halt)`);
+      }
     }
 
     this.strandedWatchdog = new StrandedWatchdog({
@@ -950,12 +969,42 @@ export class HealthMonitor {
 
   /**
    * Combined LIVE auto-suspend state (GAP-070): enabled (activation lever) AND not halted
-   * (instant emergency brake). The SINGLE source of truth both consumers read — the suspend
-   * path here and the dispatcher's resume-on-message coupling (via an injected getter) — so a
-   * halt flip stops BOTH in the same instant (no half-halted middle). Read live per poll.
+   * (instant emergency brake) AND — when an agentName is given — in the rollout scope. The SINGLE
+   * source of truth BOTH consumers read: the suspend path here (with the agent name) and the
+   * dispatcher's resume-on-message coupling (via an injected getter, also with the agent name) — so
+   * a halt flip OR a scope change stops/gates BOTH in the same instant (no half-halted middle,
+   * scoping applied identically to suspend and resume). Read live per poll.
+   *
+   * agentName omitted → the global armed state (enabled && !halted), scope-agnostic (for status).
+   * agentName given → additionally scope-filtered: empty scope = fleet-wide (all eligible),
+   * non-empty scope = only listed agents eligible.
    */
-  isAutoSuspendActive(): boolean {
-    return this.autoSuspendEnabled && !this.autoSuspendHalted;
+  isAutoSuspendActive(agentName?: string): boolean {
+    if (!this.autoSuspendEnabled || this.autoSuspendHalted) return false;
+    if (agentName === undefined) return true; // global armed state (status), scope-agnostic
+    return this.autoSuspendScope.size === 0 || this.autoSuspendScope.has(agentName);
+  }
+
+  /** Current rollout allowlist snapshot (GAP-070) — empty array = fleet-wide. */
+  getAutoSuspendScope(): string[] {
+    return [...this.autoSuspendScope];
+  }
+
+  /**
+   * Set the rollout allowlist at runtime (GAP-070 gradual activation) — widen the cohort
+   * (fixture → cohort → [] = fleet) LIVE without a restart, so each widening avoids another
+   * container-recreate churn. Empty list = fleet-wide. Takes effect on the next poll; gates BOTH
+   * suspend and resume-on-message identically (same getter). Called by the authenticated scope route.
+   */
+  setAutoSuspendScope(agents: string[]): void {
+    this.autoSuspendScope = new Set(agents.map(s => s.trim()).filter(Boolean));
+    if (this.autoSuspendScope.size === 0) {
+      // Runtime empty-scope = going FLEET-WIDE live = the highest-blast-radius action. Distinct + LOUD
+      // (parallels the startup guard) so it is never silent — even if the feature is currently dormant.
+      console.warn(`[health] ⚠ AUTO-SUSPEND SCOPE SET TO EMPTY AT RUNTIME → FLEET-WIDE (every idle agent eligible when enabled; enabled=${this.autoSuspendEnabled}, halted=${this.autoSuspendHalted}). Instant brake: POST /api/health/auto-suspend/halt`);
+    } else {
+      console.warn(`[health] auto-suspend scope set at runtime → ${this.autoSuspendScope.size} agent(s): ${[...this.autoSuspendScope].join(', ')} (enabled=${this.autoSuspendEnabled}, halted=${this.autoSuspendHalted})`);
+    }
   }
 
   /**
@@ -985,7 +1034,7 @@ export class HealthMonitor {
    * (threshold >> poll interval). This is the GAP-070 dead-since-inception defect.
    */
   private autoSuspendIfEligible(agentName: string): void {
-    if (!this.isAutoSuspendActive()) return; // dormant/halted — the deploy-time no-op gate
+    if (!this.isAutoSuspendActive(agentName)) return; // dormant/halted/out-of-scope — the deploy-time no-op gate
     if (this.autoSuspending.has(agentName)) return;
 
     const agent = this.db.getAgent(agentName);

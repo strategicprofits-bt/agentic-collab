@@ -155,7 +155,7 @@ const messageDispatcher = new MessageDispatcher({
   // GAP-070: the dispatcher reads the SAME live auto-suspend state the health monitor's
   // suspend path reads (via the forward ref), so an instant halt stops resume-on-message and
   // suspend in the same instant. Default-false until the health monitor exists / is enabled.
-  isAutoSuspendActive: () => healthMonitorRef?.isAutoSuspendActive() ?? false,
+  isAutoSuspendActive: (agentName) => healthMonitorRef?.isAutoSuspendActive(agentName) ?? false,
   onAgentResumed: (agentName) => { healthMonitorRef?.noteResume(agentName); },
   onMessageDelivered: (agentName) => {
     // Immediately mark idle agents as active for instant dashboard feedback
@@ -291,6 +291,9 @@ const routeCtx: RouteContext = {
   // GAP-070 instant emergency brake: authenticated halt/re-arm of auto-suspend, live next poll.
   setAutoSuspendHalted: (halted) => healthMonitor.setAutoSuspendHalted(halted),
   isAutoSuspendActive: () => healthMonitor.isAutoSuspendActive(),
+  // GAP-070 gradual activation: set/read the rollout allowlist live (empty = fleet-wide).
+  setAutoSuspendScope: (agents) => healthMonitor.setAutoSuspendScope(agents),
+  getAutoSuspendScope: () => healthMonitor.getAutoSuspendScope(),
 };
 
 const router = createRouter(routeCtx);

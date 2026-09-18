@@ -1105,6 +1105,7 @@ describe('routes: auto-suspend halt', () => {
   // Model the health monitor's live combined state: active = enabled && !halted.
   let enabled = true;
   let halted = false;
+  let scope: string[] = [];
 
   before(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'agentic-halt-test-'));
@@ -1127,6 +1128,8 @@ describe('routes: auto-suspend halt', () => {
       telegramDispatcher: { send: async () => {} } as any,
       setAutoSuspendHalted: (h) => { halted = h; },
       isAutoSuspendActive: () => enabled && !halted,
+      setAutoSuspendScope: (a) => { scope = a; },
+      getAutoSuspendScope: () => scope,
     };
     const router = createRouter(ctx);
     server = createServer(async (req, res) => { await router(req, res); });
@@ -1180,5 +1183,42 @@ describe('routes: auto-suspend halt', () => {
     const { status } = await req('POST', '/api/health/auto-suspend/halt', { nope: 1 }, SECRET);
     assert.equal(status, 400);
     assert.equal(halted, false, 'malformed request must not flip the flag');
+  });
+
+  // ── scope route (GAP-070 gradual activation) ──
+  it('rejects an UNAUTHENTICATED scope set (401) — rollout lever is not open', async () => {
+    scope = [];
+    const { status } = await req('POST', '/api/health/auto-suspend/scope', { agents: ['x'] });
+    assert.equal(status, 401);
+    assert.deepEqual(scope, [], 'unauth request must not change scope');
+  });
+
+  it('authenticated scope set flips the live allowlist (efficacy) + GET reflects it', async () => {
+    scope = [];
+    const { status, data } = await req('POST', '/api/health/auto-suspend/scope', { agents: ['fixture-a'] }, SECRET);
+    assert.equal(status, 200);
+    assert.deepEqual(data.scope, ['fixture-a'], 'response echoes the live scope');
+    assert.equal(data.count, 1, 'response echoes cohort size');
+    assert.equal(data.fleetWide, false, 'non-empty scope is not fleet-wide');
+    assert.deepEqual(scope, ['fixture-a'], 'underlying scope actually set (efficacy)');
+    const get = await req('GET', '/api/health/auto-suspend', undefined, SECRET);
+    assert.deepEqual(get.data.scope, ['fixture-a'], 'GET reflects the live scope');
+  });
+
+  it('empty agents array = fleet-wide (accepted) — response echoes count + fleetWide', async () => {
+    scope = ['fixture-a'];
+    const { status, data } = await req('POST', '/api/health/auto-suspend/scope', { agents: [] }, SECRET);
+    assert.equal(status, 200);
+    assert.deepEqual(data.scope, [], 'empty scope accepted = fleet-wide');
+    assert.equal(data.count, 0, 'response echoes resulting cohort size');
+    assert.equal(data.fleetWide, true, 'response flags fleet-wide unmistakably (never a silent 200)');
+    assert.deepEqual(scope, []);
+  });
+
+  it('rejects a malformed scope body (400) without changing scope', async () => {
+    scope = ['keep'];
+    const { status } = await req('POST', '/api/health/auto-suspend/scope', { agents: 'not-an-array' }, SECRET);
+    assert.equal(status, 400);
+    assert.deepEqual(scope, ['keep'], 'malformed request must not change scope');
   });
 });

@@ -178,7 +178,7 @@ describe('MessageDispatcher', () => {
     if (command.action === 'has_session') return { ok: true, data: true };
     return { ok: true };
   };
-  function makeCoupledDispatcher(active: () => boolean, proxy = readyProxy): MessageDispatcher {
+  function makeCoupledDispatcher(active: (agentName: string) => boolean, proxy = readyProxy): MessageDispatcher {
     return new MessageDispatcher({
       db,
       locks: new LockManager(db.rawDb),
@@ -273,6 +273,33 @@ describe('MessageDispatcher', () => {
       assert.equal(delivered, true, 'active agent delivers normally even with coupling active');
       assert.equal(db.getPendingMessageById(msg.id)?.status, 'delivered');
       assert.equal(db.getAgent('act-normal')?.state, 'active', 'state unchanged — never routed through resume');
+    } finally {
+      dispatcher.stop();
+    }
+  });
+
+  it('GAP-070 SCOPE gates resume-coupling — an OUT-OF-SCOPE suspended agent is NOT woken', async () => {
+    db.createAgent({ name: 'sus-outofscope', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    setAgentState('sus-outofscope', 'suspended');
+    db.enqueueMessage({ sourceAgent: null, targetAgent: 'sus-outofscope', envelope: 'not for you' });
+    // getter mirrors isAutoSuspendActive(name): only 'someone-else' is active → this agent is out of scope
+    const dispatcher = makeCoupledDispatcher((name) => name === 'someone-else');
+    try {
+      await dispatcher.tryDeliver('sus-outofscope');
+      assert.equal(db.getAgent('sus-outofscope')?.state, 'suspended', 'out-of-scope suspended agent must NOT be woken (scope gates resume too)');
+    } finally {
+      dispatcher.stop();
+    }
+  });
+
+  it('GAP-070 SCOPE allows resume-coupling — an IN-SCOPE suspended agent IS woken', async () => {
+    db.createAgent({ name: 'sus-inscope', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    setAgentState('sus-inscope', 'suspended');
+    db.enqueueMessage({ sourceAgent: null, targetAgent: 'sus-inscope', envelope: 'wake, you are in scope' });
+    const dispatcher = makeCoupledDispatcher((name) => name === 'sus-inscope');
+    try {
+      await dispatcher.tryDeliver('sus-inscope');
+      assert.notEqual(db.getAgent('sus-inscope')?.state, 'suspended', 'in-scope suspended agent IS woken');
     } finally {
       dispatcher.stop();
     }

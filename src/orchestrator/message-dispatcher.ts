@@ -33,7 +33,7 @@ export type MessageDispatcherOptions = {
    * resumes a suspended agent — the normal delivery path is byte-unchanged. Reading the same
    * getter the suspend path uses is what makes the halt atomic across both consumers.
    */
-  isAutoSuspendActive?: () => boolean;
+  isAutoSuspendActive?: (agentName: string) => boolean;
   /** GAP-070 flap guard: notify the health monitor when a suspended agent is woken for delivery. */
   onAgentResumed?: (agentName: string) => void;
 };
@@ -46,7 +46,7 @@ export class MessageDispatcher {
   private readonly onQueueUpdate: (message: PendingMessage) => void;
   private readonly onDashboardMessage: (message: DashboardMessage) => void;
   private readonly onMessageDelivered: (agentName: string) => void;
-  private readonly isAutoSuspendActive: () => boolean;
+  private readonly isAutoSuspendActive: (agentName: string) => boolean;
   private readonly onAgentResumed: (agentName: string) => void;
   private readonly drainTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Guards against concurrent drain loops for the same agent. */
@@ -73,7 +73,7 @@ export class MessageDispatcher {
     this.onQueueUpdate = opts.onQueueUpdate ?? (() => {});
     this.onDashboardMessage = opts.onDashboardMessage ?? (() => {});
     this.onMessageDelivered = opts.onMessageDelivered ?? (() => {});
-    this.isAutoSuspendActive = opts.isAutoSuspendActive ?? (() => false);
+    this.isAutoSuspendActive = opts.isAutoSuspendActive ?? ((_agentName: string) => false);
     this.onAgentResumed = opts.onAgentResumed ?? (() => {});
   }
 
@@ -90,7 +90,7 @@ export class MessageDispatcher {
    *   - `resuming` set → no concurrent double-resume.
    */
   private async maybeResumeForDelivery(agentName: string): Promise<boolean> {
-    if (!this.isAutoSuspendActive()) return false;
+    if (!this.isAutoSuspendActive(agentName)) return false; // dormant/halted/out-of-scope (same gate as suspend)
     if (this.resuming.has(agentName)) return false;
     const agent = this.db.getAgent(agentName);
     if (!agent || !agent.proxyId || agent.state !== 'suspended') return false;
