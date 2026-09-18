@@ -885,22 +885,7 @@ describe('HealthMonitor', () => {
       proxyId: 'p1',
     });
 
-    captureOutput = 'idle prompt\n> \n';
-    const suspendCalls: string[] = [];
-
-    const monitor = makeMonitor({
-      idleSuspendMs: 50,
-      proxyDispatch: async (_proxyId: string, command: ProxyCommand): Promise<ProxyResponse> => {
-        proxyCommands.push(command);
-        if (command.action === 'capture') return { ok: true, data: captureOutput };
-        if (command.action === 'has_session') return { ok: true, data: true };
-        if (command.action === 'paste') {
-          suspendCalls.push(('text' in command && command.text) as string ?? 'paste');
-        }
-        if (command.action === 'pane_activity') return { ok: true, data: 1 };
-        return { ok: true };
-      },
-    });
+    const monitor = makeSuspendMonitor(name, { idleSuspendMs: 50 });
 
     // First poll: baseline snapshot
     await monitor.pollAll();
@@ -910,10 +895,10 @@ describe('HealthMonitor', () => {
     const afterIdle = db.getAgent(name);
     assert.equal(afterIdle?.state, 'idle', 'should be idle after 2 unchanged polls');
 
-    // Set lastActivity far in the past to trigger timeout
-    db.updateAgentState(name, 'idle', afterIdle!.version, {
-      lastActivity: new Date(Date.now() - 10_000).toISOString(),
-    });
+    // Real sustained idle past the 50ms threshold. idleSince (the active→idle transition
+    // stamp), NOT the poll-refreshed lastActivity, is the auto-suspend clock — so elapse real
+    // time rather than backdating a field the gate no longer reads.
+    await new Promise(r => setTimeout(r, 120));
 
     // Third poll: should trigger auto-suspend
     await monitor.pollAll();
@@ -941,17 +926,7 @@ describe('HealthMonitor', () => {
       proxyId: 'p1',
     });
 
-    captureOutput = 'idle prompt\n> \n';
-    const monitor = makeMonitor({
-      idleSuspendMs: 50,
-      proxyDispatch: async (_proxyId: string, command: ProxyCommand): Promise<ProxyResponse> => {
-        proxyCommands.push(command);
-        if (command.action === 'capture') return { ok: true, data: captureOutput };
-        if (command.action === 'has_session') return { ok: true, data: true };
-        if (command.action === 'pane_activity') return { ok: true, data: 1 };
-        return { ok: true };
-      },
-    });
+    const monitor = makeSuspendMonitor(name, { idleSuspendMs: 50 });
 
     // Poll twice to reach idle via screen-diff
     await monitor.pollAll();
@@ -959,10 +934,9 @@ describe('HealthMonitor', () => {
     const idled = db.getAgent(name);
     assert.equal(idled?.state, 'idle', 'should be idle after 2 unchanged polls');
 
-    // Set lastActivity far in the past to trigger timeout
-    db.updateAgentState(name, 'idle', idled!.version, {
-      lastActivity: new Date(Date.now() - 10_000).toISOString(),
-    });
+    // Real sustained idle past the threshold, so the pending-message gate (not insufficient
+    // idle) is the actual blocker under test.
+    await new Promise(r => setTimeout(r, 120));
 
     // Enqueue a message so hasPendingMessages returns true
     db.enqueueMessage({ sourceAgent: null, targetAgent: name, envelope: 'test message' });
@@ -985,17 +959,7 @@ describe('HealthMonitor', () => {
       proxyId: 'p1',
     });
 
-    captureOutput = 'idle prompt\n> \n';
-    const monitor = makeMonitor({
-      idleSuspendMs: 50,
-      proxyDispatch: async (_proxyId: string, command: ProxyCommand): Promise<ProxyResponse> => {
-        proxyCommands.push(command);
-        if (command.action === 'capture') return { ok: true, data: captureOutput };
-        if (command.action === 'has_session') return { ok: true, data: true };
-        if (command.action === 'pane_activity') return { ok: true, data: 1 };
-        return { ok: true };
-      },
-    });
+    const monitor = makeSuspendMonitor(name, { idleSuspendMs: 50 });
 
     // Poll twice to reach idle via screen-diff
     await monitor.pollAll();
@@ -1003,10 +967,8 @@ describe('HealthMonitor', () => {
     const idled = db.getAgent(name);
     assert.equal(idled?.state, 'idle', 'should be idle after 2 unchanged polls');
 
-    // Set lastActivity far in the past to trigger timeout
-    db.updateAgentState(name, 'idle', idled!.version, {
-      lastActivity: new Date(Date.now() - 10_000).toISOString(),
-    });
+    // Real sustained idle past the threshold, so the imminent-reminder gate is the blocker.
+    await new Promise(r => setTimeout(r, 120));
 
     // Create an imminent reminder (cadence nearly elapsed — fires within idle window)
     const rem = db.createReminder({ agentName: name, prompt: 'check something', cadenceMinutes: 5 });
@@ -1032,27 +994,15 @@ describe('HealthMonitor', () => {
       proxyId: 'p1',
     });
 
-    captureOutput = 'idle prompt\n> \n';
-    const monitor = makeMonitor({
-      idleSuspendMs: 50,
-      proxyDispatch: async (_proxyId: string, command: ProxyCommand): Promise<ProxyResponse> => {
-        proxyCommands.push(command);
-        if (command.action === 'capture') return { ok: true, data: captureOutput };
-        if (command.action === 'has_session') return { ok: true, data: true };
-        if (command.action === 'pane_activity') return { ok: true, data: 1 };
-        if (command.action === 'suspend') return { ok: true };
-        return { ok: true };
-      },
-    });
+    const monitor = makeSuspendMonitor(name, { idleSuspendMs: 50 });
 
     await monitor.pollAll();
     await monitor.pollAll();
     const idled = db.getAgent(name);
     assert.equal(idled?.state, 'idle', 'should be idle after 2 unchanged polls');
 
-    db.updateAgentState(name, 'idle', idled!.version, {
-      lastActivity: new Date(Date.now() - 10_000).toISOString(),
-    });
+    // Real sustained idle past the threshold — the distant reminder must NOT block suspend.
+    await new Promise(r => setTimeout(r, 120));
 
     // Create a distant reminder (24h cadence, just created — not imminent)
     db.createReminder({ agentName: name, prompt: 'daily check', cadenceMinutes: 1440 });
@@ -1345,6 +1295,123 @@ describe('HealthMonitor', () => {
 
     assert.ok(!pasted.some(t => t.includes('/compact')), 'must not compact when the composer capture fails (cannot verify)');
     monitor.stop();
+  });
+
+  // ── Auto-suspend activation + instant-halt + flap guard (GAP-070 coupled build) ──
+  // Target-scoped: the target session reads a STABLE idle prompt (→ idle → suspend candidate);
+  // every OTHER session reads a per-poll-CHANGING pane (→ active), so a leftover idle agent from
+  // an earlier test in the shared db is never drawn into this test's auto-suspend (no stray async
+  // suspend racing teardown). Mirrors makeCompactMonitor's targetSession scoping.
+  function makeSuspendMonitor(targetName: string, overrides?: Partial<ConstructorParameters<typeof HealthMonitor>[0]>): HealthMonitor {
+    const targetSession = `agent-${targetName}`;
+    let tick = 0;
+    return makeMonitor({
+      idleSuspendMs: 60,
+      autoSuspendEnabled: true,
+      resumeDebounceMs: 0,
+      proxyDispatch: async (_p: string, command: ProxyCommand): Promise<ProxyResponse> => {
+        proxyCommands.push(command);
+        const isTarget = 'sessionName' in command && command.sessionName === targetSession;
+        if (command.action === 'capture') return { ok: true, data: isTarget ? 'idle prompt\n> \n' : `busy ${tick++}\n> working\n` };
+        if (command.action === 'has_session') return { ok: true, data: true };
+        if (command.action === 'pane_activity') return { ok: true, data: 1 };
+        return { ok: true };
+      },
+      ...overrides,
+    });
+  }
+  async function makeIdleAgentFor(name: string): Promise<void> {
+    db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent(name)!;
+    db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
+  }
+
+  it('REGRESSION: auto-suspends after SUSTAINED idle across continuous polls (threshold > poll-gap)', async () => {
+    // GAP-070 dead-since-inception defect: idleDuration was keyed on agent.lastActivity, which
+    // the monitor refreshes to now EVERY poll — so in the production regime (threshold >> poll
+    // interval) the idle clock never accrued under continuous polling and auto-suspend NEVER
+    // fired. idleSince fixes it. This test FAILS on the lastActivity clock, PASSES on idleSince.
+    const name = 'health-autosuspend-sustained';
+    await makeIdleAgentFor(name);
+    const monitor = makeSuspendMonitor(name, { idleSuspendMs: 250 });
+    await monitor.pollAll();
+    await monitor.pollAll();
+    assert.equal(db.getAgent(name)?.state, 'idle', 'precondition: idle');
+    const start = Date.now();
+    while (Date.now() - start < 500) { await monitor.pollAll(); await sleep(40); }
+    await sleep(200);
+    const after = db.getAgent(name);
+    assert.ok(after?.state === 'suspending' || after?.state === 'suspended',
+      `must suspend after SUSTAINED idle despite continuous polling; got ${after?.state}`);
+    monitor.stop();
+  });
+
+  it('is DORMANT by default — never auto-suspends when autoSuspendEnabled is unset', async () => {
+    const name = 'health-autosuspend-dormant';
+    await makeIdleAgentFor(name);
+    const monitor = makeMonitor({
+      idleSuspendMs: 60, // NOTE: no autoSuspendEnabled → dormant
+      proxyDispatch: async (_p: string, command: ProxyCommand): Promise<ProxyResponse> => {
+        proxyCommands.push(command);
+        if (command.action === 'capture') return { ok: true, data: 'idle prompt\n> \n' };
+        if (command.action === 'has_session') return { ok: true, data: true };
+        if (command.action === 'pane_activity') return { ok: true, data: 1 };
+        return { ok: true };
+      },
+    });
+    assert.equal(monitor.isAutoSuspendActive(), false, 'default must be dormant');
+    await driveToIdle(monitor, name);
+    await sleep(150); // well past the 60ms threshold
+    await monitor.pollAll();
+    await sleep(150);
+    assert.equal(db.getAgent(name)?.state, 'idle', 'dormant default must never auto-suspend (deploy no-op)');
+    monitor.stop();
+  });
+
+  it('HALT is instant: halted stops auto-suspend live; un-halt re-arms (no restart)', async () => {
+    const name = 'health-autosuspend-halt';
+    await makeIdleAgentFor(name);
+    const monitor = makeSuspendMonitor(name, { idleSuspendMs: 60 });
+    monitor.setAutoSuspendHalted(true);
+    assert.equal(monitor.isAutoSuspendActive(), false, 'active=false while halted');
+    await driveToIdle(monitor, name);
+    await sleep(150);
+    await monitor.pollAll();
+    await sleep(150);
+    assert.equal(db.getAgent(name)?.state, 'idle', 'must NOT suspend while halted');
+    monitor.setAutoSuspendHalted(false); // re-arm live
+    assert.equal(monitor.isAutoSuspendActive(), true, 'active=true after re-arm');
+    await monitor.pollAll();
+    await sleep(200);
+    const after = db.getAgent(name);
+    assert.ok(after?.state === 'suspending' || after?.state === 'suspended',
+      `must suspend on the next poll after re-arm; got ${after?.state}`);
+    monitor.stop();
+  });
+
+  it('does NOT re-suspend within the resume-debounce window (flap guard)', async () => {
+    const name = 'health-autosuspend-debounce';
+    await makeIdleAgentFor(name);
+    const monitor = makeSuspendMonitor(name, { idleSuspendMs: 60, resumeDebounceMs: 100_000 });
+    await driveToIdle(monitor, name);
+    monitor.noteResume(name); // a wake just happened
+    await sleep(150); // past the idle threshold, but INSIDE the (huge) debounce window
+    await monitor.pollAll();
+    await sleep(150);
+    assert.equal(db.getAgent(name)?.state, 'idle', 'must not re-suspend within the resume-debounce window');
+    monitor.stop();
+  });
+
+  it('FAIL-SAFE: unset AUTO_SUSPEND_ENABLED env seeds dormant (restart safety)', () => {
+    const saved = process.env['AUTO_SUSPEND_ENABLED'];
+    delete process.env['AUTO_SUSPEND_ENABLED'];
+    try {
+      const monitor = makeMonitor({}); // no explicit option → constructor reads the (unset) env
+      assert.equal(monitor.isAutoSuspendActive(), false, 'unset env must seed dormant — restart fails safe');
+      monitor.stop();
+    } finally {
+      if (saved !== undefined) process.env['AUTO_SUSPEND_ENABLED'] = saved;
+    }
   });
 });
 

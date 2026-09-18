@@ -72,6 +72,11 @@ export type RouteContext = {
   telegramDispatcher: TelegramDispatcher;
   /** GAP-056 ADD-2: shared blast-radius tracker, threaded into API-triggered recovery ctx. */
   recoveryScaleTracker?: import('./recovery-scale-tracker.ts').RecoveryScaleTracker | undefined;
+  /** GAP-070: flip the auto-suspend instant emergency brake (halt/re-arm). Optional so the type
+   *  stays usable without a health monitor; wired to HealthMonitor.setAutoSuspendHalted in main. */
+  setAutoSuspendHalted?: (halted: boolean) => void;
+  /** GAP-070: read the live combined auto-suspend state (enabled && !halted) for halt efficacy. */
+  isAutoSuspendActive?: () => boolean;
 };
 
 /**
@@ -1426,6 +1431,30 @@ route('POST', '/api/agents/:name/recover', async (req, res, match, ctx) => {
 route('POST', '/api/agents/:name/interrupt', lifecycleRoute(interruptAgent, { eventLabel: 'Interrupted' }));
 
 route('POST', '/api/agents/:name/compact', lifecycleRoute(compactAgent, { eventLabel: 'Compacted' }));
+
+// ── Auto-suspend instant emergency brake (GAP-070) ──
+// POST flips the live halt flag; the router already requires a Bearer token for all non-public
+// POSTs, so this fleet-control lever is authenticated. The response echoes the live combined
+// state (efficacy: proves the flip took, not merely a 200). Both the health-monitor suspend path
+// and the dispatcher resume-on-message coupling read that same state, so a halt stops both at once.
+route('POST', '/api/health/auto-suspend/halt', async (req, res, _match, ctx) => {
+  const body = await readJson(req);
+  if (typeof body['halted'] !== 'boolean') {
+    json(res, 400, { error: 'body must include boolean "halted"' });
+    return;
+  }
+  if (!ctx.setAutoSuspendHalted) {
+    json(res, 503, { error: 'auto-suspend control unavailable' });
+    return;
+  }
+  ctx.setAutoSuspendHalted(body['halted']);
+  json(res, 200, { ok: true, halted: body['halted'], active: ctx.isAutoSuspendActive?.() ?? false });
+});
+
+// GET the live auto-suspend state (authenticated read).
+route('GET', '/api/health/auto-suspend', async (_req, res, _match, ctx) => {
+  json(res, 200, { active: ctx.isAutoSuspendActive?.() ?? false });
+});
 
 route('POST', '/api/agents/:name/kill', async (req, res, match, ctx) => {
   const name = match.pathname.groups['name']!;
