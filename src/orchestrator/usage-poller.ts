@@ -730,10 +730,17 @@ export function parseClaudeUsage(output: string): UsageBucket[] {
         continue;
       }
 
-      // Old format: progress bar on same line or line above, reset info below
+      // Old format: progress bar on same line or line above, reset info below.
+      // GAP-067 Finding 3: ALSO accept a bar-LESS "N% used" line whose column before the
+      // percentage is pure whitespace (`^\s*\d+% used`). After a weekly reset the week buckets
+      // drop to 0-1%%, where a 0%% bar renders as spaces only (no glyph) — the glyph-only gate
+      // silently dropped it, blinding the week reading right after a reset. The whitespace-only
+      // prefix still rejects incidental prose like "used directly: 19% used" (that fails ^\s*\d+%),
+      // while a 1%% partial glyph (▌) or a light-shade (░) bar is still caught by the bar test.
       const hasBarOnLine = PROGRESS_BAR_RE.test(line);
       const hasBarAbove = i > 0 && PROGRESS_BAR_RE.test(lines[i - 1]!);
-      if (hasBarOnLine || hasBarAbove) {
+      const isBarlessPctLine = /^\s*\d+%\s+used\b/.test(line);
+      if (hasBarOnLine || hasBarAbove || isBarlessPctLine) {
         let label = '';
         for (let j = i - 1; j >= 0; j--) {
           const l = lines[j]!.trim();

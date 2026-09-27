@@ -26,6 +26,35 @@ describe('parseClaudeUsage', () => {
     assert.equal(buckets[1]!.resetsAt, 'Mar 13, 12am (America/Chicago)');
   });
 
+  it('parses low-percentage buckets with no/partial bar glyph (post-weekly-reset)', () => {
+    // GAP-067 Finding 3: after a weekly reset the week buckets drop to 0-1%%, where the bar
+    // renders with a partial glyph (▌) or NONE (0%% = spaces only). Gating on a bar glyph
+    // silently dropped these — the label + "N%% used" must be enough.
+    const output = [
+      '  Current session',
+      '  █▌                                                 3% used',
+      '  Resets 3:59pm (UTC)',
+      '',
+      '  Current week (all models)',
+      '  ▌                                                  1% used',
+      '  Resets Oct 4, 9:59am (UTC)',
+      '',
+      '  Current week (Fable)',
+      '                                                     0% used',
+      '  Resets Oct 4, 10am (UTC)',
+    ].join('\n');
+
+    const buckets = parseClaudeUsage(output);
+    assert.equal(buckets.length, 3);
+    assert.equal(buckets[0]!.label, 'Current session');
+    assert.equal(buckets[0]!.pctUsed, 3);
+    assert.equal(buckets[1]!.label, 'Current week (all models)');
+    assert.equal(buckets[1]!.pctUsed, 1);
+    assert.equal(buckets[2]!.label, 'Current week (Fable)');
+    assert.equal(buckets[2]!.pctUsed, 0);
+    assert.equal(buckets[2]!.resetsAt, 'Oct 4, 10am (UTC)');
+  });
+
   it('parses three buckets including Sonnet-only', () => {
     const output = [
       '  Current session',
