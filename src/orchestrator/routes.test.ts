@@ -539,6 +539,50 @@ describe('API Routes', () => {
     assert.equal(status, 200);
     assert.ok(typeof (data as Record<string, unknown>).restored === 'number');
   });
+
+  // ── Reminders: PATCH in-place update (the contract `collab reminder update` wires to) ──
+
+  async function createReminder(): Promise<number> {
+    // POST /api/reminders requires the agent to exist — create it once (idempotent).
+    if (!db.getAgent('rem-agent')) {
+      db.createAgent({ name: 'rem-agent', engine: 'claude', cwd: '/tmp' });
+    }
+    const { status, data } = await api('POST', '/api/reminders', {
+      agentName: 'rem-agent', prompt: 'original prompt', cadenceMinutes: 30, createdBy: 'test',
+    });
+    assert.equal(status, 201);
+    return (data as Record<string, number>).id;
+  }
+
+  it('PATCH /api/reminders/:id updates the prompt in place (same id, persisted)', async () => {
+    const id = await createReminder();
+    const { status, data } = await api('PATCH', `/api/reminders/${id}`, { prompt: 'updated prompt' });
+    assert.equal(status, 200);
+    assert.equal((data as Record<string, unknown>).id, id, 'same id — atomic in-place edit, no churn');
+    assert.equal((data as Record<string, unknown>).prompt, 'updated prompt');
+    // Persisted: list reflects the new prompt under the same id.
+    const { data: list } = await api('GET', '/api/reminders?agent=rem-agent');
+    const row = (list as Array<Record<string, unknown>>).find((r) => r.id === id);
+    assert.equal(row?.prompt, 'updated prompt');
+  });
+
+  it('PATCH /api/reminders/:id updates cadenceMinutes', async () => {
+    const id = await createReminder();
+    const { status, data } = await api('PATCH', `/api/reminders/${id}`, { cadenceMinutes: 15 });
+    assert.equal(status, 200);
+    assert.equal((data as Record<string, unknown>).cadenceMinutes, 15);
+  });
+
+  it('PATCH /api/reminders/:id rejects cadenceMinutes < 5 (400, unchanged)', async () => {
+    const id = await createReminder();
+    const { status } = await api('PATCH', `/api/reminders/${id}`, { cadenceMinutes: 3 });
+    assert.equal(status, 400);
+  });
+
+  it('PATCH /api/reminders/:id on a nonexistent id → 404', async () => {
+    const { status } = await api('PATCH', '/api/reminders/99999', { prompt: 'x' });
+    assert.equal(status, 404);
+  });
 });
 
 describe('API Routes — Auth', () => {

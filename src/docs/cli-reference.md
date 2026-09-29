@@ -185,7 +185,15 @@ collab reminder cancel <id>
 collab reminder swap <id1> <id2>
 ```
 
-Controls which reminder is delivered first (lower sort order = delivered first).
+Controls which reminder is delivered first (lower sort order = delivered first). `swap` changes ORDER only — it does **not** edit a reminder's prompt or cadence.
+
+**Edit in place (prompt and/or cadence):**
+```
+collab reminder update <id> "<new prompt>" [--cadence 10m]
+collab reminder update <id> --cadence 15m          # cadence only, prompt unchanged
+```
+
+Atomically updates the reminder's prompt and/or cadence — **same id, no delivery gap**. Prefer this over `done`+`add` for editing an existing reminder (that mints a new id and briefly leaves the slot empty). At least one of `<prompt>` / `--cadence` is required; cadence must be ≥ 5 minutes.
 
 ### Pages
 
