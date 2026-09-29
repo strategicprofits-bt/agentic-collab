@@ -551,7 +551,7 @@ describe('API Routes', () => {
       agentName: 'rem-agent', prompt: 'original prompt', cadenceMinutes: 30, createdBy: 'test',
     });
     assert.equal(status, 201);
-    return (data as Record<string, number>).id;
+    return (data as { id: number }).id;
   }
 
   it('PATCH /api/reminders/:id updates the prompt in place (same id, persisted)', async () => {
