@@ -450,7 +450,7 @@ cmd('tmux', 'tmux <agent> -- <tmux args...>', 'Run a constrained tmux command ag
 
 // ── Reminders ──
 
-cmd('reminder', 'reminder <sub> [args...]', 'Manage reminders (add|list|done|cancel|swap)', async (args) => {
+cmd('reminder', 'reminder <sub> [args...]', 'Manage reminders (add|list|done|cancel|swap|update)', async (args) => {
   const sub = args[0];
   const sargs = args.slice(1);
 
@@ -552,9 +552,40 @@ cmd('reminder', 'reminder <sub> [args...]', 'Manage reminders (add|list|done|can
     console.log(`swapped reminder #${id1} ↔ #${id2}`);
   }
 
+  else if (sub === 'update') {
+    // collab reminder update <id> "<new prompt>" [--cadence 10m]
+    // Atomic in-place edit (PATCH) — SAME id, no gap, unlike done+add. `swap` is reorder-only,
+    // NOT content; this is the content-edit path. Prompt and/or --cadence (at least one).
+    const id = parseInt(sargs[0], 10);
+    if (isNaN(id)) { console.error('usage: collab reminder update <id> "<prompt>" [--cadence 10m]'); process.exit(1); }
+    let prompt; let cadence;
+    for (let i = 1; i < sargs.length; i++) {
+      if (sargs[i] === '--cadence' && sargs[i + 1]) { cadence = sargs[++i]; }
+      else if (prompt === undefined) { prompt = sargs[i]; }
+    }
+    if (prompt === undefined && cadence === undefined) {
+      console.error('usage: collab reminder update <id> "<prompt>" [--cadence 10m]  (at least one of prompt / --cadence)');
+      process.exit(1);
+    }
+    const body = {};
+    if (prompt !== undefined) body.prompt = prompt;
+    if (cadence !== undefined) {
+      const m = cadence.match(/^(\d+)m?$/);
+      if (!m) { console.error('error: --cadence must be like 10m or 30'); process.exit(1); }
+      const cadenceMinutes = parseInt(m[1], 10);
+      if (cadenceMinutes < 5) { console.error('error: cadence must be >= 5 minutes'); process.exit(1); }
+      body.cadenceMinutes = cadenceMinutes;
+    }
+    await api('PATCH', `/api/reminders/${id}`, body);
+    const parts = [];
+    if (body.prompt !== undefined) parts.push('prompt');
+    if (body.cadenceMinutes !== undefined) parts.push(`cadence=${body.cadenceMinutes}m`);
+    console.log(`reminder #${id} updated (${parts.join(', ')}) — same id, no gap`);
+  }
+
   else {
     console.error(`unknown subcommand: ${sub}`);
-    console.error('usage: collab reminder {add|list|done|cancel|swap}');
+    console.error('usage: collab reminder {add|list|done|cancel|swap|update}');
     process.exit(1);
   }
 });
