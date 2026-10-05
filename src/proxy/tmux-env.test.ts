@@ -105,6 +105,23 @@ describe('envScrubArgs — COMPOSITION with the -e overrides (coherent-by-constr
     assert.ok(!argv.includes('-u'), 'composed argv must contain no -u flag');
   });
 
+  it('sets DISABLE_AUTOUPDATER=1 so the native CLI auto-updater is OFF (CLI-pin enforceable, GAP-069)', () => {
+    const argv = buildCreateSessionArgs('sess', '/work', { PATH: '/usr/bin' });
+    assert.ok(argvHasFlagKey(argv, '-e', 'DISABLE_AUTOUPDATER=1'),
+      'every spawned session must launch with -e DISABLE_AUTOUPDATER=1');
+  });
+
+  it('DISABLE_AUTOUPDATER is set-to-1 exactly once even if inherited (E_OVERRIDE skip, no scrub dup)', () => {
+    // If the proxy env already carries DISABLE_AUTOUPDATER, the scrub must NOT emit a
+    // second `-e DISABLE_AUTOUPDATER=` (empty) that would clobber our authoritative =1.
+    const scrubKeys = ['DISABLE_AUTOUPDATER', 'DOPPLER_TOKEN'];
+    assert.deepEqual(envScrubArgs(scrubKeys), ['-e', 'DOPPLER_TOKEN='],
+      'DISABLE_AUTOUPDATER is an -e override key, never scrubbed to empty');
+    const argv = buildCreateSessionArgs('sess', '/work', { PATH: '/usr/bin' }, scrubKeys);
+    assert.equal(countFlagKey(argv, '-e', 'DISABLE_AUTOUPDATER=1'), 1, 'exactly one -e DISABLE_AUTOUPDATER=1');
+    assert.equal(countFlagKey(argv, '-e', 'DISABLE_AUTOUPDATER='), 0, 'no empty-set duplicate');
+  });
+
   it('NEVER scrubs COLLAB_AGENT in the composed argv (path-2 guard fails-open if it is missing)', () => {
     const scrubKeys = ['COLLAB_AGENT', 'DOPPLER_TOKEN', 'STRIPE_SECRET_KEY'];
     const argv = buildCreateSessionArgs('sess', '/work', { PATH: '/usr/bin' }, scrubKeys);

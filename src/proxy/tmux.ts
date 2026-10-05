@@ -178,7 +178,7 @@ export const ALLOWED_SESSION_ENV = new Set<string>([
  * arg-ordering refactor cannot silently reopen the TMP-clobber. The explicit
  * `-e` override is the sole authority for these keys.
  */
-const E_OVERRIDE_KEYS = new Set<string>(['CLAUDECODE', 'PATH', 'TMPDIR', 'TMP']);
+const E_OVERRIDE_KEYS = new Set<string>(['CLAUDECODE', 'PATH', 'TMPDIR', 'TMP', 'DISABLE_AUTOUPDATER']);
 
 /**
  * Given the key names present in the session's inherited environment, return the
@@ -249,6 +249,16 @@ export function parseServerEnvKeys(showEnvOutput: string): string[] {
  *                 makes it short-circuit to /tmp regardless of a poisoned TMP.
  * - TMP=        : clear any inherited TMP so a secret value clobbered onto the
  *                 server env is absent from the spawn env entirely (Facet-B).
+ * - DISABLE_AUTOUPDATER=1 : the native claude installer's auto-updater is PROTECTED
+ *                 (autoUpdatesProtectedForNative) and ignores `autoUpdates:false` in
+ *                 config — it auto-advances the ~/.local/bin/claude symlink to
+ *                 native-CDN `latest`, which LEADS npm `latest` (lands un-triageable
+ *                 pre-releases, GAP-069). The env var is checked FIRST in the binary's
+ *                 update-decision fn (verified) and is the ONLY thing that disables it,
+ *                 making our CLI ratification ENFORCEABLE (version pin holds instead of
+ *                 being overwritten). Policy pairs with PROMPT advance-on-ratification
+ *                 (Chloe #392 → Kondo+Brienne → DrRobby ratify → manual `claude install
+ *                 <ratified>`) so disabling auto-update does NOT stagnate security patches.
  */
 export function buildCreateSessionArgs(
   sessionName: string,
@@ -266,6 +276,7 @@ export function buildCreateSessionArgs(
     '-e', `PATH=${path}`,
     '-e', 'TMPDIR=/tmp',
     '-e', 'TMP=',
+    '-e', 'DISABLE_AUTOUPDATER=1',
   ];
 }
 
