@@ -40,6 +40,14 @@ services:
       - AUTOCOMPACT_TOKEN_THRESHOLD=${AUTOCOMPACT_TOKEN_THRESHOLD:-}
       - AUTOCOMPACT_MIN_IDLE_MS=${AUTOCOMPACT_MIN_IDLE_MS:-}
       - AUTOCOMPACT_COOLDOWN_MS=${AUTOCOMPACT_COOLDOWN_MS:-}
+      # GAP-070 auto-suspend (dormant by default) — host-env-settable without a rebuild,
+      # same pass-through pattern as auto-compact. Empty/unset → DORMANT (fail-safe): the code
+      # never auto-suspends. AUTO_SUSPEND_ENABLED=1 is the deliberate activation lever;
+      # AUTO_SUSPEND_AGENTS is the per-agent rollout allowlist (empty=fleet-wide when enabled —
+      # LOUD-warned; set to a cohort to bound it). IDLE_SUSPEND_MS overrides the idle threshold.
+      - AUTO_SUSPEND_ENABLED=${AUTO_SUSPEND_ENABLED:-}
+      - AUTO_SUSPEND_AGENTS=${AUTO_SUSPEND_AGENTS:-}
+      - IDLE_SUSPEND_MS=${IDLE_SUSPEND_MS:-}
     labels:
       io.agentic-collab.role: orchestrator
     restart: unless-stopped
