@@ -26,6 +26,25 @@ cross-paste = pane *i* shows this trial's marker for some *j ≠ i*.
 Fixtures are namespaced `gap051probe*`, disposable, and torn down after the run;
 no live `agent-*` session is ever touched.
 
+### ⚠️ Structural safety guard (the BEFORE condition is itself the hazard)
+
+The **BEFORE** condition runs the UNFIXED code, whose unnamed `load-buffer`/
+`paste-buffer` races the fleet-GLOBAL shared paste-buffer stack. Run against the
+live shared tmux server under fleet load, that race can cross-paste a probe
+marker into a REAL agent's pane — i.e. running the RED harness live *induces the
+very GAP-051 hazard on production*. A verification step must never become a new
+harm vector.
+
+The harness therefore **refuses** (not merely warns) to run the unfixed
+condition when the target tmux server hosts any live `agent-*` session — it exits
+before creating any fixture. Detection is self-contained: the fixed module
+exports `nextPasteBufferName`; its absence means pre-fix code was imported. The
+**AFTER/fixed** condition is safe-by-construction (unique named buffers never
+touch the shared stack) and is always allowed. Escape hatch for a genuinely
+isolated/throwaway server only: `GAP051_ALLOW_UNFIXED_LIVE=1`.
+
+Run the BEFORE condition only on a quiesced or throwaway tmux server.
+
 ```
 # BEFORE (reproduces the race against main's unnamed code)
 node test-results/gap051/gap051-repro.mjs /path/to/main/src/proxy/tmux.ts BEFORE 8 100

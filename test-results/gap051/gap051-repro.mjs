@@ -32,6 +32,37 @@ const sessions = Array.from({ length: K }, (_, i) => `gap051probe${i}`);
 
 async function tmuxRaw(args) { try { return (await exec('tmux', args)).stdout; } catch { return ''; } }
 
+// ── STRUCTURAL SAFETY REFUSAL (GAP-051, mechanize-don't-recall) ──
+// The BEFORE/RED condition runs the UNFIXED code, whose unnamed load-buffer/
+// paste-buffer races the fleet-GLOBAL shared paste-buffer stack. Run against the
+// live shared tmux server under fleet load, that race can cross-paste a probe
+// marker into a REAL agent's pane — i.e. running the RED harness live INDUCES the
+// very GAP-051 hazard on production. A verification step must never become a new
+// harm vector. So REFUSE (not merely warn — a warning is recall-dependent) to run
+// the unfixed condition whenever the target tmux server hosts live `agent-*`
+// sessions. Self-detecting: the FIXED module exports nextPasteBufferName; its
+// ABSENCE means we imported pre-fix (unnamed) code. The AFTER/fixed condition is
+// safe-by-construction (unique named buffers never touch the shared stack) and is
+// always allowed. Override for a genuinely isolated/throwaway server:
+// GAP051_ALLOW_UNFIXED_LIVE=1 (documented escape hatch, off by default).
+const isFixed = typeof tmux.nextPasteBufferName === 'function';
+if (!isFixed && process.env.GAP051_ALLOW_UNFIXED_LIVE !== '1') {
+  const names = (await tmuxRaw(['ls', '-F', '#{session_name}'])).split('\n').filter(Boolean);
+  const liveAgents = names.filter((s) => s.startsWith('agent-'));
+  if (liveAgents.length > 0) {
+    console.error(
+      `REFUSING to run the BEFORE/unfixed (unnamed-buffer) harness: the target tmux ` +
+      `server hosts ${liveAgents.length} live agent-* session(s), so the unnamed-buffer ` +
+      `race could cross-paste a probe marker into a REAL agent's pane (inducing the ` +
+      `GAP-051 hazard on the live fleet). Run the BEFORE condition ONLY on a quiesced/` +
+      `throwaway server. The AFTER/fixed condition (module exporting nextPasteBufferName) ` +
+      `is safe-by-construction and always allowed. Override (isolated server only): ` +
+      `GAP051_ALLOW_UNFIXED_LIVE=1.`,
+    );
+    process.exit(3);
+  }
+}
+
 async function setup() {
   for (const s of sessions) {
     await tmuxRaw(['kill-session', '-t', s]).catch(() => {});
