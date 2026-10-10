@@ -184,6 +184,11 @@ export class HealthMonitor {
   // Defaults: 700k (>> the 500-650k legit working band); 60s sustained idle (> poll interval —
   // the load-bearing false-idle guard); 15min cooldown (anti-rapid-refire).
   static readonly AUTOCOMPACT_TOKEN_THRESHOLD = parseIntEnv('AUTOCOMPACT_TOKEN_THRESHOLD', 700_000);
+  // GAP-012 frozen-ctx% residual: below this absolute cumulative-token floor, a non-null
+  // context_pct is physically impossible (a stale occupancy line) and is nulled to honest-unknown
+  // at the recorder. Window-agnostic (no 200k/window assumption). Fleet-empirical gap: frozen-stale
+  // <10k, genuine peaks ≥130k. Mirrors Chloe's interim skip-compact predicate.
+  static readonly CTX_STALE_TOKEN_FLOOR = parseIntEnv('CTX_STALE_TOKEN_FLOOR', 10_000);
   static readonly AUTOCOMPACT_MIN_IDLE_MS = parseIntEnv('AUTOCOMPACT_MIN_IDLE_MS', 60_000);
   static readonly AUTOCOMPACT_COOLDOWN_MS = parseIntEnv('AUTOCOMPACT_COOLDOWN_MS', 15 * 60 * 1000);
   private readonly autoCompactTokenThreshold: number;
@@ -810,6 +815,19 @@ export class HealthMonitor {
       const contextResult = adapter.parseContextPercent(paneOutput);
       contextPct = contextResult.contextPct;
       if (contextResult.totalTokens !== undefined) totalTokens = contextResult.totalTokens;
+    }
+
+    // GAP-012 (frozen-ctx% residual): a non-null context_pct alongside a tiny cumulative token
+    // count is PHYSICALLY IMPOSSIBLE — <CTX_STALE_TOKEN_FLOOR tokens cannot occupy a meaningful
+    // fraction of ANY real context window (200k…1M) — so the % is a STALE occupancy line (Claude
+    // UI lag, typically lingering post-/compact) that parsed fresh this poll. Invalidate it to
+    // honest-unknown (null). This VALIDATES the % against an absolute token FLOOR and writes NULL;
+    // it NEVER derives a % from the token count (the 0907345 genuine-or-null invariant holds).
+    // Window-agnostic (absolute floor, no 200k/window assumption). Fleet-empirical: every observed
+    // frozen-stale case sits <10k tokens, every genuine peak ≥130k — so a GENUINE high-% (always
+    // backed by a high token count) is never false-nulled. Mirrors Chloe's interim skip predicate.
+    if (contextPct !== null && totalTokens !== undefined && totalTokens < HealthMonitor.CTX_STALE_TOKEN_FLOOR) {
+      contextPct = null;
     }
 
     // Nothing parseable at all (no occupancy %, no token count) — leave the last
