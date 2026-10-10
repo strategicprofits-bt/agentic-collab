@@ -285,6 +285,69 @@ describe('HealthMonitor', () => {
     assert.equal(updated.lastContextPct, 88, 'occupancy used = 100 - 12');
   });
 
+  // GAP-012 (frozen-ctx% residual): a high context_pct alongside a tiny cumulative token
+  // count is PHYSICALLY IMPOSSIBLE — <10k tokens cannot occupy a meaningful fraction of ANY
+  // real context window (200k…1M) — so the % is a STALE occupancy line (Claude UI lag,
+  // typically lingering post-/compact) parsed fresh. The recorder nulls it to honest-unknown
+  // (validates the % against the token FLOOR, writes NULL — never derives % from tokens, so
+  // the 0907345 invariant holds). Window-agnostic absolute floor; matches Chloe's <10k interim.
+  it('nulls a stale high context_pct when total_tokens is below the floor (impossible pair)', async () => {
+    db.createAgent({ name: 'health-stale', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent('health-stale')!;
+    db.updateAgentState('health-stale', 'active', a.version, {
+      tmuxSession: 'agent-health-stale', proxyId: 'p1', lastContextPct: 85,
+    });
+
+    // Stale occupancy line (→ 100-15 = 85) co-occurring with a tiny fresh token count (483).
+    captureOutput = 'Context left until auto-compact: 15%\n                 483 tokens\n> ';
+
+    const monitor = makeMonitor();
+    proxyCommands = [];
+    await monitor.pollAll();
+
+    const updated = db.getAgent('health-stale')!;
+    assert.equal(updated.lastContextPct, null, '85% at 483 tokens is impossible → stale → null');
+    const snaps = db.getTokenSnapshots('health-stale');
+    assert.equal(snaps.at(-1)!.totalTokens, 483, 'genuine low token count still recorded');
+    assert.equal(snaps.at(-1)!.contextPct, null, 'snapshot context_pct nulled too (same upstream)');
+  });
+
+  it('KEEPS a genuine high context_pct when total_tokens is high (not a false-null)', async () => {
+    db.createAgent({ name: 'health-genuine', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent('health-genuine')!;
+    db.updateAgentState('health-genuine', 'active', a.version, {
+      tmuxSession: 'agent-health-genuine', proxyId: 'p1',
+    });
+
+    // Genuine near-compaction: 85% occupancy WITH a supporting high token count (170k ≥ floor).
+    captureOutput = 'Context left until auto-compact: 15%\n              170000 tokens\n> ';
+
+    const monitor = makeMonitor();
+    proxyCommands = [];
+    await monitor.pollAll();
+
+    const updated = db.getAgent('health-genuine')!;
+    assert.equal(updated.lastContextPct, 85, 'genuine high-% with supporting tokens must be KEPT');
+  });
+
+  it('does NOT null context_pct when no token count is present (no basis to invalidate)', async () => {
+    db.createAgent({ name: 'health-notok', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent('health-notok')!;
+    db.updateAgentState('health-notok', 'active', a.version, {
+      tmuxSession: 'agent-health-notok', proxyId: 'p1',
+    });
+
+    // Occupancy line only, no token figure → cannot prove staleness → keep the parsed %.
+    captureOutput = 'Context left until auto-compact: 15%\n> ';
+
+    const monitor = makeMonitor();
+    proxyCommands = [];
+    await monitor.pollAll();
+
+    const updated = db.getAgent('health-notok')!;
+    assert.equal(updated.lastContextPct, 85, 'no token basis → do not invalidate the %');
+  });
+
   it('fires onMessageDelivered callback after successful delivery', async () => {
     db.createAgent({ name: 'health-cb-deliver', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
     const a = db.getAgent('health-cb-deliver')!;
