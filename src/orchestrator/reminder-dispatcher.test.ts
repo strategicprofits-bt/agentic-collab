@@ -61,6 +61,12 @@ describe('ReminderDispatcher', () => {
     assert.ok(pending.some(m => m.envelope.includes('Check the logs')));
     assert.ok(pending.some(m => m.envelope.includes(`reminder #${r.id}`)));
     assert.ok(pending.some(m => m.envelope.includes('from ben')));
+    // GAP-098 format-pin: the respawn-safety (b) check (database.hasPendingOrRecentInbound)
+    // EXCLUDES reminders by the "[reminder #" envelope prefix. Pin that exact prefix here so a
+    // dispatcher format change breaks LOUDLY — else (b) would silently re-count reminders and
+    // the cadence respawn branch would never fire for a high-cadence monitor (the GAP-098 target).
+    assert.ok(pending.some(m => m.envelope.startsWith('[reminder #')),
+      'reminder envelope MUST start with "[reminder #" — the GAP-098 (b) exclusion marker depends on it');
 
     // Clean up
     db.deleteReminder(r.id);
