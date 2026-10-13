@@ -65,6 +65,12 @@ export type HealthMonitorOptions = {
   autoCompactCooldownMs?: number;
   /** Global kill-switch for auto-compact (incident lever). Defaults to DISABLE_AUTO_COMPACT env. */
   autoCompactDisabled?: boolean;
+  /** GAP-098: wall-clock interval (ms) between cadence respawn/compact (default CADENCE_REFRESH_INTERVAL_MS, 4h). */
+  cadenceRefreshIntervalMs?: number;
+  /** GAP-098: agents enrolled in cadence refresh (default from CADENCE_REFRESH_AGENTS env, v1 seed ChloeOBrian). */
+  cadenceRefreshAgents?: Set<string>;
+  /** GAP-098: global kill-switch for cadence refresh (incident lever). Default CADENCE_REFRESH_DISABLED env. */
+  cadenceRefreshDisabled?: boolean;
   /**
    * Auto-suspend ACTIVATION lever (GAP-070). Default FALSE (dormant) — seeded from the
    * AUTO_SUSPEND_ENABLED env at construction (restart-gated, deliberate). While false the
@@ -196,6 +202,19 @@ export class HealthMonitor {
   private readonly autoCompactCooldownMs: number;
   /** When true, auto-compact is globally suppressed (incident kill-switch). */
   private readonly autoCompactDisabled: boolean;
+  // ── GAP-098 cadence refresh (wall-clock respawn/compact for high-cadence agents) ──
+  // Belt-and-suspenders vs the GAP-055 treadmill (peer-compact buys ~1h then RSS regrows),
+  // independent of the token-gated auto-compact. v1 = ChloeOBrian only (curated opt-in).
+  static readonly CADENCE_REFRESH_INTERVAL_MS = parseIntEnv('CADENCE_REFRESH_INTERVAL_MS', 4 * 60 * 60 * 1000);
+  private readonly cadenceRefreshIntervalMs: number;
+  /** Enrolled agents (curated opt-in; v1 seed ChloeOBrian). */
+  private readonly cadenceRefreshAgents: Set<string>;
+  /** Global kill-switch for cadence refresh (incident lever). */
+  private readonly cadenceRefreshDisabled: boolean;
+  /** Agents mid cadence-refresh — prevents duplicate concurrent attempts (+ mutual-excl with auto-compact). */
+  private readonly cadenceRefreshing = new Set<string>();
+  /** Timestamp of the last cadence refresh (or first-seen) per enrolled agent — the wall-clock gate. */
+  private readonly lastCadenceRefresh = new Map<string, number>();
   // ── Auto-suspend activation (GAP-070) — dormant by default; see options doc. ──
   static readonly AUTOSUSPEND_RESUME_DEBOUNCE_MS = parseIntEnv('AUTOSUSPEND_RESUME_DEBOUNCE_MS', 60_000);
   /** ACTIVATION lever — env-seeded, restart-gated. Deliberate. */
@@ -289,6 +308,14 @@ export class HealthMonitor {
     this.autoCompactDisabled = opts.autoCompactDisabled ?? (process.env['DISABLE_AUTO_COMPACT'] === '1');
     if (this.autoCompactDisabled) {
       console.warn('[health] DISABLE_AUTO_COMPACT active — auto-compact suppressed; high-context idle agents need manual /compact');
+    }
+    // GAP-098 cadence refresh: interval + enrolled set + kill-switch (env-tunable, restart-gated).
+    this.cadenceRefreshIntervalMs = opts.cadenceRefreshIntervalMs ?? HealthMonitor.CADENCE_REFRESH_INTERVAL_MS;
+    this.cadenceRefreshAgents = opts.cadenceRefreshAgents
+      ?? new Set((process.env['CADENCE_REFRESH_AGENTS'] ?? 'ChloeOBrian').split(',').map(s => s.trim()).filter(Boolean));
+    this.cadenceRefreshDisabled = opts.cadenceRefreshDisabled ?? (process.env['CADENCE_REFRESH_DISABLED'] === '1');
+    if (this.cadenceRefreshDisabled) {
+      console.warn('[health] CADENCE_REFRESH_DISABLED active — cadence respawn/compact suppressed');
     }
     // GAP-070 auto-suspend: dormant unless AUTO_SUSPEND_ENABLED=1 (fail-safe-to-dormant on restart).
     this.autoSuspendEnabled = opts.autoSuspendEnabled ?? (process.env['AUTO_SUSPEND_ENABLED'] === '1');
@@ -692,6 +719,7 @@ export class HealthMonitor {
     // re-idles with a lower token count — so it naturally spaces compaction from suspend;
     // the 60s-compact / 5min-suspend margin makes the exact ordering non-critical.
     void this.autoCompactIfEligible(agent.name);
+    void this.cadenceRefreshIfEligible(agent.name); // GAP-098: wall-clock respawn/compact (enrolled agents)
     this.checkIdleSuspendTimeout(agent.name);
 
     const currentAgent = this.db.getAgent(agent.name);
@@ -929,6 +957,7 @@ export class HealthMonitor {
   private async autoCompactIfEligible(agentName: string): Promise<void> {
     if (this.autoCompactDisabled) return;
     if (this.autoCompacting.has(agentName)) return;
+    if (this.cadenceRefreshing.has(agentName)) return; // GAP-098: mutual-excl — don't double-fire same poll
 
     const agent = this.db.getAgent(agentName);
     if (!agent || agent.state !== 'idle') return;
@@ -988,6 +1017,77 @@ export class HealthMonitor {
     }).finally(() => {
       this.autoCompacting.delete(agentName);
     });
+  }
+
+  /**
+   * GAP-098: wall-clock cadence refresh for enrolled high-cadence agents — breaks the GAP-055
+   * peer-compact→RSS-regrow treadmill. Independent of the token-gated auto-compact. Every
+   * cadenceRefreshIntervalMs, on a safely-idle enrolled agent: RESPAWN (clean RSS reset) when
+   * respawn-safe, else COMPACT (context-only — the conservative default; respawn is the gated
+   * optimization). Respawn-safety = (b) conversational-continuity only: no pending/delivering
+   * inbound AND nothing delivered within the race window. A respawn preserves the host checkout
+   * (committed + uncommitted survive — see data/knowledge reference-respawn-does-not-touch-git-or-cwd),
+   * so file durability is NOT at risk on respawn; only an owed reply is, which (b) guards. The
+   * currency predicate is per-durability-model (pluggable seam); v1 Chloe = (b)-only. Gates mirror
+   * autoCompactIfEligible: enrolled, idle, wall-clock interval, in-flight guard, composer-defer,
+   * and a fire-time idle re-check inside reloadAgent/compactAgent (requireIdle).
+   */
+  private async cadenceRefreshIfEligible(agentName: string): Promise<void> {
+    if (this.cadenceRefreshDisabled) return;
+    if (!this.cadenceRefreshAgents.has(agentName)) return;     // curated opt-in (v1: ChloeOBrian)
+    if (this.cadenceRefreshing.has(agentName)) return;
+    if (this.autoCompacting.has(agentName)) return;            // mutual-excl with auto-compact
+
+    const agent = this.db.getAgent(agentName);
+    if (!agent || agent.state !== 'idle') return;
+
+    // Wall-clock gate. First encounter: stamp (do NOT fire on boot — avoids a restart respawn
+    // storm) and return; the first real fire is one interval later.
+    const now = Date.now();
+    const last = this.lastCadenceRefresh.get(agentName);
+    if (last === undefined) { this.lastCadenceRefresh.set(agentName, now); return; }
+    const elapsed = now - last;
+    if (elapsed < this.cadenceRefreshIntervalMs) return;
+
+    this.cadenceRefreshing.add(agentName);
+
+    // Composer-defer: never interrupt a real draft (mirror auto-compact gate 6). No stamp on
+    // defer so it fires once the draft clears; on capture failure do NOT fire (safe).
+    const cap = agent.proxyId
+      ? await this.proxyDispatch(agent.proxyId, { action: 'capture', sessionName: sessionName(agent), lines: 20 })
+      : ({ ok: false } as ProxyResponse);
+    if (!cap.ok || extractComposerText((cap.data as string) ?? '') !== null) {
+      if (cap.ok) this.db.logEvent(agentName, 'cadence_refresh_deferred', undefined, { reason: 'composer_nonempty' });
+      this.cadenceRefreshing.delete(agentName);
+      return;
+    }
+
+    // Commit to firing: stamp the interval clock now so a subsequent skip can't re-fire early.
+    this.lastCadenceRefresh.set(agentName, now);
+
+    // (b) respawn-safe iff NO pending/delivering inbound AND nothing delivered within the race
+    // window (reuses the auto-compact cooldown; Chloe replies same-turn so this guards only the
+    // go-idle→next-poll race — a documented approximation of true reply-complete). Not-safe →
+    // COMPACT (conservative). compactAgent/reloadAgent re-verify idle under the lock (requireIdle).
+    const recencySeconds = Math.floor(this.autoCompactCooldownMs / 1000);
+    const respawnSafe = !this.db.hasPendingOrRecentInbound(agentName, recencySeconds);
+    const ctx = this.makeLifecycleCtx();
+
+    if (respawnSafe) {
+      console.log(`[health] ${agentName}: cadence RESPAWN (elapsed ${Math.round(elapsed / 60000)}m, respawn-safe)`);
+      this.db.logEvent(agentName, 'cadence_respawn', undefined, { elapsedMs: elapsed });
+      reloadAgent(ctx, agentName, { immediate: true, requireIdle: true })
+        .then(() => this.onAgentUpdate(agentName))
+        .catch((err) => console.error(`[health] ${agentName}: cadence respawn failed:`, (err as Error).message))
+        .finally(() => this.cadenceRefreshing.delete(agentName));
+    } else {
+      console.log(`[health] ${agentName}: cadence COMPACT (elapsed ${Math.round(elapsed / 60000)}m, owed inbound → not respawn-safe)`);
+      this.db.logEvent(agentName, 'cadence_compact', undefined, { elapsedMs: elapsed, reason: 'pending_or_recent_inbound' });
+      compactAgent(ctx, agentName, { requireIdle: true })
+        .then(() => this.onAgentUpdate(agentName))
+        .catch((err) => console.error(`[health] ${agentName}: cadence compact failed:`, (err as Error).message))
+        .finally(() => this.cadenceRefreshing.delete(agentName));
+    }
   }
 
   /**

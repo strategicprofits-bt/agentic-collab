@@ -739,6 +739,30 @@ export class Database {
     return row !== undefined;
   }
 
+  /**
+   * GAP-098 (b): conversational-continuity guard for the cadence respawn/compact decision.
+   * Returns TRUE if the agent has inbound that makes a RESPAWN unsafe right now — either
+   * (i) an in-flight (pending/delivering) message not yet on the agent's pane, OR (ii) a
+   * message DELIVERED within the last `withinSeconds` (the go-idle→next-poll race window;
+   * delivery-recency is a documented APPROXIMATION of true reply-complete, valid while the
+   * agent replies same-turn). Respawn-safe := NOT this. Any TRUE → caller falls back to
+   * compact (conservative: respawn is the gated optimization, compact the safe default).
+   */
+  hasPendingOrRecentInbound(agentName: string, withinSeconds: number): boolean {
+    const row = this.db.prepare(`
+      SELECT 1 FROM pending_messages
+      WHERE target_agent = ?
+        AND (
+          status IN ('pending', 'delivering')
+          OR (status = 'delivered'
+              AND delivered_at IS NOT NULL
+              AND delivered_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?))
+        )
+      LIMIT 1
+    `).get(agentName, `-${Math.max(0, Math.floor(withinSeconds))} seconds`);
+    return row !== undefined;
+  }
+
   markAttemptStarted(id: number): void {
     this.db.prepare(`
       UPDATE pending_messages SET last_attempt_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?

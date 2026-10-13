@@ -480,6 +480,35 @@ describe('Lifecycle', () => {
       assert.ok(proxyCommands.some(c => c.action === 'kill_session'));
       assert.ok(proxyCommands.some(c => c.action === 'create_session'));
     });
+
+    // GAP-098: cadence-respawn fires unattended, so immediate reload gains a fire-time
+    // idle re-check (mirrors suspendAgent/compactAgent requireIdle) — the health-monitor
+    // gates on idle at poll time but the agent can go active before the lock; re-verify
+    // under the lock and SKIP if no longer idle. Manual route omits requireIdle (unchanged).
+    it('with requireIdle SKIPS immediate reload when the agent is not idle (fire-time re-check)', async () => {
+      db.createAgent({ name: 'reload-ri-active', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      const a = db.getAgent('reload-ri-active')!;
+      db.updateAgentState('reload-ri-active', 'active', a.version, {
+        tmuxSession: 'agent-reload-ri-active', proxyId: 'p1',
+      });
+      proxyCommands = [];
+      const result = await reloadAgent(ctx, 'reload-ri-active', { immediate: true, requireIdle: true });
+      assert.equal(result.state, 'active', 'must NOT reload a now-active agent under requireIdle');
+      assert.equal(result.spawnCount, a.spawnCount, 'spawnCount unchanged (no respawn)');
+      assert.ok(!proxyCommands.some(c => c.action === 'kill_session'), 'no kill_session when skipped');
+    });
+
+    it('with requireIdle reloads when the agent IS idle', async () => {
+      db.createAgent({ name: 'reload-ri-idle', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      const a = db.getAgent('reload-ri-idle')!;
+      db.updateAgentState('reload-ri-idle', 'idle', a.version, {
+        tmuxSession: 'agent-reload-ri-idle', proxyId: 'p1',
+      });
+      proxyCommands = [];
+      const result = await reloadAgent(ctx, 'reload-ri-idle', { immediate: true, requireIdle: true });
+      assert.ok(result.spawnCount > a.spawnCount, 'reloads an idle agent under requireIdle');
+      assert.ok(proxyCommands.some(c => c.action === 'kill_session'), 'kill_session fired');
+    });
   });
 
   describe('interruptAgent', () => {

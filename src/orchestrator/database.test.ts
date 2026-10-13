@@ -535,6 +535,19 @@ describe('Database', () => {
       assert.ok(updated.deliveredAt !== null);
     });
 
+    // GAP-098 (b): respawn-safety conversational-continuity guard.
+    it('hasPendingOrRecentInbound: pending/delivering/recent-delivered → true; none/outside-window → false', () => {
+      const agent = 'g98-inbound';
+      assert.equal(db.hasPendingOrRecentInbound(agent, 900), false, 'no inbound → respawn-safe');
+      const m = db.enqueueMessage({ sourceAgent: 'x', targetAgent: agent, envelope: 'e' });
+      assert.equal(db.hasPendingOrRecentInbound(agent, 900), true, 'pending → not respawn-safe');
+      db.claimForDelivery(m.id);
+      assert.equal(db.hasPendingOrRecentInbound(agent, 900), true, 'delivering → not respawn-safe');
+      db.markMessageDelivered(m.id);
+      assert.equal(db.hasPendingOrRecentInbound(agent, 900), true, 'just-delivered within window → not respawn-safe');
+      assert.equal(db.hasPendingOrRecentInbound(agent, 0), false, 'zero window → delivered no longer "recent" → respawn-safe');
+    });
+
     it('marks attempt failed with backoff', () => {
       const msg = db.enqueueMessage({
         sourceAgent: 'agent-c',
