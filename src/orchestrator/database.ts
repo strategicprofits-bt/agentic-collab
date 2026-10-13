@@ -749,9 +749,19 @@ export class Database {
    * compact (conservative: respawn is the gated optimization, compact the safe default).
    */
   hasPendingOrRecentInbound(agentName: string, withinSeconds: number): boolean {
+    // GAP-098: EXCLUDE reminders. A reminder (`[reminder #N from …]`, reminder-dispatcher.ts)
+    // is self-scheduled work the agent processes + completes SAME-TURN — there is no reply owed
+    // to it — and it is queue-durable (survives a respawn, re-delivered after). So it is NOT an
+    // owed-reply and must not block respawn. A high-cadence monitor's own ~5-min reminders would
+    // otherwise flood the recency window → (b) always-true → respawn NEVER fires (the defeater).
+    // Error-asymmetry: failing to exclude = always-compact (safe); wrongly excluding a PEER/
+    // OPERATOR owed-reply = respawn-when-owed = LOSE it (harmful). So key on the SPECIFIC
+    // "[reminder #" prefix, NOT null-source (operator msgs are null-source too and MUST count).
+    // The prefix is format-pinned in reminder-dispatcher.test.ts so a dispatcher change breaks loud.
     const row = this.db.prepare(`
       SELECT 1 FROM pending_messages
       WHERE target_agent = ?
+        AND envelope NOT LIKE '[reminder #%'
         AND (
           status IN ('pending', 'delivering')
           OR (status = 'delivered'

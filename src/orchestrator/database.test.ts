@@ -548,6 +548,35 @@ describe('Database', () => {
       assert.equal(db.hasPendingOrRecentInbound(agent, 0), false, 'zero window → delivered no longer "recent" → respawn-safe');
     });
 
+    // GAP-098: (b) must EXCLUDE reminders (self-scheduled work, processed same-turn, NOT an
+    // owed reply, + queue-durable so they survive a respawn) and COUNT genuine owed-reply
+    // inbound (peer + operator). Error-asymmetry: failing to exclude a reminder = always-compact
+    // (safe); wrongly excluding a peer/operator owed-reply = respawn-when-owed = LOSE it (harmful).
+    // So the marker is the SPECIFIC "[reminder #" prefix, NOT null-source (operator msgs are
+    // null-source too and MUST be counted).
+    it('hasPendingOrRecentInbound: EXCLUDES reminders, COUNTS peer + operator owed-replies [GAP-098]', () => {
+      // reminder delivered just now → excluded → respawn-safe
+      const a1 = 'g98-rem-excl';
+      const rem = db.enqueueMessage({ sourceAgent: null, targetAgent: a1, envelope: '[reminder #7 from ChloeOBrian]: fleet scan' });
+      db.markMessageDelivered(rem.id);
+      assert.equal(db.hasPendingOrRecentInbound(a1, 900), false, 'delivered reminder excluded → respawn-safe');
+      // a PENDING (undelivered) reminder also excluded (queue-durable, survives respawn)
+      const a2 = 'g98-rem-pending';
+      db.enqueueMessage({ sourceAgent: null, targetAgent: a2, envelope: '[reminder #9 from ChloeOBrian]: scan' });
+      assert.equal(db.hasPendingOrRecentInbound(a2, 900), false, 'pending reminder excluded → respawn-safe');
+      // a PEER owed-reply (source non-null) → counted → not respawn-safe
+      const a3 = 'g98-peer';
+      const peer = db.enqueueMessage({ sourceAgent: 'SomePeer', targetAgent: a3, envelope: "[from: SomePeer, reply with ...]: 'question'" });
+      db.markMessageDelivered(peer.id);
+      assert.equal(db.hasPendingOrRecentInbound(a3, 900), true, 'peer owed-reply counted → NOT respawn-safe');
+      // an OPERATOR nudge — null-source but a genuine owed-reply, envelope NOT "[reminder #" →
+      // MUST be counted (the harmful-direction guard: do not exclude on null-source).
+      const a4 = 'g98-operator';
+      const op = db.enqueueMessage({ sourceAgent: null, targetAgent: a4, envelope: '[reply-reminder] topic: x | from: dashboard | "please respond"' });
+      db.markMessageDelivered(op.id);
+      assert.equal(db.hasPendingOrRecentInbound(a4, 900), true, 'operator null-source owed-reply counted → NOT respawn-safe (not excluded despite null-source)');
+    });
+
     it('marks attempt failed with backoff', () => {
       const msg = db.enqueueMessage({
         sourceAgent: 'agent-c',
