@@ -40,6 +40,15 @@ services:
       - AUTOCOMPACT_TOKEN_THRESHOLD=${AUTOCOMPACT_TOKEN_THRESHOLD:-}
       - AUTOCOMPACT_MIN_IDLE_MS=${AUTOCOMPACT_MIN_IDLE_MS:-}
       - AUTOCOMPACT_COOLDOWN_MS=${AUTOCOMPACT_COOLDOWN_MS:-}
+      # GAP-098 cadence respawn/compact — tunables + incident kill-switch, SAME passthrough
+      # pattern as AUTOCOMPACT_* so they are settable via host env WITHOUT a rebuild. Empty/
+      # unset → code defaults (enrolled {ChloeOBrian}, 4h interval, enabled). Without these
+      # lines the code's env reads can never reach the container (the knobs — incl the
+      # CADENCE_REFRESH_DISABLED kill-switch — would be inert). CADENCE_REFRESH_DISABLED=1
+      # disarms cadence respawn/compact fleet-wide (the incident lever).
+      - CADENCE_REFRESH_DISABLED=${CADENCE_REFRESH_DISABLED:-}
+      - CADENCE_REFRESH_INTERVAL_MS=${CADENCE_REFRESH_INTERVAL_MS:-}
+      - CADENCE_REFRESH_AGENTS=${CADENCE_REFRESH_AGENTS:-}
     labels:
       io.agentic-collab.role: orchestrator
     restart: unless-stopped
