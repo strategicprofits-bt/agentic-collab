@@ -251,7 +251,7 @@ describe('HealthMonitor', () => {
       proxyId: 'p1',
     });
 
-    captureOutput = 'some output\n                              160000 tokens\n> ';
+    captureOutput = 'some output\n                      new task? /clear to save 160000 tokens\n> ';
 
     const monitor = makeMonitor();
     proxyCommands = [];
@@ -299,7 +299,7 @@ describe('HealthMonitor', () => {
     });
 
     // Stale occupancy line (→ 100-15 = 85) co-occurring with a tiny fresh token count (483).
-    captureOutput = 'Context left until auto-compact: 15%\n                 483 tokens\n> ';
+    captureOutput = 'Context left until auto-compact: 15%\n          new task? /clear to save 483 tokens\n> ';
 
     const monitor = makeMonitor();
     proxyCommands = [];
@@ -320,7 +320,7 @@ describe('HealthMonitor', () => {
     });
 
     // Genuine near-compaction: 85% occupancy WITH a supporting high token count (170k ≥ floor).
-    captureOutput = 'Context left until auto-compact: 15%\n              170000 tokens\n> ';
+    captureOutput = 'Context left until auto-compact: 15%\n       new task? /clear to save 170000 tokens\n> ';
 
     const monitor = makeMonitor();
     proxyCommands = [];
@@ -328,6 +328,78 @@ describe('HealthMonitor', () => {
 
     const updated = db.getAgent('health-genuine')!;
     assert.equal(updated.lastContextPct, 85, 'genuine high-% with supporting tokens must be KEPT');
+  });
+
+  // GAP-097: the token capture must anchor on the CUMULATIVE session line
+  // ("new task? /clear to save NNNk tokens") and IGNORE the transient per-turn
+  // streaming counter (a bare "N tokens" that resets each turn). The loose
+  // `(\d+)\s*tokens` conflated the two → coin-flip capture that broke the 700k
+  // auto-compact gate AND fed garbage to the GAP-012 floor (nulling genuine ctx%).
+  it('GAP-097: captures the cumulative /clear-to-save line, with k-suffix + decimal', async () => {
+    db.createAgent({ name: 'g97-cum', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent('g97-cum')!;
+    db.updateAgentState('g97-cum', 'active', a.version, { tmuxSession: 'agent-g97-cum', proxyId: 'p1' });
+
+    captureOutput = '✻ Worked for 16s · done\n                      new task? /clear to save 724.5k tokens\n❯ ';
+
+    const monitor = makeMonitor();
+    proxyCommands = [];
+    await monitor.pollAll();
+
+    const snaps = db.getTokenSnapshots('g97-cum');
+    assert.equal(snaps.at(-1)!.totalTokens, 724500, '724.5k → 724500 (decimal + k suffix handled)');
+  });
+
+  it('GAP-097: IGNORES a transient per-turn "N tokens" counter (no /clear-to-save)', async () => {
+    db.createAgent({ name: 'g97-transient', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent('g97-transient')!;
+    db.updateAgentState('g97-transient', 'active', a.version, { tmuxSession: 'agent-g97-transient', proxyId: 'p1' });
+
+    // Streaming counter only — a bare transient, no cumulative line. Must NOT be recorded.
+    captureOutput = '✻ Cooked for 2s · esc to interrupt · 16800 tokens\n❯ ';
+
+    const monitor = makeMonitor();
+    proxyCommands = [];
+    await monitor.pollAll();
+
+    const snaps = db.getTokenSnapshots('g97-transient');
+    assert.equal(snaps.length, 0, 'transient streaming counter must not be captured as a token snapshot');
+  });
+
+  it('GAP-097: with BOTH transient and cumulative present, captures the cumulative (not the coin-flip)', async () => {
+    db.createAgent({ name: 'g97-both', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent('g97-both')!;
+    db.updateAgentState('g97-both', 'active', a.version, { tmuxSession: 'agent-g97-both', proxyId: 'p1' });
+
+    // Transient counter BELOW the cumulative status line (realistic: the streaming counter
+    // is the bottom-most line). The old bottom-up loose regex grabs the nearest "N tokens"
+    // (the transient 16800); the fix must skip it and capture the cumulative (724500).
+    captureOutput = 'new task? /clear to save 724.5k tokens\n     esc to interrupt · 16800 tokens\n❯ ';
+
+    const monitor = makeMonitor();
+    proxyCommands = [];
+    await monitor.pollAll();
+
+    const snaps = db.getTokenSnapshots('g97-both');
+    assert.equal(snaps.at(-1)!.totalTokens, 724500, 'must capture the cumulative line, not the transient');
+  });
+
+  it('GAP-097/012: genuine occupancy % is KEPT (not nulled) when only a transient token line is present', async () => {
+    db.createAgent({ name: 'g97-occ', engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent('g97-occ')!;
+    db.updateAgentState('g97-occ', 'active', a.version, { tmuxSession: 'agent-g97-occ', proxyId: 'p1' });
+
+    // Real occupancy (→85) co-occurring with a transient 57-token counter (NOT a cumulative
+    // line). Pre-fix the transient 57 (<10k floor) nulled the genuine 85; post-fix the
+    // transient is never captured → no totalTokens → floor cannot fire → 85 is preserved.
+    captureOutput = 'Context left until auto-compact: 15%\n     esc to interrupt · 57 tokens\n❯ ';
+
+    const monitor = makeMonitor();
+    proxyCommands = [];
+    await monitor.pollAll();
+
+    const updated = db.getAgent('g97-occ')!;
+    assert.equal(updated.lastContextPct, 85, 'genuine 85% must survive — transient token must not trip the GAP-012 floor');
   });
 
   it('does NOT null context_pct when no token count is present (no basis to invalidate)', async () => {
@@ -1142,7 +1214,7 @@ describe('HealthMonitor', () => {
     const a = db.getAgent(name)!;
     db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
 
-    let cap = 'working\n750000 tokens\n> \n';
+    let cap = 'working\n/clear to save 750000 tokens\n> \n';
     const pasted: string[] = [];
     const monitor = makeCompactMonitor(name, () => cap, pasted);
 
@@ -1164,7 +1236,7 @@ describe('HealthMonitor', () => {
     const a = db.getAgent(name)!;
     db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
 
-    const cap = 'working\n750000 tokens\n> \n';
+    const cap = 'working\n/clear to save 750000 tokens\n> \n';
     const pasted: string[] = [];
     // minIdle 250ms; NO backdating. The idle clock must survive continuous polling (the
     // production path — health-monitor refreshes agent.lastActivity every poll, so a gate
@@ -1187,7 +1259,7 @@ describe('HealthMonitor', () => {
     const a = db.getAgent(name)!;
     db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
 
-    const cap = 'working\n523000 tokens\n> \n'; // legit working band — must NOT fire
+    const cap = 'working\n/clear to save 523000 tokens\n> \n'; // legit working band — must NOT fire
     const pasted: string[] = [];
     const monitor = makeCompactMonitor(name, () => cap, pasted);
 
@@ -1206,7 +1278,7 @@ describe('HealthMonitor', () => {
     const a = db.getAgent(name)!;
     db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
 
-    const cap = 'working\n750000 tokens\n> \n';
+    const cap = 'working\n/clear to save 750000 tokens\n> \n';
     const pasted: string[] = [];
     // Large min-idle so a freshly-idle agent is not yet eligible
     const monitor = makeCompactMonitor(name, () => cap, pasted, { autoCompactMinIdleMs: 999_999 });
@@ -1226,7 +1298,7 @@ describe('HealthMonitor', () => {
     const a = db.getAgent(name)!;
     db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
 
-    const cap = 'working\n750000 tokens\n> \n';
+    const cap = 'working\n/clear to save 750000 tokens\n> \n';
     const pasted: string[] = [];
     const monitor = makeCompactMonitor(name, () => cap, pasted, { autoCompactCooldownMs: 999_999 });
 
@@ -1258,7 +1330,7 @@ describe('HealthMonitor', () => {
     const a = db.getAgent(name)!;
     db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
 
-    const cap = 'working\n750000 tokens\n> \n';
+    const cap = 'working\n/clear to save 750000 tokens\n> \n';
     const pasted: string[] = [];
     const monitor = makeCompactMonitor(name, () => cap, pasted, { autoCompactDisabled: true });
 
@@ -1279,7 +1351,7 @@ describe('HealthMonitor', () => {
     db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
 
     // Composer holds a real draft (❯ + text) → extractComposerText returns non-null → defer.
-    const cap = 'working\n750000 tokens\n❯ half-typed draft the agent left\n';
+    const cap = 'working\n/clear to save 750000 tokens\n❯ half-typed draft the agent left\n';
     const pasted: string[] = [];
     const monitor = makeCompactMonitor(name, () => cap, pasted);
 
@@ -1307,7 +1379,7 @@ describe('HealthMonitor', () => {
 
     // Real fleet idle composer is a bare ❯ — extractComposerText returns null → must FIRE
     // (guarding against the inverse bug: false-deferring on an empty composer = inert again).
-    const cap = 'working\n750000 tokens\n❯ \n';
+    const cap = 'working\n/clear to save 750000 tokens\n❯ \n';
     const pasted: string[] = [];
     const monitor = makeCompactMonitor(name, () => cap, pasted);
 
@@ -1326,7 +1398,7 @@ describe('HealthMonitor', () => {
     const a = db.getAgent(name)!;
     db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
 
-    const cap = 'working\n750000 tokens\n> \n';
+    const cap = 'working\n/clear to save 750000 tokens\n> \n';
     const pasted: string[] = [];
     // Fail ONLY the guard's capture (lines:20) for the target; leave the idle-detection
     // captures working so the agent still reaches idle. Cannot-verify-composer → do NOT fire.

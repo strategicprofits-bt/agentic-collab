@@ -262,42 +262,49 @@ describe('Engine Adapters', () => {
       assert.equal(result.confident, true);
     });
 
-    // GAP-012 (Option A): a "tokens" figure is CUMULATIVE session tokens, NOT
-    // current-window occupancy. It is recorded as totalTokens (a real signal) but
-    // MUST NOT be divided by 200k to fabricate a context %. contextPct stays null.
-    it('records token count as totalTokens without fabricating a context %', () => {
-      const result = adapter.parseContextPercent('some output\n                                                                  15048 tokens');
+    // GAP-012/097: a CUMULATIVE "tokens" figure is recorded as totalTokens (never
+    // divided by 200k to fabricate a context %; contextPct stays null). GAP-097: the
+    // cumulative figure is the "new task? /clear to save NNN[kKmM] tokens" line ONLY —
+    // a bare "N tokens" is the TRANSIENT per-turn streaming counter (resets each turn)
+    // and must NOT be captured as cumulative. (The pre-GAP-097 "↓ Nk tokens"/bare
+    // Gusting/Working fixtures were an older Claude-CLI status-bar format — GAP-006 —
+    // no longer emitted; the live v2.x cumulative line is "/clear to save".)
+    it('records the /clear-to-save cumulative count as totalTokens, contextPct null', () => {
+      const result = adapter.parseContextPercent('some output\n            new task? /clear to save 15048 tokens');
       assert.equal(result.contextPct, null);
       assert.equal(result.totalTokens, 15048);
       assert.equal(result.confident, true);
     });
 
     it('does not derive a context % from a large cumulative token count', () => {
-      const result = adapter.parseContextPercent('  160000 tokens');
+      const result = adapter.parseContextPercent('  new task? /clear to save 160000 tokens');
       assert.equal(result.contextPct, null);
       assert.equal(result.totalTokens, 160000);
       assert.equal(result.confident, true);
     });
 
-    it('records k-suffix token count as totalTokens, contextPct null (24.9k tokens)', () => {
-      const result = adapter.parseContextPercent('Gusting… (33m 58s · ↓ 24.9k tokens · thought for 17s)');
+    it('parses k-suffix cumulative count (24.9k → 24900)', () => {
+      const result = adapter.parseContextPercent('  new task? /clear to save 24.9k tokens');
       assert.equal(result.contextPct, null);
       assert.equal(result.totalTokens, 24900);
-      assert.equal(result.confident, true);
     });
 
-    it('records K-suffix token count as totalTokens, contextPct null (150K tokens)', () => {
-      const result = adapter.parseContextPercent('Working… (5m · ↓ 150K tokens)');
-      assert.equal(result.contextPct, null);
+    it('parses K-suffix cumulative count (150K → 150000)', () => {
+      const result = adapter.parseContextPercent('  new task? /clear to save 150K tokens');
       assert.equal(result.totalTokens, 150000);
-      assert.equal(result.confident, true);
     });
 
-    it('records k-suffix token count as totalTokens, contextPct null (88.5k tokens)', () => {
-      const result = adapter.parseContextPercent('  88.5k tokens');
-      assert.equal(result.contextPct, null);
+    it('parses decimal k-suffix cumulative count (88.5k → 88500)', () => {
+      const result = adapter.parseContextPercent('  new task? /clear to save 88.5k tokens');
       assert.equal(result.totalTokens, 88500);
-      assert.equal(result.confident, true);
+    });
+
+    // GAP-097: the TRANSIENT per-turn streaming counter (bare "N tokens", no
+    // "/clear to save" anchor) must NOT be captured as cumulative — it resets each
+    // turn and sawtooths, which broke the auto-compact gate + the GAP-012 floor.
+    it('GAP-097: does NOT capture a transient streaming "N tokens" counter', () => {
+      const result = adapter.parseContextPercent('✻ Cooked for 2s · esc to interrupt · 16800 tokens');
+      assert.equal(result.totalTokens, undefined, 'bare transient counter must not be captured as cumulative');
     });
 
     // GAP-012 live-defect regression: the v2.x idle status bar shows

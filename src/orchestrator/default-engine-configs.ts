@@ -85,7 +85,12 @@ const CLAUDE_DETECTION = {
     { pattern: '\\u00b7\\s*\\d+ shells?', lines: 3 },        // background shells (status bar only)
     { pattern: '\\u00b7\\s*\\d+ background tasks?', lines: 3 },  // background tasks (status bar only)
   ],
-  contextPattern: '(\\d+)\\s*tokens',
+  // GAP-097: anchor on the CUMULATIVE session line ("new task? /clear to save NNNk
+  // tokens") only. A bare "(\\d+)\\s*tokens" also matched the transient per-turn
+  // streaming counter (resets each turn) → non-deterministic capture that broke the
+  // auto-compact token gate and fed the GAP-012 floor garbage. The number (g1) may
+  // carry a decimal + k/M unit (g2), handled in health-monitor's token branch.
+  contextPattern: '/clear to save\\s+(\\d+(?:[.,]\\d+)?)\\s*([kKmM]?)\\s*tokens',
   idleThreshold: 2,
   activeGraceMs: 10000,
   snapshotLines: 30,
