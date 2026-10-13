@@ -152,11 +152,13 @@ export class ClaudeAdapter implements EngineAdapter {
         }
       }
 
-      // Cumulative session tokens: "24.9k tokens", "150K tokens", "NNNNN tokens",
-      // "↓ 24.9k tokens", "/clear to save 202k tokens". Recorded as totalTokens
-      // ONLY — never converted to a context %.
+      // Cumulative session tokens — the "new task? /clear to save NNNk tokens" line
+      // ONLY. GAP-097: a bare "N tokens" also matches the TRANSIENT per-turn streaming
+      // counter (resets each turn), so anchor on "/clear to save" to capture the real
+      // cumulative figure and ignore the transient. Recorded as totalTokens ONLY —
+      // never converted to a context %.
       if (totalTokens === undefined) {
-        const tokenMatch = line.match(/↓?\s*(\d+(?:[.,]\d+)?)\s*([kKmM])?\s*tokens/);
+        const tokenMatch = line.match(/\/clear to save\s+(\d+(?:[.,]\d+)?)\s*([kKmM])?\s*tokens/);
         if (tokenMatch) {
           let tokens = parseFloat(tokenMatch[1]!.replace(/,/g, ''));
           const suffix = tokenMatch[2];

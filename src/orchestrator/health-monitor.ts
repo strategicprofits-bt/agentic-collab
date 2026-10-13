@@ -790,17 +790,22 @@ export class HealthMonitor {
       for (let i = lines.length - 1; i >= Math.max(0, lines.length - 20); i--) {
         const match = lines[i]?.match(detection.contextPattern);
         if (match?.[1]) {
-          const rawValue = parseInt(match[1].replace(/,/g, ''), 10);
           // Determine if value is a percentage or token count:
           // If the matched text contains '%', treat as direct occupancy percentage.
           if (match[0].includes('%')) {
-            contextPct = Math.min(100, rawValue);
+            contextPct = Math.min(100, parseInt(match[1].replace(/,/g, ''), 10));
           } else {
-            // GAP-012: a bare token count is CUMULATIVE session tokens, NOT window
+            // GAP-012: a token count is CUMULATIVE session tokens, NOT window
             // occupancy — record it as totalTokens but do NOT divide by 200k to
             // fabricate a context %. Leave contextPct null so the adapter fallback
             // can populate it from a genuine occupancy line (or leave it null).
-            totalTokens = rawValue;
+            // GAP-097: the cumulative figure may carry a decimal + k/M unit
+            // ("724.5k" → 724500); capture group 2 is the optional unit.
+            let value = parseFloat(match[1].replace(/,/g, ''));
+            const unit = match[2];
+            if (unit === 'k' || unit === 'K') value *= 1_000;
+            else if (unit === 'm' || unit === 'M') value *= 1_000_000;
+            totalTokens = Math.round(value);
           }
           break;
         }
