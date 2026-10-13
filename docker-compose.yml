@@ -48,7 +48,14 @@ services:
       # disarms cadence respawn/compact fleet-wide (the incident lever).
       - CADENCE_REFRESH_DISABLED=${CADENCE_REFRESH_DISABLED:-}
       - CADENCE_REFRESH_INTERVAL_MS=${CADENCE_REFRESH_INTERVAL_MS:-}
-      - CADENCE_REFRESH_AGENTS=${CADENCE_REFRESH_AGENTS:-}
+      # NOTE the dash-WITHOUT-colon on AGENTS (unlike the :- above). The code reads the agent
+      # list with `?? 'ChloeOBrian'` (NULLISH, not falsy): a passed-empty "" is NOT nullish, so
+      # `:-` empty-default would yield [] = NOBODY enrolled at rest (Brienne catch @b9234278f).
+      # `${VAR-default}` (no colon) defaults ONLY when the host var is UNSET → container gets
+      # "ChloeOBrian" (enrolled at rest); host="" passes through empty → NOBODY (enables the
+      # canary's structural-unenroll restore); host="X,Y" → that allowlist. DISABLED(=== '1')
+      # and INTERVAL(parseIntEnv) treat empty-as-default already, so they keep plain `:-`.
+      - CADENCE_REFRESH_AGENTS=${CADENCE_REFRESH_AGENTS-ChloeOBrian}
     labels:
       io.agentic-collab.role: orchestrator
     restart: unless-stopped
