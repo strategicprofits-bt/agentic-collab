@@ -967,7 +967,7 @@ export async function destroyAgent(
 export async function reloadAgent(
   ctx: LifecycleContext,
   name: string,
-  opts?: { immediate?: boolean; task?: string },
+  opts?: { immediate?: boolean; task?: string; requireIdle?: boolean },
 ): Promise<AgentRecord> {
   // Queue mode: set flag and return
   if (!opts?.immediate) {
@@ -996,6 +996,14 @@ export async function reloadAgent(
     if (!canSuspend(agent)) {
       throw new Error(`Agent "${name}" is in state "${agent.state}", cannot reload`);
     }
+    // GAP-098: fire-time idle re-check under the lock (mirrors suspendAgent/compactAgent).
+    // A cadence-respawn fires unattended; the health-monitor gates on idle at poll time but
+    // the agent can go active in the window before the lock — so re-verify here and SKIP
+    // (sentinel null) if no longer idle. The manual route omits requireIdle (unchanged).
+    if (opts?.requireIdle && agent.state !== 'idle') {
+      ctx.db.logEvent(name, 'reload_skipped', undefined, { reason: 'not_idle', state: agent.state });
+      return null;
+    }
     const proxyId = requireProxy(agent);
 
     const current = ctx.db.updateAgentState(name, 'suspending', agent.version, {
@@ -1019,6 +1027,9 @@ export async function reloadAgent(
       hookExit: agent.hookExit,
     };
   });
+
+  // GAP-098: requireIdle re-check skipped the reload (agent no longer idle) — return unchanged.
+  if (phase1 === null) return ctx.db.getAgent(name)!;
 
   const {
     proxyId, cwd, persona, previousContextPct,

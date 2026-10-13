@@ -1230,6 +1230,101 @@ describe('HealthMonitor', () => {
     monitor.stop();
   });
 
+  // ── GAP-098: cadence respawn/compact (wall-clock, enrolled agents) ──
+  // Drives via pollAll: driveToIdle's 2nd poll is the cadence FIRST-ENCOUNTER (stamps, no fire);
+  // a 3rd poll with interval 0 is the first real fire. Capture is a clean idle prompt (empty
+  // composer) with NO "/clear to save" line, so auto-compact's token gate never co-fires.
+  describe('GAP-098 cadence refresh', () => {
+    const idleCap = 'task done, committed+pushed\n❯ \n';
+
+    it('RESPAWNS an enrolled idle agent when respawn-safe (no owed inbound)', async () => {
+      const name = 'g98-respawn';
+      db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      const a = db.getAgent(name)!;
+      db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
+      const pasted: string[] = [];
+      const monitor = makeCompactMonitor(name, () => idleCap, pasted, {
+        cadenceRefreshAgents: new Set([name]), cadenceRefreshIntervalMs: 0,
+      });
+      await driveToIdle(monitor, name);  // poll #2 = cadence first-encounter (stamps)
+      await sleep(10);
+      monitor.stop();                    // stop further polls; the fire below is one-shot
+      await monitor.pollAll();           // poll #3 = fires; no inbound → respawn-safe
+      await sleep(50);
+      // Assert the cadence DECISION (respawn branch), logged synchronously before the async
+      // reloadAgent invoke. reloadAgent's own execution (kill/recreate) is covered in
+      // lifecycle.test (reloadAgent requireIdle); here we verify cadence chose RESPAWN not compact.
+      const events = db.getEvents(name, 40);
+      assert.ok(events.some(e => e.event === 'cadence_respawn'), 'logged cadence_respawn (respawn branch taken)');
+      assert.ok(!events.some(e => e.event === 'cadence_compact'), 'did NOT take the compact branch');
+    });
+
+    it('COMPACTS instead of respawning when inbound is owed (not respawn-safe)', async () => {
+      const name = 'g98-compact';
+      db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      const a = db.getAgent(name)!;
+      db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
+      const pasted: string[] = [];
+      const monitor = makeCompactMonitor(name, () => idleCap, pasted, {
+        cadenceRefreshAgents: new Set([name]), cadenceRefreshIntervalMs: 0,
+      });
+      await driveToIdle(monitor, name);
+      db.enqueueMessage({ sourceAgent: 'peer', targetAgent: name, envelope: '[from: peer]: owed reply' });
+      await sleep(10);
+      await monitor.pollAll();           // pending inbound → NOT respawn-safe → compact
+      await sleep(250);
+      assert.ok(pasted.some(t => t.includes('/compact')), 'compacted (pasted /compact)');
+      assert.ok(!proxyCommands.some(c => c.action === 'kill_session'), 'did NOT respawn');
+      const events = db.getEvents(name, 40);
+      assert.ok(events.some(e => e.event === 'cadence_compact'), 'logged cadence_compact');
+      assert.ok(!events.some(e => e.event === 'cadence_respawn'), 'did NOT respawn');
+      monitor.stop();
+    });
+
+    it('does NOT cadence-refresh a non-enrolled agent', async () => {
+      const name = 'g98-notenrolled';
+      db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      const a = db.getAgent(name)!;
+      db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
+      const pasted: string[] = [];
+      const monitor = makeCompactMonitor(name, () => idleCap, pasted, {
+        cadenceRefreshAgents: new Set(['someone-else']), cadenceRefreshIntervalMs: 0,
+      });
+      await driveToIdle(monitor, name);
+      await sleep(10);
+      await monitor.pollAll();
+      await sleep(150);
+      assert.ok(!proxyCommands.some(c => c.action === 'kill_session'), 'no respawn for non-enrolled');
+      const events = db.getEvents(name, 40);
+      assert.ok(!events.some(e => e.event === 'cadence_respawn' || e.event === 'cadence_compact'), 'no cadence event');
+      monitor.stop();
+    });
+
+    it('does NOT fire before the interval elapses (first-encounter only stamps)', async () => {
+      const name = 'g98-interval';
+      db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+      const a = db.getAgent(name)!;
+      db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
+      const pasted: string[] = [];
+      const monitor = makeCompactMonitor(name, () => idleCap, pasted, {
+        cadenceRefreshAgents: new Set([name]), cadenceRefreshIntervalMs: 999_999,
+      });
+      await driveToIdle(monitor, name); // first-encounter stamps
+      await sleep(10);
+      await monitor.pollAll();          // elapsed ~10ms << 999999 → no fire
+      await sleep(150);
+      assert.ok(!proxyCommands.some(c => c.action === 'kill_session'), 'no respawn before interval');
+      const events = db.getEvents(name, 40);
+      assert.ok(!events.some(e => e.event === 'cadence_respawn' || e.event === 'cadence_compact'), 'no fire before interval');
+      monitor.stop();
+    });
+
+    // (composer-defer path mirrors the already-tested auto-compact gate-6 — same
+    // extractComposerText check — so it is covered by that proven pattern; a dedicated
+    // cadence defer test is omitted because toggling the capture to a draft flips the
+    // agent active, which exits at the idle gate rather than the defer gate.)
+  });
+
   it('measures SUSTAINED idle across continuous polls, not time-since-last-poll (regression)', async () => {
     const name = 'health-autocompact-sustained';
     db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
