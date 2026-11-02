@@ -38,6 +38,48 @@ describe('extractComposerText', () => {
     ].join('\n');
     assert.equal(extractComposerText(pane), null);
   });
+
+  // GAP-119 regression: the composer's TOP border can be banner-overlaid — a
+  // reminder/notification label is rendered at the START of the border line, so
+  // the line no longer begins with '─' (it still ends with it). The old walk
+  // recognised the top border only via startsWith('─'), so it failed to stop,
+  // climbed into the status/scrollback lines, and mis-read them as unsubmitted
+  // input — permanently true for a monitor whose pane always shows a reminder
+  // banner, which silently dead-locked GAP-098 cadence-refresh/auto-compact
+  // behind a false composer_nonempty for ~3.5 days.
+  describe('GAP-119: banner-overlaid top border (reminder label on the border line)', () => {
+    // Mirrors ChloeOBrian's live pane 2026-11-02: status/scrollback lines, then a
+    // top border carrying a reminder banner at its start and '─' at its end, the
+    // empty '❯ ' prompt, the bottom border, and the hint line.
+    const bannerBox = (composer: string[]): string =>
+      [
+        '● #453 clean, both legs, logged and pushed. Resuming rotation.',
+        '',
+        '✻ Worked for 21s · done 1:27 PM',
+        '                    ✔ Update installed · Restart to update',
+        ' ChloeOBrian[reminder #452 from ChloeOBrian]: fleet-claude-login-expiry watch… ─',
+        ...composer,
+        '────────────────────────────────────────────────────────────────',
+        HINT,
+      ].join('\n');
+
+    it('EMPTY composer under a banner-overlaid top border → null (the regression)', () => {
+      assert.equal(extractComposerText(bannerBox(['❯ '])), null);
+      assert.equal(hasComposerText(bannerBox(['❯ '])), false);
+    });
+    it('real draft under a banner-overlaid top border → only the draft, not the banner/scrollback', () => {
+      assert.equal(
+        extractComposerText(bannerBox(['❯ on it, drafting the reply now'])),
+        'on it, drafting the reply now',
+      );
+    });
+    it('multi-line draft under a banner-overlaid top border → joined, banner excluded', () => {
+      assert.equal(
+        extractComposerText(bannerBox(['❯ first line of my reply', '  wrapped continuation here'])),
+        'first line of my reply wrapped continuation here',
+      );
+    });
+  });
 });
 
 describe('composerCorrespondsToMessage (common-prefix ≥ MIN)', () => {
