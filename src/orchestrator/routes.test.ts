@@ -1,4 +1,4 @@
-import { describe, it, before, after } from 'node:test';
+import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
@@ -582,6 +582,135 @@ describe('API Routes', () => {
   it('PATCH /api/reminders/:id on a nonexistent id → 404', async () => {
     const { status } = await api('PATCH', '/api/reminders/99999', { prompt: 'x' });
     assert.equal(status, 404);
+  });
+
+  // ── GAP-116: claim-mutex enforcement at the keystroke layer ──
+  describe('GAP-116 claim-mutex', () => {
+    const TARGET = 'MutexTarget';
+
+    // fetch with an explicit acting-agent / force header (what the CLI sets).
+    async function kreq(
+      method: string,
+      path: string,
+      body?: unknown,
+      hdrs?: Record<string, string>,
+    ): Promise<{ status: number; data: any }> {
+      const init: RequestInit = {
+        method,
+        headers: { ...(body ? { 'content-type': 'application/json' } : {}), ...(hdrs ?? {}) },
+      };
+      if (body !== undefined) init.body = JSON.stringify(body);
+      const resp = await fetch(`http://localhost:${port}${path}`, init);
+      let data: any = null;
+      try { data = await resp.json(); } catch { /* no body */ }
+      return { status: resp.status, data };
+    }
+
+    before(() => {
+      if (!db.getAgent(TARGET)) {
+        db.registerProxy('proxy-mutex', 'tok', 'localhost:3100');
+        db.createAgent({ name: TARGET, engine: 'claude', cwd: '/tmp', proxyId: 'proxy-mutex' });
+      }
+    });
+
+    beforeEach(() => {
+      db.releasePane(TARGET, '*', true); // force-clear any residual claim from a prior test
+      proxyCommands = [];
+    });
+
+    it('a foreign agent send-keys to a claimed pane is BLOCKED (409) and never dispatches', async () => {
+      db.claimPane(TARGET, 'Sydney', 300);
+      const n = proxyCommands.length;
+      const { status, data } = await kreq('POST', `/api/agents/${TARGET}/tmux`,
+        { args: ['send-keys', 'x', 'Enter'] }, { 'x-collab-agent': 'DrRobby' });
+      assert.equal(status, 409);
+      assert.equal(data.claim.holder, 'Sydney');
+      assert.equal(proxyCommands.length, n, 'no keystroke reached the proxy');
+    });
+
+    it('the holder itself passes through to the proxy', async () => {
+      db.claimPane(TARGET, 'Sydney', 300);
+      const { status } = await kreq('POST', `/api/agents/${TARGET}/tmux`,
+        { args: ['send-keys', 'x', 'Enter'] }, { 'x-collab-agent': 'Sydney' });
+      assert.equal(status, 200);
+      assert.ok(proxyCommands.some((c) => c.action === 'send_keys_raw'), 'dispatched');
+    });
+
+    it('/type is gated by the same lock', async () => {
+      db.claimPane(TARGET, 'Sydney', 300);
+      const { status } = await kreq('POST', `/api/agents/${TARGET}/type`,
+        { text: 'hello', pressEnter: true }, { 'x-collab-agent': 'DrRobby' });
+      assert.equal(status, 409);
+      assert.ok(!proxyCommands.some((c) => c.action === 'paste'), 'paste blocked');
+    });
+
+    it('/keys is gated by the same lock', async () => {
+      db.claimPane(TARGET, 'Sydney', 300);
+      const { status } = await kreq('POST', `/api/agents/${TARGET}/keys`,
+        { keys: 'C-c' }, { 'x-collab-agent': 'DrRobby' });
+      assert.equal(status, 409);
+    });
+
+    it('capture-pane (read-only) is NOT gated, even on a claimed pane', async () => {
+      db.claimPane(TARGET, 'Sydney', 300);
+      const { status } = await kreq('POST', `/api/agents/${TARGET}/tmux`,
+        { args: ['capture-pane', '-p'] }, { 'x-collab-agent': 'DrRobby' });
+      assert.equal(status, 200, 'read ops are never blocked by a claim');
+    });
+
+    it('releasing the claim frees the pane for another actor', async () => {
+      db.claimPane(TARGET, 'Sydney', 300);
+      const rel = await kreq('POST', `/api/agents/${TARGET}/release`, {}, { 'x-collab-agent': 'Sydney' });
+      assert.equal(rel.status, 200);
+      const { status } = await kreq('POST', `/api/agents/${TARGET}/tmux`,
+        { args: ['send-keys', 'x', 'Enter'] }, { 'x-collab-agent': 'DrRobby' });
+      assert.equal(status, 200, 'pane free after release');
+    });
+
+    it('an expired claim auto-frees the pane (TTL safety)', async () => {
+      db.claimPane(TARGET, 'Sydney', -10); // already expired
+      const { status } = await kreq('POST', `/api/agents/${TARGET}/tmux`,
+        { args: ['send-keys', 'x', 'Enter'] }, { 'x-collab-agent': 'DrRobby' });
+      assert.equal(status, 200, 'expired claim does not block');
+    });
+
+    it('operator/dashboard is a first-class claimant — a dashboard lock blocks an agent', async () => {
+      // no x-collab-agent header on the claim → holder defaults to 'dashboard' (operator Ben)
+      const claim = await kreq('POST', `/api/agents/${TARGET}/claim`, {});
+      assert.equal(claim.status, 200);
+      assert.equal(claim.data.claim.holder, 'dashboard');
+      const { status } = await kreq('POST', `/api/agents/${TARGET}/tmux`,
+        { args: ['send-keys', 'x', 'Enter'] }, { 'x-collab-agent': 'DrRobby' });
+      assert.equal(status, 409, 'agent blocked by the operator lock');
+    });
+
+    it('and the reverse — an agent lock blocks the operator/dashboard keystroke', async () => {
+      db.claimPane(TARGET, 'DrRobby', 300);
+      // dashboard keystroke = no x-collab-agent header → actor 'dashboard' != holder
+      const { status } = await kreq('POST', `/api/agents/${TARGET}/tmux`,
+        { args: ['send-keys', 'x', 'Enter'] });
+      assert.equal(status, 409, 'operator blocked by the agent lock');
+    });
+
+    it('--force overrides a foreign claim, dispatches, and logs a LOUD audit event', async () => {
+      db.claimPane(TARGET, 'Sydney', 300);
+      const { status } = await kreq('POST', `/api/agents/${TARGET}/tmux`,
+        { args: ['send-keys', 'x', 'Enter'] }, { 'x-collab-agent': 'DrRobby', 'x-collab-force': '1' });
+      assert.equal(status, 200, 'force overrides the lock');
+      assert.ok(proxyCommands.some((c) => c.action === 'send_keys_raw'), 'dispatched despite the lock');
+      const events = db.getEvents(TARGET, 20);
+      assert.ok(
+        events.some((e) => e.event === 'pane_claim_force_override'),
+        'force emitted a persisted audit event',
+      );
+    });
+
+    it('a second agent cannot steal a live claim via POST /claim (409)', async () => {
+      db.claimPane(TARGET, 'Sydney', 300);
+      const { status, data } = await kreq('POST', `/api/agents/${TARGET}/claim`, {}, { 'x-collab-agent': 'DrRobby' });
+      assert.equal(status, 409);
+      assert.equal(data.claim.holder, 'Sydney');
+    });
   });
 });
 

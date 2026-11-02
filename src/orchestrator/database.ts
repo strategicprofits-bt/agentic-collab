@@ -21,6 +21,7 @@ import type {
   PageRecord,
   DataStoreRecord,
   DestinationRecord,
+  PaneClaim,
 } from '../shared/types.ts';
 import {
   configColumnMap,
@@ -146,6 +147,15 @@ const SCHEMA = `
     total_bytes    INTEGER NOT NULL DEFAULT 0,
     created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  );
+
+  -- GAP-116: claim-mutex pane locks. Keyed on the TARGET pane (topic-independent).
+  -- Orchestrator is the SOLE writer (GAP-036 doctrine — no sidecar/direct-DB write).
+  CREATE TABLE IF NOT EXISTS pane_claims (
+    target_agent   TEXT PRIMARY KEY,
+    holder         TEXT NOT NULL,
+    claimed_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    expires_at     TEXT NOT NULL
   );
 `;
 
@@ -567,6 +577,81 @@ export class Database {
       'SELECT * FROM events WHERE agent_name = ? ORDER BY created_at DESC LIMIT ?'
     ).all(agentName, limit) as Array<Record<string, unknown>>;
     return rows.map(mapEventRow);
+  }
+
+  // ── Pane Claims (GAP-116 claim-mutex) ──
+
+  /**
+   * Read the live claim on a target pane, auto-expiring a stale one on read.
+   * A claim past its TTL is treated as absent (and physically removed) so a
+   * crashed/forgetful holder can never lock a pane forever. The orchestrator
+   * is the sole writer, so this read-path delete is race-free (single event loop).
+   */
+  getActiveClaim(targetAgent: string): PaneClaim | undefined {
+    const row = this.db
+      .prepare('SELECT * FROM pane_claims WHERE target_agent = ?')
+      .get(targetAgent) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    const claim = mapPaneClaimRow(row);
+    if (claim.expiresAt <= nowIso()) {
+      // Stale → auto-expire. ISO8601-UTC strings compare correctly lexicographically.
+      this.db.prepare('DELETE FROM pane_claims WHERE target_agent = ?').run(targetAgent);
+      return undefined;
+    }
+    return claim;
+  }
+
+  /**
+   * Acquire (or re-acquire/extend) a pane claim. Succeeds if the pane is free,
+   * expired, or already held by the SAME holder; fails (ok:false) if a live
+   * claim is held by a DIFFERENT holder, returning that live claim so the
+   * caller can report who holds it.
+   */
+  claimPane(targetAgent: string, holder: string, ttlSeconds: number): { ok: boolean; claim: PaneClaim } {
+    const existing = this.getActiveClaim(targetAgent); // auto-expires stale first
+    if (existing && existing.holder !== holder) {
+      return { ok: false, claim: existing };
+    }
+    const claimedAt = nowIso();
+    const expiresAt = isoAfter(ttlSeconds);
+    this.db
+      .prepare(
+        `INSERT INTO pane_claims (target_agent, holder, claimed_at, expires_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(target_agent) DO UPDATE SET holder = excluded.holder,
+           claimed_at = excluded.claimed_at, expires_at = excluded.expires_at`
+      )
+      .run(targetAgent, holder, claimedAt, expiresAt);
+    return { ok: true, claim: { targetAgent, holder, claimedAt, expiresAt } };
+  }
+
+  /**
+   * Release a pane claim. Removes it iff the caller is the holder, OR force is
+   * set (override path — the route emits a loud audit on force). Returns the
+   * claim that was released (if any) for audit/reporting.
+   */
+  releasePane(targetAgent: string, holder: string, force = false): { released: boolean; claim?: PaneClaim } {
+    const existing = this.getActiveClaim(targetAgent);
+    if (!existing) return { released: false };
+    if (existing.holder !== holder && !force) return { released: false, claim: existing };
+    this.db.prepare('DELETE FROM pane_claims WHERE target_agent = ?').run(targetAgent);
+    return { released: true, claim: existing };
+  }
+
+  /** List all live claims (auto-expiring stale ones on read). For dashboard/debug. */
+  listPaneClaims(): PaneClaim[] {
+    const rows = this.db.prepare('SELECT * FROM pane_claims').all() as Array<Record<string, unknown>>;
+    const now = nowIso();
+    const live: PaneClaim[] = [];
+    for (const row of rows) {
+      const claim = mapPaneClaimRow(row);
+      if (claim.expiresAt <= now) {
+        this.db.prepare('DELETE FROM pane_claims WHERE target_agent = ?').run(claim.targetAgent);
+      } else {
+        live.push(claim);
+      }
+    }
+    return live;
   }
 
   // ── Dashboard Messages ──
@@ -1513,6 +1598,25 @@ function mapEventRow(row: Record<string, unknown>): EventRecord {
     meta: row['meta'] as string | null,
     createdAt: row['created_at'] as string,
   };
+}
+
+function mapPaneClaimRow(row: Record<string, unknown>): PaneClaim {
+  return {
+    targetAgent: row['target_agent'] as string,
+    holder: row['holder'] as string,
+    claimedAt: row['claimed_at'] as string,
+    expiresAt: row['expires_at'] as string,
+  };
+}
+
+/** Current UTC instant as the same ISO8601 'YYYY-MM-DDTHH:MM:SSZ' shape the schema defaults use. */
+function nowIso(): string {
+  return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+/** UTC instant `seconds` from now, same ISO8601 shape as nowIso(). */
+function isoAfter(seconds: number): string {
+  return new Date(Date.now() + seconds * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
 
 function mapDashboardMessageRow(row: Record<string, unknown>): DashboardMessage {

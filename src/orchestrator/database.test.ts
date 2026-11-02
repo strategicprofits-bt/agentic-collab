@@ -1433,3 +1433,95 @@ describe('GAP-026 T0: churn-event retention + dashboard index', () => {
     assert.equal(countEvent('idle_detected'), 4, 'remainder cleared on a later run');
   });
 });
+
+describe('GAP-116: pane claims (claim-mutex)', () => {
+  let db: Database;
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'agentic-paneclaim-test-'));
+    db = new Database(join(tmpDir, 'test.db'));
+  });
+
+  afterEach(() => {
+    db.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('no claim → getActiveClaim returns undefined', () => {
+    assert.equal(db.getActiveClaim('Pepper'), undefined);
+  });
+
+  it('claimPane acquires a free pane and getActiveClaim reads it back', () => {
+    const res = db.claimPane('Pepper', 'Sydney', 300);
+    assert.equal(res.ok, true);
+    assert.equal(res.claim.holder, 'Sydney');
+    const live = db.getActiveClaim('Pepper');
+    assert.equal(live?.holder, 'Sydney');
+    assert.equal(live?.targetAgent, 'Pepper');
+  });
+
+  it('a foreign holder cannot acquire a live claim (ok:false, returns current holder)', () => {
+    db.claimPane('Pepper', 'Sydney', 300);
+    const res = db.claimPane('Pepper', 'DrRobby', 300);
+    assert.equal(res.ok, false);
+    assert.equal(res.claim.holder, 'Sydney'); // unchanged — Sydney still holds it
+    assert.equal(db.getActiveClaim('Pepper')?.holder, 'Sydney');
+  });
+
+  it('the same holder can re-acquire / extend its own claim', () => {
+    const first = db.claimPane('Pepper', 'Sydney', 300);
+    const second = db.claimPane('Pepper', 'Sydney', 600);
+    assert.equal(second.ok, true);
+    assert.ok(second.claim.expiresAt >= first.claim.expiresAt); // extended, not rejected
+  });
+
+  it('auto-expires a stale claim on read (crashed/forgetful holder cannot lock forever)', () => {
+    db.claimPane('Pepper', 'Sydney', -10); // already expired
+    assert.equal(db.getActiveClaim('Pepper'), undefined, 'stale claim treated as absent');
+    // …and a new holder can now acquire it
+    const res = db.claimPane('Pepper', 'DrRobby', 300);
+    assert.equal(res.ok, true);
+    assert.equal(res.claim.holder, 'DrRobby');
+  });
+
+  it('releasePane by the holder frees the pane', () => {
+    db.claimPane('Pepper', 'Sydney', 300);
+    const rel = db.releasePane('Pepper', 'Sydney');
+    assert.equal(rel.released, true);
+    assert.equal(db.getActiveClaim('Pepper'), undefined);
+  });
+
+  it('releasePane by a non-holder is refused unless forced', () => {
+    db.claimPane('Pepper', 'Sydney', 300);
+    const refused = db.releasePane('Pepper', 'DrRobby');
+    assert.equal(refused.released, false);
+    assert.equal(refused.claim?.holder, 'Sydney'); // still held
+    const forced = db.releasePane('Pepper', 'DrRobby', true);
+    assert.equal(forced.released, true);
+    assert.equal(db.getActiveClaim('Pepper'), undefined);
+  });
+
+  it('releasePane on an unclaimed pane is a no-op (idempotent)', () => {
+    const rel = db.releasePane('Pepper', 'Sydney');
+    assert.equal(rel.released, false);
+    assert.equal(rel.claim, undefined);
+  });
+
+  it('listPaneClaims returns live claims and drops expired ones', () => {
+    db.claimPane('Pepper', 'Sydney', 300);
+    db.claimPane('Richie', 'DrRobby', 300);
+    db.claimPane('Dude', 'Beane', -10); // expired
+    const live = db.listPaneClaims();
+    const holders = live.map((c) => c.targetAgent).sort();
+    assert.deepEqual(holders, ['Pepper', 'Richie']);
+  });
+
+  it('claims are per-pane independent (topic-independent, keyed on target)', () => {
+    db.claimPane('Pepper', 'Sydney', 300);
+    const other = db.claimPane('Richie', 'DrRobby', 300);
+    assert.equal(other.ok, true);
+    assert.equal(db.getActiveClaim('Pepper')?.holder, 'Sydney');
+    assert.equal(db.getActiveClaim('Richie')?.holder, 'DrRobby');
+  });
+});

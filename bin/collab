@@ -88,14 +88,19 @@ async function init() {
   }
 }
 
-function headers() {
+function headers(extra) {
   const h = { 'content-type': 'application/json' };
   if (_secret) h['authorization'] = `Bearer ${_secret}`;
-  return h;
+  // GAP-116: transmit this agent's self-identity so the orchestrator can attribute
+  // keystrokes + enforce the claim-mutex. Absent (e.g. a human on the host with no
+  // COLLAB_AGENT) → the orchestrator treats the caller as the operator ('dashboard').
+  const me = process.env['COLLAB_AGENT'];
+  if (me) h['x-collab-agent'] = me;
+  return extra ? { ...h, ...extra } : h;
 }
 
-async function api(method, path, body) {
-  const opts = { method, headers: headers() };
+async function api(method, path, body, extraHeaders) {
+  const opts = { method, headers: headers(extraHeaders) };
   if (body !== undefined) opts.body = JSON.stringify(body);
   const resp = await fetch(`${_host}${path}`, opts);
   const text = await resp.text();
@@ -412,11 +417,13 @@ cmd('peek', 'peek <name>', 'Peek at agent tmux pane output', async (args) => {
   console.log(data.output);
 });
 
-cmd('keys', 'keys <name> <keys>', 'Send tmux keys to an agent', async (args) => {
-  const name = args[0];
-  const keys = args.slice(1).join(' ');
-  if (!name || !keys) { console.error('usage: collab keys <name> <keys>'); process.exit(1); }
-  await api('POST', `/api/agents/${encodeURIComponent(name)}/keys`, { keys });
+cmd('keys', 'keys [--force] <name> <keys>', 'Send tmux keys to an agent', async (args) => {
+  const force = args.includes('--force');
+  const rest = args.filter((a) => a !== '--force');
+  const name = rest[0];
+  const keys = rest.slice(1).join(' ');
+  if (!name || !keys) { console.error('usage: collab keys [--force] <name> <keys>'); process.exit(1); }
+  await api('POST', `/api/agents/${encodeURIComponent(name)}/keys`, { keys }, force ? { 'x-collab-force': '1' } : undefined);
   console.log(`sent keys to ${name}`);
 });
 
@@ -428,15 +435,17 @@ cmd('reload', 'reload <name> [task...]', 'Reload an agent (kill + respawn)', asy
   console.log(`${name} reloading`);
 });
 
-cmd('tmux', 'tmux <agent> -- <tmux args...>', 'Run a constrained tmux command against an agent session', async (args) => {
-  const name = args[0];
-  const dashIdx = args.indexOf('--');
-  const tmuxArgs = dashIdx === -1 ? args.slice(1) : args.slice(dashIdx + 1);
+cmd('tmux', 'tmux [--force] <agent> -- <tmux args...>', 'Run a constrained tmux command against an agent session', async (args) => {
+  const force = args.includes('--force');
+  const rest = args.filter((a) => a !== '--force');
+  const name = rest[0];
+  const dashIdx = rest.indexOf('--');
+  const tmuxArgs = dashIdx === -1 ? rest.slice(1) : rest.slice(dashIdx + 1);
   if (!name || tmuxArgs.length === 0) {
-    console.error('usage: collab tmux <agent> -- <tmux args...>');
+    console.error('usage: collab tmux [--force] <agent> -- <tmux args...>');
     process.exit(1);
   }
-  const data = await api('POST', `/api/agents/${encodeURIComponent(name)}/tmux`, { args: tmuxArgs });
+  const data = await api('POST', `/api/agents/${encodeURIComponent(name)}/tmux`, { args: tmuxArgs }, force ? { 'x-collab-force': '1' } : undefined);
   if (data.data == null) {
     console.log('ok');
   } else if (typeof data.data === 'string') {
@@ -446,6 +455,26 @@ cmd('tmux', 'tmux <agent> -- <tmux args...>', 'Run a constrained tmux command ag
   } else {
     console.log(JSON.stringify(data.data, null, 2));
   }
+});
+
+cmd('claim', 'claim <agent> [--ttl <seconds>]', 'GAP-116: claim a pane-lock so no other actor can keystroke it', async (args) => {
+  const ttlIdx = args.indexOf('--ttl');
+  const ttl = ttlIdx !== -1 ? parseInt(args[ttlIdx + 1] ?? '', 10) : undefined;
+  const rest = args.filter((a, i) => a !== '--ttl' && i !== ttlIdx + 1);
+  const name = rest[0];
+  if (!name) { console.error('usage: collab claim <agent> [--ttl <seconds>]'); process.exit(1); }
+  const body = Number.isFinite(ttl) ? { ttl } : {};
+  const data = await api('POST', `/api/agents/${encodeURIComponent(name)}/claim`, body);
+  console.log(`claimed ${name} until ${data.claim.expiresAt} (holder: ${data.claim.holder})`);
+});
+
+cmd('release', 'release <agent> [--force]', 'GAP-116: release a pane-lock (--force overrides another holder)', async (args) => {
+  const force = args.includes('--force');
+  const rest = args.filter((a) => a !== '--force');
+  const name = rest[0];
+  if (!name) { console.error('usage: collab release <agent> [--force]'); process.exit(1); }
+  const data = await api('POST', `/api/agents/${encodeURIComponent(name)}/release`, {}, force ? { 'x-collab-force': '1' } : undefined);
+  console.log(data.released ? `released ${name}` : `no live claim on ${name}`);
 });
 
 // ── Reminders ──

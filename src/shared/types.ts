@@ -223,6 +223,27 @@ export type DashboardMessage = {
   createdAt: string;
 };
 
+// ── Pane Claims (GAP-116) ──
+
+/**
+ * A claim-mutex lock on a target agent's tmux pane. Keyed on the TARGET pane
+ * (topic-independent) so a claim is structurally visible to every send-keys
+ * attempt regardless of which topic anyone is watching — closing the
+ * wrong-plausible-topic invisibility hole that let Sydney+DrRobby cross
+ * keystrokes on a live pane (2026-11-02).
+ *
+ * Cooperative coordination-safety, NOT an adversarial boundary: `holder` is
+ * self-asserted (shared fleet bearer secret), so it reliably prevents
+ * ACCIDENTAL crossed-keystrokes between cooperating actors, not a spoofing
+ * attacker. See known-gaps GAP-116 tier-limit (GAP-036 residual class).
+ */
+export type PaneClaim = {
+  targetAgent: string;
+  holder: string;
+  claimedAt: string;
+  expiresAt: string;
+};
+
 // ── Message Queue ──
 
 export type PendingMessageStatus = 'pending' | 'delivering' | 'delivered' | 'failed';
