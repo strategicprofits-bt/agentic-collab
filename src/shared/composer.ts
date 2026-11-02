@@ -59,8 +59,17 @@ export function extractComposerText(pane: string): string | null {
       // Any non-empty text inside the box = live unsubmitted input. Strip an
       // optional prompt glyph so a bare "❯"/"> " empty prompt reads as empty
       // while wrapped continuation lines (no glyph) still count.
+      const isPrompt = line.startsWith('❯');
       const content = line.replace(/^[❯>]\s*/, '').trim();
       if (content.length > 0) collected.push(content);
+      // GAP-119: the "❯" prompt glyph marks the TOP of the input region — nothing
+      // above it inside the box is user input (continuation lines carry no glyph
+      // and are collected on the way up BEFORE reaching the prompt). STOP here, so
+      // the walk can't climb past the prompt into scrollback when the top border
+      // is banner-overlaid (a reminder label rendered at the border's START makes
+      // it no longer begin with '─', defeating the startsWith('─') stop below and
+      // dead-locking the composer-defer gate behind a false composer_nonempty).
+      if (isPrompt) break;
     } else {
       // A non-decoration line reached BEFORE any bottom border = a compact pane
       // with no rendered box. Only a composer prompt WITH text counts, and only
