@@ -460,7 +460,7 @@ cmd('tmux', 'tmux [--force] <agent> -- <tmux args...>', 'Run a constrained tmux 
 cmd('claim', 'claim <agent> [--ttl <seconds>]', 'GAP-116: claim a pane-lock so no other actor can keystroke it', async (args) => {
   const ttlIdx = args.indexOf('--ttl');
   const ttl = ttlIdx !== -1 ? parseInt(args[ttlIdx + 1] ?? '', 10) : undefined;
-  const rest = args.filter((a, i) => a !== '--ttl' && i !== ttlIdx + 1);
+  const rest = args.filter((a, i) => a !== '--ttl' && (ttlIdx === -1 || i !== ttlIdx + 1));
   const name = rest[0];
   if (!name) { console.error('usage: collab claim <agent> [--ttl <seconds>]'); process.exit(1); }
   const body = Number.isFinite(ttl) ? { ttl } : {};
