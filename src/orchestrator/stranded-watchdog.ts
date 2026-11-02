@@ -241,6 +241,13 @@ export class StrandedWatchdog {
           this.logEvent(name, 'stranded_s1_no_correspondence', {
             deliveredAt: msg.deliveredAt,
             composerPreview: (composerText ?? '').slice(0, 80),
+            // GAP-119 certainty: the 80-char preview can't tell a long genuine
+            // own-draft from a banner-overlaid-border scrollback climb (both
+            // truncate alike). Log the FULL extracted draft AND the full captured
+            // pane (bounded to the 30-line capture) so the next occurrence is
+            // mechanism-dispositive — the pane shows WHERE the text came from.
+            composerText: composerText ?? '',
+            pane,
           });
           this.noCorrLogged.add(name);
         }
@@ -347,6 +354,9 @@ export class StrandedWatchdog {
         this.logEvent(name, 'stranded_s2_dismissed_no_correspondence', {
           deliveredAt: msg.deliveredAt,
           composerPreview: (composerText ?? '').slice(0, 80),
+          // GAP-119 certainty (see the S1 site): full draft + full revealed pane.
+          composerText: composerText ?? '',
+          pane,
         });
         return { agent: name, result: 's1-no-correspondence' }; // dismissed, no genuine strand → no respawn
       }
