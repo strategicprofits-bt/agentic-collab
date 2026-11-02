@@ -1529,6 +1529,9 @@ route('POST', '/api/agents/:name/keys', async (req, res, match, ctx) => {
   if (!agent) { json(res, 404, { error: `Agent "${name}" not found` }); return; }
   if (!agent.proxyId) { json(res, 400, { error: `Agent "${name}" has no proxy` }); return; }
 
+  // GAP-116: claim-mutex — /keys is a keystroke injector, gated like /tmux send-keys.
+  if (enforcePaneClaim(ctx, res, name, actingAgent(req), forceRequested(req, body))) return;
+
   const result = await ctx.proxyDispatch(agent.proxyId, {
     action: 'send_keys',
     sessionName: agent.tmuxSession ?? `agent-${name}`,
@@ -1580,6 +1583,80 @@ function parseTmuxResize(args: string[]): { width: number; height: number } {
   return { width: Math.floor(width), height: Math.floor(height) };
 }
 
+// ── GAP-116 claim-mutex helpers ──
+//
+// A CLAIM registers a pane-lock on a target agent, keyed on the TARGET pane
+// (topic-independent) so it is structurally visible to every keystroke attempt
+// regardless of which topic anyone is watching. This closes the
+// wrong-plausible-topic invisibility hole (Sydney+DrRobby crossed keystrokes on a
+// live pane, 2026-11-02). TIER-LIMIT: cooperative coordination-safety, NOT an
+// adversarial boundary — the acting-agent identity below is SELF-ASSERTED (single
+// shared fleet bearer secret), so it prevents ACCIDENTAL crossings between
+// cooperating actors, not a spoofing attacker (GAP-036 residual class).
+
+const CLAIM_DEFAULT_TTL_SECONDS = 300;
+const CLAIM_MAX_TTL_SECONDS = 3600;
+
+/**
+ * Who is acting on the keystroke path. The `collab` CLI sets `x-collab-agent`
+ * from `COLLAB_AGENT`; the dashboard (operator Ben) sends no such header →
+ * 'dashboard', making the operator a first-class, bidirectional claimant.
+ */
+function actingAgent(req: IncomingMessage): string {
+  const h = req.headers['x-collab-agent'];
+  const v = Array.isArray(h) ? h[0] : h;
+  return typeof v === 'string' && v.trim() ? v.trim() : 'dashboard';
+}
+
+/** The holder for a claim/release: an explicit body `holder`, else the acting agent. */
+function resolveHolder(req: IncomingMessage, body?: Record<string, unknown>): string {
+  const h = body?.['holder'];
+  return typeof h === 'string' && h.trim() ? h.trim() : actingAgent(req);
+}
+
+/** Force-override flag, from the `x-collab-force` header (set by `--force`) or body `force`. */
+function forceRequested(req: IncomingMessage, body?: Record<string, unknown>): boolean {
+  const h = req.headers['x-collab-force'];
+  const hv = Array.isArray(h) ? h[0] : h;
+  if (hv === '1' || hv === 'true') return true;
+  return body?.['force'] === true;
+}
+
+/**
+ * Enforce the claim-mutex before a keystroke dispatch. Returns true (and sends a
+ * 409) when a live claim is held by someone other than the actor and force is not
+ * set — the caller MUST NOT dispatch. When force overrides a foreign holder it
+ * emits a LOUD audit (persisted event + dashboard event) and returns false
+ * (proceed). Free / expired / self-held → false (proceed). Read ops never call this.
+ */
+function enforcePaneClaim(
+  ctx: RouteContext,
+  res: ServerResponse,
+  targetAgent: string,
+  actor: string,
+  force: boolean,
+): boolean {
+  const claim = ctx.db.getActiveClaim(targetAgent);
+  if (!claim || claim.holder === actor) return false;
+  if (!force) {
+    json(res, 409, {
+      error: `pane for "${targetAgent}" is claimed by "${claim.holder}" until ${claim.expiresAt} (claim it or use --force)`,
+      claim,
+    });
+    return true;
+  }
+  ctx.db.logEvent(targetAgent, 'pane_claim_force_override', undefined, {
+    overrider: actor,
+    holder: claim.holder,
+    claimedAt: claim.claimedAt,
+    expiresAt: claim.expiresAt,
+  });
+  ctx.wss.broadcast(
+    JSON.stringify({ type: 'pane_claim_force_override', target: targetAgent, overrider: actor, holder: claim.holder }),
+  );
+  return false;
+}
+
 route('POST', '/api/agents/:name/tmux', async (req, res, match, ctx) => {
   const name = match.pathname.groups['name']!;
   const body = await readJson(req);
@@ -1600,6 +1677,8 @@ route('POST', '/api/agents/:name/tmux', async (req, res, match, ctx) => {
     switch (subcommand) {
       case 'send-keys':
         if (rest.length === 0) throw new Error('send-keys requires at least one key/token');
+        // GAP-116: claim-mutex. A foreign live claim blocks this keystroke (409) unless forced.
+        if (enforcePaneClaim(ctx, res, name, actingAgent(req), forceRequested(req, body))) return;
         result = await ctx.proxyDispatch(agent.proxyId, {
           action: 'send_keys_raw',
           sessionName,
@@ -1674,6 +1753,9 @@ route('POST', '/api/agents/:name/type', async (req, res, match, ctx) => {
   if (!agent) { json(res, 404, { error: `Agent "${name}" not found` }); return; }
   if (!agent.proxyId) { json(res, 400, { error: `Agent "${name}" has no proxy` }); return; }
 
+  // GAP-116: claim-mutex — /type pastes + optionally presses Enter = a keystroke injector, gated.
+  if (enforcePaneClaim(ctx, res, name, actingAgent(req), forceRequested(req, body))) return;
+
   const pressEnter = body?.pressEnter === true;
   const result = await ctx.proxyDispatch(agent.proxyId, {
     action: 'paste',
@@ -1708,6 +1790,54 @@ route('POST', '/api/agents/:name/resize', async (req, res, match, ctx) => {
 
   if (!result.ok) { json(res, 500, { error: result.error }); return; }
   json(res, 200, { ok: true });
+});
+
+// ── GAP-116 claim-mutex endpoints ──
+
+route('POST', '/api/agents/:name/claim', async (req, res, match, ctx) => {
+  const name = match.pathname.groups['name']!;
+  const body = await readJson(req);
+  if (!ctx.db.getAgent(name)) { json(res, 404, { error: `Agent "${name}" not found` }); return; }
+
+  const holder = resolveHolder(req, body);
+  const ttlRaw = typeof body?.['ttl'] === 'number' ? (body['ttl'] as number) : CLAIM_DEFAULT_TTL_SECONDS;
+  const ttl = Math.max(1, Math.min(Math.floor(ttlRaw), CLAIM_MAX_TTL_SECONDS));
+
+  const result = ctx.db.claimPane(name, holder, ttl);
+  if (!result.ok) {
+    json(res, 409, { error: `pane for "${name}" is already claimed by "${result.claim.holder}"`, claim: result.claim });
+    return;
+  }
+  ctx.db.logEvent(name, 'pane_claimed', undefined, { holder, expiresAt: result.claim.expiresAt });
+  ctx.wss.broadcast(JSON.stringify({ type: 'pane_claim', target: name, holder, expiresAt: result.claim.expiresAt }));
+  json(res, 200, { ok: true, claim: result.claim });
+});
+
+route('POST', '/api/agents/:name/release', async (req, res, match, ctx) => {
+  const name = match.pathname.groups['name']!;
+  const body = await readJson(req);
+  if (!ctx.db.getAgent(name)) { json(res, 404, { error: `Agent "${name}" not found` }); return; }
+
+  const holder = resolveHolder(req, body);
+  const force = forceRequested(req, body);
+  const result = ctx.db.releasePane(name, holder, force);
+  if (!result.released) {
+    if (result.claim) {
+      json(res, 409, { error: `pane for "${name}" is held by "${result.claim.holder}"; use --force to override`, claim: result.claim });
+      return;
+    }
+    json(res, 200, { ok: true, released: false }); // nothing to release — idempotent
+    return;
+  }
+  ctx.db.logEvent(name, 'pane_released', undefined, { holder, forced: force, previousHolder: result.claim?.holder });
+  ctx.wss.broadcast(JSON.stringify({ type: 'pane_release', target: name, holder }));
+  json(res, 200, { ok: true, released: true, claim: result.claim });
+});
+
+route('GET', '/api/agents/:name/claim', async (_req, res, match, ctx) => {
+  const name = match.pathname.groups['name']!;
+  if (!ctx.db.getAgent(name)) { json(res, 404, { error: `Agent "${name}" not found` }); return; }
+  json(res, 200, { claim: ctx.db.getActiveClaim(name) ?? null });
 });
 
 route('POST', '/api/agents/:name/destroy', lifecycleRoute(destroyAgent, { broadcast: 'destroyed' }));
