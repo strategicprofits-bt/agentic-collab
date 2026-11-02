@@ -197,6 +197,18 @@ export class HealthMonitor {
   static readonly CTX_STALE_TOKEN_FLOOR = parseIntEnv('CTX_STALE_TOKEN_FLOOR', 10_000);
   static readonly AUTOCOMPACT_MIN_IDLE_MS = parseIntEnv('AUTOCOMPACT_MIN_IDLE_MS', 60_000);
   static readonly AUTOCOMPACT_COOLDOWN_MS = parseIntEnv('AUTOCOMPACT_COOLDOWN_MS', 15 * 60 * 1000);
+  // ── GAP-118: direct ctx-pct alert for the monitor-role holder ──
+  // The 85%-ctx ESCALATION is a judgment step the standing monitor (ChloeOBrian) cannot
+  // reliably self-apply when SHE is the over-threshold agent (she's busy/compacting). So for
+  // the monitor-role holder specifically, a genuine (GAP-012 non-null) ctx crossing auto-fires
+  // a direct system alert to DrRobby — zero agent judgment in the loop, same shape as the
+  // session-death/stall/circuit-breaker direct alerts. Config, not hardcoded (dodges the
+  // stale-constant trap + survives a roster change without a rebuild). Comma-separated list.
+  static readonly MONITOR_CTX_ALERT_THRESHOLD = parseIntEnv('MONITOR_CTX_ALERT_THRESHOLD', 85);
+  static readonly MONITOR_ROLE_AGENTS: ReadonlySet<string> = new Set(
+    (process.env['MONITOR_ROLE_AGENTS'] ?? 'ChloeOBrian')
+      .split(',').map((s) => s.trim()).filter(Boolean),
+  );
   private readonly autoCompactTokenThreshold: number;
   private readonly autoCompactMinIdleMs: number;
   private readonly autoCompactCooldownMs: number;
@@ -261,6 +273,9 @@ export class HealthMonitor {
   private readonly healedAt = new Map<string, number>();
   /** Agents for which a session-death alert has already been fired (prevents duplicates). */
   private readonly sessionDeathAlerted = new Set<string>();
+  /** Monitor-role agents for which a ctx-threshold alert has fired (GAP-118) — cleared when
+   *  the agent drops back below threshold, so a later re-crossing re-alerts. */
+  private readonly monitorCtxAlerted = new Set<string>();
   /** Liveness sweep timer — periodic audit of all agent states. */
   private livenessSweepTimer: ReturnType<typeof setInterval> | null = null;
   static readonly LIVENESS_SWEEP_MS = 10 * 60 * 1000; // 10 minutes
@@ -889,6 +904,54 @@ export class HealthMonitor {
       });
     } catch { /* version conflict — another operation changed the agent, skip this update */ }
     this.onAgentUpdate(agent.name);
+
+    // GAP-118: if the monitor-role holder has crossed its ctx escalation threshold, fire a
+    // direct alert to DrRobby — the monitor cannot reliably self-escalate its own crossing.
+    // Uses the GAP-012 genuine-or-null contextPct (never a stale/fabricated %), so a null
+    // (honest-unknown) reading never fires a false alert.
+    this.checkMonitorCtxThreshold(agent.name, contextPct);
+  }
+
+  /**
+   * GAP-118: direct ctx-threshold alert for the monitor-role holder.
+   * Fires once per crossing (deduped) when a monitor-role agent's GENUINE context occupancy
+   * reaches MONITOR_CTX_ALERT_THRESHOLD; resets when it drops back below so a re-crossing
+   * re-alerts. No-op for non-monitor agents and for null (unknown) readings.
+   */
+  private checkMonitorCtxThreshold(agentName: string, contextPct: number | null): void {
+    if (!HealthMonitor.MONITOR_ROLE_AGENTS.has(agentName)) return;
+    if (contextPct === null) return; // honest-unknown (GAP-012) — never alert on bad data
+    if (contextPct >= HealthMonitor.MONITOR_CTX_ALERT_THRESHOLD) {
+      if (this.monitorCtxAlerted.has(agentName)) return; // already alerted this crossing
+      this.monitorCtxAlerted.add(agentName);
+      this.fireMonitorCtxAlert(agentName, contextPct);
+    } else {
+      this.monitorCtxAlerted.delete(agentName); // dropped below — re-arm
+    }
+  }
+
+  private fireMonitorCtxAlert(agentName: string, contextPct: number): void {
+    const displayBody = `⚠️ ${agentName} (monitor role) is at ${contextPct}% context and cannot reliably self-escalate its own threshold crossing (GAP-118). Verify/compact or reassign the monitor watch.`;
+
+    // Dashboard alert for operator visibility
+    const dashMsg = this.db.addDashboardMessage(agentName, 'to_agent', displayBody, {
+      topic: 'sev3-monitor-ctx-threshold',
+      sourceAgent: 'system',
+    });
+    this.onDashboardMessage(dashMsg);
+
+    // Collab message to DrRobby for Telegram escalation — system-fired, no agent in the loop
+    const envelope = `[from: system, reply with collab send system --topic monitor-ctx-alert]: '${agentName} (monitor role) is at ${contextPct}% context and may not be able to escalate its own threshold crossing (GAP-118). Verify/compact ${agentName} or reassign the monitor watch.'`;
+    const pending = this.db.enqueueMessage({
+      sourceAgent: null,
+      targetAgent: 'DrRobby',
+      envelope,
+    });
+    this.db.linkDashboardMessageToQueue(dashMsg.id, pending.id);
+    this.onQueueUpdate(pending);
+    this.onMessageEnqueued('DrRobby');
+
+    this.db.logEvent(agentName, 'monitor_ctx_threshold_alert', undefined, { contextPct });
   }
 
   /**
