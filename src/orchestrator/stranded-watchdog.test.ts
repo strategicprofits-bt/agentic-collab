@@ -84,6 +84,22 @@ const REAL_QUOTE_SCROLLBACK_EMPTY = [
   '──────────────────────────────────────────',
   REAL_HINT,
 ].join('\n');
+// GAP-119 — the composer TOP BORDER is banner-overlaid: a reminder label is
+// rendered at the START of the border line, so it no longer BEGINS with '─' (it
+// still ends with it). The old startsWith('─') top-border detection failed, so the
+// bounded walk climbed past the EMPTY composer into the status/scrollback lines and
+// read them as live input → false S1. This is the ChloeOBrian cadence dead-lock and
+// the banner-driven PepperPotts stranded-input false-positive class. Composer is
+// EMPTY → must return null. Shaped verbatim from ChloeOBrian's live pane 2026-11-02.
+const BANNER_TOP_BORDER_EMPTY = [
+  '● #453 clean, both legs, logged and pushed. Resuming rotation.',
+  '',
+  '✻ Worked for 21s · done 1:27 PM',
+  ' ChloeOBrian[reminder #452 from ChloeOBrian]: fleet-claude-login-expiry watch… ─',
+  EMPTY_COMPOSER,
+  '────────────────────────────────────────────',
+  REAL_HINT,
+].join('\n');
 
 // ── Correspondence-guard fixtures ──
 // A genuine stranded paste: the composer holds the delivered message ENVELOPE
@@ -164,6 +180,12 @@ describe('classifyStrand', () => {
   });
   it('returns null: empty composer with REAL "> …" persona scrollback above', () => {
     assert.equal(classifyStrand(REAL_QUOTE_SCROLLBACK_EMPTY), null);
+  });
+  // GAP-119 (false-S1 regression): banner-overlaid top border over an EMPTY
+  // composer must be null — the walk must stop at the empty '❯' prompt and never
+  // climb into the banner/status lines. RED before the prompt-glyph-anchored stop.
+  it('returns null: empty composer under a banner-overlaid top border (GAP-119)', () => {
+    assert.equal(classifyStrand(BANNER_TOP_BORDER_EMPTY), null);
   });
   // v2.1.220 signature-refresh mirror (proxy PR-2 parity): the a289e43 watchdog
   // signatures were STALE for /help, /model, /resume — S2 detection missed the
