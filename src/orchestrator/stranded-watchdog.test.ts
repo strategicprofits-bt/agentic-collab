@@ -774,6 +774,41 @@ describe('StrandedWatchdog', () => {
     );
   });
 
+  it('TEST 6f: s1-no-correspondence logs the FULL pane + untruncated composer text (GAP-119 certainty)', async () => {
+    // slice(0,80) left the dominant PepperPotts strand ("--notify (from agent-team/
+    // cwd). This is the standin…") mechanism-AMBIGUOUS: a banner-overlaid-border
+    // climb (GAP-119 parser class) and a long genuine own-draft truncate to the
+    // same 80 chars. Logging the full extracted draft AND the full captured pane
+    // makes the next occurrence dispositive (the pane shows WHERE the text came
+    // from — inside the box vs climbed into scrollback above a banner border).
+    const longDraft =
+      'investigate the --notify standing instruction from agent-team cwd and reconcile pending-updates before the next cycle';
+    assert.ok(longDraft.length > 80, 'fixture draft must exceed the old 80-char cap to prove untruncation');
+    const LONG_OWN_DRAFT_S1_PANE = [
+      '──────────────────────────────── Agent ──',
+      '❯ ' + longDraft,
+      '──────────────────────────────────────────',
+      REAL_HINT,
+    ].join('\n');
+    const agent = makeAgent('verbose');
+    seedDeliveredMessage('verbose', 'CoachBeard', 300);
+    seedSnapshot('verbose', 300);
+    scripts.set('verbose', { pane: LONG_OWN_DRAFT_S1_PANE, frozenSecs: 300 });
+    const metas: Array<Record<string, unknown> | undefined> = [];
+    const wd = makeWatchdog({
+      logEvent: (_a, e, meta) => {
+        if (e === 'stranded_s1_no_correspondence') metas.push(meta);
+      },
+    });
+
+    await wd.sweep([agent]);
+    assert.equal(metas.length, 1, 'logged once');
+    const meta = metas[0]!;
+    assert.equal(meta.composerText, longDraft, 'logs the FULL extracted composer draft, not an 80-char slice');
+    assert.equal(meta.pane, LONG_OWN_DRAFT_S1_PANE, 'logs the full captured pane for banner-climb disambiguation');
+    assert.equal(meta.composerPreview, longDraft.slice(0, 80), 'retains the cheap 80-char preview for continuity/dedup');
+  });
+
   it('TEST 6e: a transient SKIP (capture failure) mid-episode does NOT clear the episode', async () => {
     // The load-bearing re-arm edge: 'skip' is a TRANSIENT (capture-failed /
     // sweep-in-flight), not a recovery. A skip mid-wedge must NOT re-arm the
