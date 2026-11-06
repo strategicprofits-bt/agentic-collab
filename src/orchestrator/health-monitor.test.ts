@@ -330,6 +330,77 @@ describe('HealthMonitor', () => {
     assert.equal(updated.lastContextPct, 85, 'genuine high-% with supporting tokens must be KEPT');
   });
 
+  // GAP-122: context_pct capture regressed silently ~2026-10-13T14:17Z (occupancy-% went
+  // NULL fleet-wide while token capture kept working). These diagnostics classify WHY ctx%
+  // is null so the next near-compact agent is mechanism-DISPOSITIVE (reasoning is exhausted):
+  //   floor_null  = our regex matched a genuine % but the GAP-012 token-floor nulled it
+  //                 (code/floor-interaction — f08c8e0/GAP-097 class).
+  //   parse_miss  = an occupancy-ish line EXISTS in the pane but our regex did not extract a
+  //                 % (format-drift — e.g. server-fetched TUI behavior under a steady binary;
+  //                 the CLI symlink was steady .296 across the cutoff, so drift can't be a
+  //                 binary-version change). The raw candidate line(s) are captured for inspection.
+  // No event when there is simply no occupancy line (genuine headroom) — null is correct there.
+  function g122Setup(name: string): HealthMonitor {
+    db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent(name)!;
+    db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
+    return makeMonitor();
+  }
+  function g122Misses(name: string): Array<Record<string, unknown>> {
+    return db.getEvents(name, 20)
+      .filter(e => e.event === 'ctx_parse_miss')
+      .map(e => { const m = (e as { meta?: unknown }).meta; return typeof m === 'string' ? JSON.parse(m) : (m ?? {}); });
+  }
+
+  it('GAP-122: logs ctx_parse_miss=parse_miss when an occupancy-ish line is present but unparsed', async () => {
+    const monitor = g122Setup('g122-miss');
+    // A NOVEL occupancy-line format our regexes do NOT match ("Context window 88% full" is
+    // neither "Context left until auto-compact: N%" nor "N% context") + a cumulative token line.
+    captureOutput = '✻ Working\n   Context window 88% full\n   new task? /clear to save 150k tokens\n❯ ';
+    proxyCommands = [];
+    await monitor.pollAll();
+    await monitor.pollAll(); // dedup: must NOT log twice for the same episode
+
+    assert.equal(db.getAgent('g122-miss')!.lastContextPct, null, 'novel format → % unparsed → null');
+    const misses = g122Misses('g122-miss');
+    assert.equal(misses.length, 1, 'exactly one ctx_parse_miss (deduped per episode)');
+    assert.equal(misses[0]!.reason, 'parse_miss', 'classified as a format-drift parse miss');
+    assert.ok(
+      (misses[0]!.candidateLines as string[]).some(l => l.includes('Context window 88% full')),
+      'the unparsed occupancy-ish line is captured for inspection',
+    );
+  });
+
+  it('GAP-122: logs ctx_parse_miss=floor_null when a matched % is nulled by the token floor', async () => {
+    const monitor = g122Setup('g122-floor');
+    // Regex MATCHES (→100-15=85) but the cumulative token count is below the 10k floor → nulled.
+    captureOutput = 'Context left until auto-compact: 15%\n   new task? /clear to save 5k tokens\n❯ ';
+    proxyCommands = [];
+    await monitor.pollAll();
+
+    const misses = g122Misses('g122-floor');
+    assert.equal(misses.length, 1, 'floor-nulled % is logged for inspection');
+    assert.equal(misses[0]!.reason, 'floor_null', 'classified as floor-interaction, not format-drift');
+    assert.equal(misses[0]!.preFloorPct, 85, 'the pre-floor parsed % is captured');
+  });
+
+  it('GAP-122: does NOT log when capture works (genuine high-% with supporting tokens)', async () => {
+    const monitor = g122Setup('g122-ok');
+    captureOutput = 'Context left until auto-compact: 15%\n   new task? /clear to save 170k tokens\n❯ ';
+    proxyCommands = [];
+    await monitor.pollAll();
+    assert.equal(g122Misses('g122-ok').length, 0, 'a successful ctx% capture logs no diagnostic');
+  });
+
+  it('GAP-122: does NOT log on genuine headroom (no occupancy line at all)', async () => {
+    const monitor = g122Setup('g122-head');
+    // Only token lines, no occupancy/context indicator → null is correct, not a defect.
+    captureOutput = '✶ Enchanting… (down 44.1k tokens)\n   new task? /clear to save 90k tokens\n❯ ';
+    proxyCommands = [];
+    await monitor.pollAll();
+    assert.equal(g122Misses('g122-head').length, 0, 'no occupancy-ish line → no parse_miss (genuine headroom)');
+  });
+
   // GAP-097: the token capture must anchor on the CUMULATIVE session line
   // ("new task? /clear to save NNNk tokens") and IGNORE the transient per-turn
   // streaming counter (a bare "N tokens" that resets each turn). The loose

@@ -276,6 +276,8 @@ export class HealthMonitor {
   /** Monitor-role agents for which a ctx-threshold alert has fired (GAP-118) — cleared when
    *  the agent drops back below threshold, so a later re-crossing re-alerts. */
   private readonly monitorCtxAlerted = new Set<string>();
+  // GAP-122: dedup ctx_parse_miss diagnostics once-per-episode; cleared when ctx% captures again.
+  private readonly ctxParseMissLogged = new Set<string>();
   /** Liveness sweep timer — periodic audit of all agent states. */
   private livenessSweepTimer: ReturnType<typeof setInterval> | null = null;
   static readonly LIVENESS_SWEEP_MS = 10 * 60 * 1000; // 10 minutes
@@ -874,9 +876,15 @@ export class HealthMonitor {
     // Window-agnostic (absolute floor, no 200k/window assumption). Fleet-empirical: every observed
     // frozen-stale case sits <10k tokens, every genuine peak ≥130k — so a GENUINE high-% (always
     // backed by a high token count) is never false-nulled. Mirrors Chloe's interim skip predicate.
+    const preFloorPct = contextPct;
     if (contextPct !== null && totalTokens !== undefined && totalTokens < HealthMonitor.CTX_STALE_TOKEN_FLOOR) {
       contextPct = null;
     }
+
+    // GAP-122 diagnostic: context_pct capture regressed silently ~2026-10-13 (occupancy-%
+    // went null fleet-wide; token capture kept working). Classify WHY ctx% is null so the
+    // next near-compact agent is mechanism-dispositive — floor-interaction vs format-drift.
+    this.checkCtxParseDiagnostic(agent.name, paneOutput, preFloorPct, contextPct, totalTokens);
 
     // Nothing parseable at all (no occupancy %, no token count) — leave the last
     // reading untouched (a transient/garbled capture must not wipe a good value).
@@ -952,6 +960,54 @@ export class HealthMonitor {
     this.onMessageEnqueued('DrRobby');
 
     this.db.logEvent(agentName, 'monitor_ctx_threshold_alert', undefined, { contextPct });
+  }
+
+  /**
+   * GAP-122 diagnostic: when context_pct comes back null, classify WHY and capture the raw
+   * status-bar evidence so the next near-compact agent is mechanism-dispositive:
+   *   - `floor_null`: the regex DID match a genuine % but the GAP-012 token-floor nulled it
+   *     (code/floor-interaction — the f08c8e0/GAP-097 class).
+   *   - `parse_miss`: an occupancy-ish line EXISTS but no regex extracted a % (format-drift;
+   *     since the CLI binary was steady .296 across the regression, drift = server-fetched TUI
+   *     behavior, not a version change). The candidate line(s) reveal the actual format.
+   * No-op when ctx% captured fine (re-arms the dedup) or when there is no occupancy line at
+   * all (genuine headroom — null is correct). Deduped once per episode.
+   * NB the captured `candidateLines` are bounded status-bar lines and belong to the same
+   * potentially-secret-bearing meta class as the GAP-119 full-pane log — scan/fingerprint,
+   * never SELECT-star-dump outward.
+   */
+  private checkCtxParseDiagnostic(
+    agentName: string,
+    paneOutput: string,
+    preFloorPct: number | null,
+    finalPct: number | null,
+    totalTokens: number | undefined,
+  ): void {
+    if (finalPct !== null) { this.ctxParseMissLogged.delete(agentName); return; } // captured → re-arm
+
+    let reason: 'floor_null' | 'parse_miss';
+    const lines = paneOutput.split('\n');
+    const region = lines.slice(Math.max(0, lines.length - 20)).map(l => l.replace(/\s+$/, ''));
+    const candidateLines = region
+      .filter(l => l.trim() && /context|auto-?compact|\d+\s*%/i.test(l))
+      .slice(0, 6);
+
+    if (preFloorPct !== null) {
+      reason = 'floor_null'; // a genuine % was parsed then nulled by the token floor
+    } else if (candidateLines.length > 0) {
+      reason = 'parse_miss'; // an occupancy-ish line exists but our regex missed it
+    } else {
+      return; // no occupancy line and nothing matched a % → genuine headroom, not a defect
+    }
+
+    if (this.ctxParseMissLogged.has(agentName)) return; // once per episode
+    this.ctxParseMissLogged.add(agentName);
+    this.db.logEvent(agentName, 'ctx_parse_miss', undefined, {
+      reason,
+      preFloorPct,
+      totalTokens: totalTokens ?? null,
+      candidateLines,
+    });
   }
 
   /**
