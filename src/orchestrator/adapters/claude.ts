@@ -140,9 +140,16 @@ export class ClaudeAdapter implements EngineAdapter {
       // — "N% until auto-compact" — which the old "Context left until auto-compact: N%" regex
       // missed, nulling context_pct fleet-wide for ~3 weeks. Match BOTH (old kept, new added);
       // the optional word tolerates "N% left/remaining until auto-compact".
+      //
+      // GAP-122 HARDENING: the occupancy phrase is matched ONLY when it is the WHOLE trimmed line
+      // (a standalone status-bar indicator), NOT when it appears embedded in prose. The first
+      // unanchored version FALSE-captured the phrase out of received collab-message / chat text
+      // (us discussing a "1% until auto-compact" value) → bogus context_pct=99 fleet-wide + a
+      // false GAP-118 alert. `^…$` on the trimmed line excludes the mid-sentence prose case.
       if (contextPct === null) {
-        const autoCompact = line.match(/Context left until auto-compact:\s*(\d+)%/i)
-          ?? line.match(/(\d+)%\s*(?:\w+\s+)?until auto-compact/i);
+        const bar = line.trim();
+        const autoCompact = bar.match(/^context left until auto-compact:\s*(\d+)%$/i)
+          ?? bar.match(/^(\d+)%\s*(?:\w+\s+)?until auto-compact$/i);
         if (autoCompact) {
           contextPct = Math.max(0, Math.min(100, 100 - parseInt(autoCompact[1]!, 10)));
         }

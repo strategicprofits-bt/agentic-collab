@@ -281,6 +281,28 @@ describe('Engine Adapters', () => {
       );
     });
 
+    // GAP-122 HARDENING (the FP that bit prod): the first fix was UNANCHORED and false-captured
+    // the occupancy phrase out of PROSE — a literal "1% until auto-compact" quoted MID-SENTENCE in
+    // a collab message rendered in an agent's pane parsed as context_pct=99 (3 agents, + a false
+    // GAP-118 alert). Anchor the match to the WHOLE trimmed line (standalone status-bar indicator).
+    it('GAP-122 harden: DIGIT prose mid-sentence ("1% until auto-compact" in a message) MUST null', () => {
+      // the exact shape that bit us — our own collab-message text in a pane
+      assert.equal(adapter.parseContextPercent('  written 1% until auto-compact repeatedly').contextPct, null);
+      assert.equal(adapter.parseContextPercent('PepperPotts at 1% until auto-compact now, 99% occupied').contextPct, null);
+      assert.equal(adapter.parseContextPercent('showing "1% until auto-compact" as the drifted format').contextPct, null);
+      // literal-N% prose also null (no digit)
+      assert.equal(adapter.parseContextPercent('the "N% until auto-compact" format drifted').contextPct, null);
+      // OLD-format prose embedded in a sentence also must null now (anchored)
+      assert.equal(adapter.parseContextPercent('the Context left until auto-compact: 7% line moved').contextPct, null);
+    });
+
+    it('GAP-122 harden: a REAL standalone right-aligned status-bar line still captures', () => {
+      // genuine PepperPotts shape: right-aligned, the indicator is the whole (trimmed) line
+      assert.equal(adapter.parseContextPercent('                                   1% until auto-compact').contextPct, 99);
+      assert.equal(adapter.parseContextPercent('        15% until auto-compact').contextPct, 85);
+      assert.equal(adapter.parseContextPercent('   Context left until auto-compact: 7%').contextPct, 93);
+    });
+
     // GAP-012/097: a CUMULATIVE "tokens" figure is recorded as totalTokens (never
     // divided by 200k to fabricate a context %; contextPct stays null). GAP-097: the
     // cumulative figure is the "new task? /clear to save NNN[kKmM] tokens" line ONLY —
