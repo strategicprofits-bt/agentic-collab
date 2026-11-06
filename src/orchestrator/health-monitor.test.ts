@@ -2336,3 +2336,134 @@ describe('GAP-026 Stage 2 — orchestrator genuine-death self-recovery', () => {
     );
   });
 });
+
+// GAP-118: the monitor-role holder's 85%-ctx escalation is a judgment step she cannot reliably
+// self-apply when SHE is the over-threshold agent. The health-monitor fires a direct system alert
+// to DrRobby on a genuine crossing — no agent in the loop. Default monitor = ChloeOBrian.
+describe('GAP-118: monitor-role ctx-threshold direct alert', () => {
+  let mDb: Database;
+  let mTmpDir: string;
+  let captureOutput: string;
+  let enqueuedTargets: string[];
+  const monitors: HealthMonitor[] = [];
+
+  const CLAUDE_DETECTION = JSON.stringify({
+    idlePatterns: [{ pattern: '^[\\u276f>]\\s*$', lines: 5 }],
+    activePatterns: [],
+    contextPattern: '(\\d+)\\s*tokens',
+    idleThreshold: 2,
+    autoRecover: false,
+  });
+
+  before(() => {
+    mTmpDir = mkdtempSync(join(tmpdir(), 'gap118-test-'));
+    mDb = new Database(join(mTmpDir, 'test.db'));
+    mDb.registerProxy('p1', 'tok', 'localhost:3100');
+    mDb.createEngineConfig({ name: 'claude', engine: 'claude', detection: CLAUDE_DETECTION });
+  });
+
+  beforeEach(() => {
+    enqueuedTargets = [];
+    captureOutput = '';
+  });
+
+  afterEach(() => {
+    for (const m of monitors) m.stop();
+    monitors.length = 0;
+  });
+
+  after(() => {
+    mDb.close();
+    rmSync(mTmpDir, { recursive: true, force: true });
+  });
+
+  function makeMonitor(): HealthMonitor {
+    const monitor = new HealthMonitor({
+      db: mDb,
+      locks: new LockManager(mDb.rawDb),
+      proxyDispatch: async (_p: string, command: ProxyCommand): Promise<ProxyResponse> => {
+        if (command.action === 'capture') return { ok: true, data: captureOutput };
+        if (command.action === 'has_session') return { ok: true, data: true };
+        return { ok: true };
+      },
+      orchestratorHost: 'http://localhost:3000',
+      pollIntervalMs: 100,
+      onMessageEnqueued: (t: string) => enqueuedTargets.push(t),
+    });
+    monitors.push(monitor);
+    return monitor;
+  }
+
+  function seedActive(name: string): void {
+    if (!mDb.getAgent(name)) mDb.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = mDb.getAgent(name)!;
+    mDb.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
+  }
+
+  it('confirms ChloeOBrian is the default monitor-role holder', () => {
+    assert.ok(HealthMonitor.MONITOR_ROLE_AGENTS.has('ChloeOBrian'));
+    assert.equal(HealthMonitor.MONITOR_CTX_ALERT_THRESHOLD, 85);
+  });
+
+  it('fires a direct DrRobby alert when the monitor-role agent crosses the threshold', async () => {
+    seedActive('ChloeOBrian');
+    seedActive('DrRobby');
+    captureOutput = 'work\n                       Context left until auto-compact: 13%\n> '; // 100-13 = 87
+    const monitor = makeMonitor();
+
+    await monitor.pollAgent(mDb.getAgent('ChloeOBrian')!);
+
+    assert.equal(mDb.getAgent('ChloeOBrian')!.lastContextPct, 87);
+    assert.ok(enqueuedTargets.includes('DrRobby'), 'alert must be enqueued to DrRobby');
+    const events = mDb.getEvents('ChloeOBrian', 20) as Array<{ event: string }>;
+    assert.ok(events.some(e => e.event === 'monitor_ctx_threshold_alert'), 'alert event logged');
+  });
+
+  it('does NOT alert for a non-monitor agent above the threshold', async () => {
+    seedActive('health-nonmon');
+    captureOutput = 'work\n                       Context left until auto-compact: 5%\n> '; // 95%
+    const monitor = makeMonitor();
+
+    await monitor.pollAgent(mDb.getAgent('health-nonmon')!);
+
+    assert.equal(mDb.getAgent('health-nonmon')!.lastContextPct, 95);
+    assert.ok(!enqueuedTargets.includes('DrRobby'), 'non-monitor agent must not fire the alert');
+    const events = mDb.getEvents('health-nonmon', 20) as Array<{ event: string }>;
+    assert.ok(!events.some(e => e.event === 'monitor_ctx_threshold_alert'));
+  });
+
+  it('does NOT alert on a null (honest-unknown GAP-012) ctx reading', async () => {
+    seedActive('ChloeOBrian');
+    // cumulative-tokens line → contextPct stays null (never derived), lastContextPct = null
+    captureOutput = 'work\n                      new task? /clear to save 160000 tokens\n> ';
+    const monitor = makeMonitor();
+
+    await monitor.pollAgent(mDb.getAgent('ChloeOBrian')!);
+
+    assert.equal(mDb.getAgent('ChloeOBrian')!.lastContextPct, null);
+    assert.ok(!enqueuedTargets.includes('DrRobby'), 'null ctx must not fire a false alert');
+  });
+
+  it('fires once per crossing (deduped), then re-arms after dropping below', async () => {
+    seedActive('ChloeOBrian');
+    seedActive('DrRobby');
+    const monitor = makeMonitor();
+    const alertCount = () =>
+      (mDb.getEvents('ChloeOBrian', 100) as Array<{ event: string }>)
+        .filter(e => e.event === 'monitor_ctx_threshold_alert').length;
+    const base = alertCount();
+
+    captureOutput = 'work\n Context left until auto-compact: 13%\n> '; // 87 — cross
+    await monitor.pollAgent(mDb.getAgent('ChloeOBrian')!);
+    await monitor.pollAgent(mDb.getAgent('ChloeOBrian')!); // still over — must NOT re-fire
+    assert.equal(alertCount() - base, 1, 'exactly one alert while continuously over threshold');
+
+    captureOutput = 'work\n Context left until auto-compact: 60%\n> '; // 40 — drop below, re-arm
+    await monitor.pollAgent(mDb.getAgent('ChloeOBrian')!);
+    assert.equal(alertCount() - base, 1, 'dropping below does not alert');
+
+    captureOutput = 'work\n Context left until auto-compact: 10%\n> '; // 90 — re-cross
+    await monitor.pollAgent(mDb.getAgent('ChloeOBrian')!);
+    assert.equal(alertCount() - base, 2, 're-crossing after a drop re-alerts');
+  });
+});
