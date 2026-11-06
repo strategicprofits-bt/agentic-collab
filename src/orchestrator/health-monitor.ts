@@ -988,8 +988,16 @@ export class HealthMonitor {
     let reason: 'floor_null' | 'parse_miss';
     const lines = paneOutput.split('\n');
     const region = lines.slice(Math.max(0, lines.length - 20)).map(l => l.replace(/\s+$/, ''));
+    // GAP-122: an occupancy-SHAPED line — a digit-% co-occurring with an occupancy word, or the
+    // "until auto-compact" phrase. Deliberately NOT a bare /context/ match: prose/chat text
+    // containing the word "context" (e.g. "context_pct is null") produced false parse_miss
+    // events in the first live catch; requiring the %+keyword co-occurrence excludes it.
     const candidateLines = region
-      .filter(l => l.trim() && /context|auto-?compact|\d+\s*%/i.test(l))
+      .filter(l => {
+        const t = l.trim();
+        if (!t) return false;
+        return (/\d\s*%/.test(t) && /context|auto-?compact/i.test(t)) || /until auto-compact/i.test(t);
+      })
       .slice(0, 6);
 
     if (preFloorPct !== null) {

@@ -134,11 +134,15 @@ export class ClaudeAdapter implements EngineAdapter {
     for (let i = lines.length - 1; i >= Math.max(0, lines.length - 20); i--) {
       const line = lines[i] ?? '';
 
-      // Genuine occupancy signal #1 (the one Claude v2.x actually exposes):
-      // "Context left until auto-compact: N%" reports REMAINING headroom, so
-      // occupancy used = 100 - N (a near-full "7%" reads as 93).
+      // Genuine occupancy signal #1: REMAINING headroom until auto-compact → occupancy = 100 - N
+      // (a near-full "7%" reads as 93). GAP-122: the Claude TUI drifted the format ~2026-10-13
+      // under a steady .296 binary (server/Statsig render change), moving the % BEFORE the phrase
+      // — "N% until auto-compact" — which the old "Context left until auto-compact: N%" regex
+      // missed, nulling context_pct fleet-wide for ~3 weeks. Match BOTH (old kept, new added);
+      // the optional word tolerates "N% left/remaining until auto-compact".
       if (contextPct === null) {
-        const autoCompact = line.match(/Context left until auto-compact:\s*(\d+)%/i);
+        const autoCompact = line.match(/Context left until auto-compact:\s*(\d+)%/i)
+          ?? line.match(/(\d+)%\s*(?:\w+\s+)?until auto-compact/i);
         if (autoCompact) {
           contextPct = Math.max(0, Math.min(100, 100 - parseInt(autoCompact[1]!, 10)));
         }
