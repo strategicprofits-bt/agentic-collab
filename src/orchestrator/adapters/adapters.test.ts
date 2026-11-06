@@ -262,6 +262,25 @@ describe('Engine Adapters', () => {
       assert.equal(result.confident, true);
     });
 
+    // GAP-122: the Claude TUI occupancy line drifted ~2026-10-13 (under a steady .296 binary =
+    // a server/Statsig render change) from "Context left until auto-compact: N%" (% AFTER the
+    // phrase) to "N% until auto-compact" (% BEFORE, still % REMAINING → occupancy = 100 - N).
+    // The old regex missed the new format → context_pct went null fleet-wide for ~3 weeks.
+    it('GAP-122: parses the drifted "N% until auto-compact" occupancy format (% remaining → 100-N)', () => {
+      // live sample (PepperPotts): "1% until auto-compact" = 1% headroom left = 99% occupied
+      assert.equal(adapter.parseContextPercent('        1% until auto-compact').contextPct, 99);
+      assert.equal(adapter.parseContextPercent('  15% until auto-compact').contextPct, 85);
+      // tolerant of an optional word between the % and the phrase ("left"/"remaining")
+      assert.equal(adapter.parseContextPercent('  8% left until auto-compact').contextPct, 92);
+    });
+
+    it('GAP-122: still parses the OLD "Context left until auto-compact: N%" format (kept)', () => {
+      assert.equal(
+        adapter.parseContextPercent('   Context left until auto-compact: 7%').contextPct,
+        93,
+      );
+    });
+
     // GAP-012/097: a CUMULATIVE "tokens" figure is recorded as totalTokens (never
     // divided by 200k to fabricate a context %; contextPct stays null). GAP-097: the
     // cumulative figure is the "new task? /clear to save NNN[kKmM] tokens" line ONLY —

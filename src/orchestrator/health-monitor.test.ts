@@ -401,6 +401,30 @@ describe('HealthMonitor', () => {
     assert.equal(g122Misses('g122-head').length, 0, 'no occupancy-ish line → no parse_miss (genuine headroom)');
   });
 
+  // GAP-122 capture FIX: the drifted "N% until auto-compact" occupancy line now parses
+  // end-to-end (→ 100-N recorded on the agent record), and a near-full agent no longer
+  // emits a parse_miss (capture repaired = the GAP-122 close signal).
+  it('GAP-122 fix: "N% until auto-compact" is captured end-to-end (→ 100-N) and logs no parse_miss', async () => {
+    const monitor = g122Setup('g122-fix');
+    // live PepperPotts shape: 1% remaining → 99% occupied, with a supporting high token count.
+    captureOutput = '✻ Working\n   1% until auto-compact\n   new task? /clear to save 180k tokens\n❯ ';
+    proxyCommands = [];
+    await monitor.pollAll();
+    assert.equal(db.getAgent('g122-fix')!.lastContextPct, 99, 'drifted occupancy format captured as 99% occupied');
+    assert.equal(g122Misses('g122-fix').length, 0, 'a captured occupancy line emits no parse_miss');
+  });
+
+  // GAP-122 diagnostic tightening: prose/chat text containing the word "context" (no occupancy
+  // %) must NOT be mistaken for an occupancy line — the first live catch logged two such
+  // false-positive parse_miss events (panes quoting "context_pct" etc.).
+  it('GAP-122 fix: prose containing "context" (no occupancy %) does NOT trigger a parse_miss', async () => {
+    const monitor = g122Setup('g122-prose');
+    captureOutput = '  whose context_pct is null, with meta.reason here\n  some context inference note\n❯ ';
+    proxyCommands = [];
+    await monitor.pollAll();
+    assert.equal(g122Misses('g122-prose').length, 0, 'bare "context" prose is not an occupancy-shaped candidate');
+  });
+
   // GAP-097: the token capture must anchor on the CUMULATIVE session line
   // ("new task? /clear to save NNNk tokens") and IGNORE the transient per-turn
   // streaming counter (a bare "N tokens" that resets each turn). The loose
