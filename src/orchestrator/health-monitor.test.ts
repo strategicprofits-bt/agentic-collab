@@ -1325,6 +1325,74 @@ describe('HealthMonitor', () => {
     monitor.stop();
   });
 
+  // GAP-125 LEG-2 (freshness-guard): when the /clear-to-save token line stops parsing (e.g.
+  // truncated by the "Update installed · Restart" nag stealing status-bar width), the cached
+  // lastTokenCount must NOT linger and keep tripping the 700k gate — that caused a ~2-day
+  // phantom auto-compact loop on a frozen 718000. Mirror the GAP-012 frozen-ctx% invalidation:
+  // after N consecutive token-less polls, invalidate the stale value so the gate sees "unknown".
+  // Incrementing pane_activity for the target makes every poll count as "changed" so
+  // recordContextPercent (which holds the freshness-guard) runs each poll; a huge minIdle keeps
+  // auto-compact from firing so the guard is exercised in isolation. (In production the phantom
+  // compacts themselves change the pane, which re-runs recordContextPercent — so the guard still
+  // bounds the loop there; here we drive it directly.)
+  function makeStaleTokenMonitor(name: string, capRef: () => string): HealthMonitor {
+    let act = 0;
+    const isTarget = (c: ProxyCommand) => 'sessionName' in c && c.sessionName === `agent-${name}`;
+    const dispatch = async (_p: string, c: ProxyCommand): Promise<ProxyResponse> => {
+      if (c.action === 'capture') return { ok: true, data: isTarget(c) ? capRef() : 'idle\n❯ \n' };
+      if (c.action === 'has_session') return { ok: true, data: true };
+      if (c.action === 'pane_activity') return { ok: true, data: isTarget(c) ? ++act : 1 };
+      return { ok: true };
+    };
+    return makeMonitor({
+      proxyDispatch: dispatch,
+      autoCompactTokenThreshold: 700_000,
+      autoCompactMinIdleMs: 999_999,
+      autoCompactCooldownMs: 10_000,
+      idleSuspendMs: 999_999,
+    });
+  }
+
+  it('GAP-125: invalidates a STALE cached token count after N token-less polls', async () => {
+    const name = 'health-token-stale';
+    db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent(name)!;
+    db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
+
+    let cap = 'working\n            new task? /clear to save 750000 tokens\n❯ \n';
+    const monitor = makeStaleTokenMonitor(name, () => cap);
+
+    await monitor.pollAll();
+    assert.equal((monitor as any).lastTokenCount.get(name), 750000, 'precondition: cached high token count');
+
+    // The /clear-to-save line vanishes (truncated/absent) for N consecutive polls.
+    cap = 'idle, nothing pending\n❯ \n';
+    for (let i = 0; i < 3; i++) await monitor.pollAll();
+
+    assert.equal((monitor as any).lastTokenCount.has(name), false, 'stale cached count must be invalidated after N token-less polls');
+    const events = db.getEvents(name, 50);
+    assert.ok(events.some(e => e.event === 'token_parse_stale_invalidated'), 'should log token_parse_stale_invalidated');
+    monitor.stop();
+  });
+
+  it('GAP-125: a SINGLE transient token-less poll does NOT invalidate (tolerates brief absence)', async () => {
+    const name = 'health-token-transient';
+    db.createAgent({ name, engine: 'claude', cwd: '/tmp', proxyId: 'p1' });
+    const a = db.getAgent(name)!;
+    db.updateAgentState(name, 'active', a.version, { tmuxSession: `agent-${name}`, proxyId: 'p1' });
+
+    let cap = 'working\n            new task? /clear to save 750000 tokens\n❯ \n';
+    const monitor = makeStaleTokenMonitor(name, () => cap);
+
+    await monitor.pollAll();
+    assert.equal((monitor as any).lastTokenCount.get(name), 750000, 'precondition');
+
+    cap = 'idle, nothing pending\n❯ \n';
+    await monitor.pollAll(); // one miss only (< threshold)
+    assert.equal((monitor as any).lastTokenCount.get(name), 750000, 'one transient miss must not invalidate');
+    monitor.stop();
+  });
+
   // ── GAP-098: cadence respawn/compact (wall-clock, enrolled agents) ──
   // Drives via pollAll: driveToIdle's 2nd poll is the cadence FIRST-ENCOUNTER (stamps, no fire);
   // a 3rd poll with interval 0 is the first real fire. Capture is a clean idle prompt (empty

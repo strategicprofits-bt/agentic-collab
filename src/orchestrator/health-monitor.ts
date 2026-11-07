@@ -197,6 +197,12 @@ export class HealthMonitor {
   static readonly CTX_STALE_TOKEN_FLOOR = parseIntEnv('CTX_STALE_TOKEN_FLOOR', 10_000);
   static readonly AUTOCOMPACT_MIN_IDLE_MS = parseIntEnv('AUTOCOMPACT_MIN_IDLE_MS', 60_000);
   static readonly AUTOCOMPACT_COOLDOWN_MS = parseIntEnv('AUTOCOMPACT_COOLDOWN_MS', 15 * 60 * 1000);
+  // GAP-125: consecutive token-less polls before a cached lastTokenCount is treated as STALE and
+  // invalidated. A totalTokens that stops re-parsing (e.g. the /clear-to-save line truncated by
+  // an update nag) must not leave a frozen value tripping the 700k gate — that drove a ~2-day
+  // phantom auto-compact loop on a stale 718000. Mirrors the GAP-012 frozen-ctx% invalidation.
+  // 3 polls tolerates a brief transient absence (mid-turn / fresh-compact) before invalidating.
+  static readonly TOKEN_STALE_POLLS = parseIntEnv('TOKEN_STALE_POLLS', 3);
   // ── GAP-118: direct ctx-pct alert for the monitor-role holder ──
   // The 85%-ctx ESCALATION is a judgment step the standing monitor (ChloeOBrian) cannot
   // reliably self-apply when SHE is the over-threshold agent (she's busy/compacting). So for
@@ -288,6 +294,8 @@ export class HealthMonitor {
   private readonly autoSuspending = new Set<string>();
   /** Last recorded total token count per agent — used to skip duplicate snapshots. */
   private readonly lastTokenCount = new Map<string, number>();
+  /** GAP-125: consecutive token-less polls per agent — invalidates a stale lastTokenCount. */
+  private readonly tokenParseMisses = new Map<string, number>();
   /** Timestamps of recent recovery attempts per agent — used for circuit breaker. */
   private readonly recoveryHistory = new Map<string, number[]>();
   /** Max recovery attempts within the sliding window before tripping the breaker. */
@@ -885,6 +893,25 @@ export class HealthMonitor {
     // went null fleet-wide; token capture kept working). Classify WHY ctx% is null so the
     // next near-compact agent is mechanism-dispositive — floor-interaction vs format-drift.
     this.checkCtxParseDiagnostic(agent.name, paneOutput, preFloorPct, contextPct, totalTokens);
+
+    // GAP-125 freshness-guard: a cached lastTokenCount that stops re-parsing must not linger
+    // and keep tripping the 700k auto-compact gate (health-monitor reads lastTokenCount, not a
+    // live parse). When the /clear-to-save line was truncated by the update nag ~2026-11-03,
+    // CristinaYang's frozen 718000 drove a ~2-day phantom auto-compact loop every cooldown.
+    // After TOKEN_STALE_POLLS consecutive token-less polls, invalidate the stale value so the
+    // gate sees "unknown" (never a ghost). Mirrors the GAP-012 frozen-ctx% invalidation. Runs
+    // BEFORE the nothing-parseable early-return below, which the phantom case (ctx% also null)
+    // would otherwise skip. A successful parse resets the miss counter.
+    if (totalTokens === undefined) {
+      const misses = (this.tokenParseMisses.get(agent.name) ?? 0) + 1;
+      this.tokenParseMisses.set(agent.name, misses);
+      if (misses >= HealthMonitor.TOKEN_STALE_POLLS && this.lastTokenCount.has(agent.name)) {
+        this.lastTokenCount.delete(agent.name);
+        this.db.logEvent(agent.name, 'token_parse_stale_invalidated', undefined, { misses });
+      }
+    } else {
+      this.tokenParseMisses.delete(agent.name);
+    }
 
     // Nothing parseable at all (no occupancy %, no token count) — leave the last
     // reading untouched (a transient/garbled capture must not wipe a good value).
