@@ -168,8 +168,19 @@ export class ClaudeAdapter implements EngineAdapter {
       // counter (resets each turn), so anchor on "/clear to save" to capture the real
       // cumulative figure and ignore the transient. Recorded as totalTokens ONLY —
       // never converted to a context %.
+      //
+      // GAP-125: the trailing word "tokens" is NO LONGER required. A pending-update nag
+      // ("✔ Update installed · Restart to update") shares the status-bar line and steals its
+      // width, TRUNCATING "/clear to save 124.6k tokens" to "/clear to save 124.6k to…" — the
+      // "tokens" word is cut off. The old ...\s*tokens anchor then missed, nulling totalTokens
+      // fleet-wide from ~2026-11-03 (snapshots stopped + the 700k auto-compact backstop went
+      // dark). The number+unit IS the signal. To keep this parse-WIDENING from false-capturing
+      // "/clear to save N" quoted mid-sentence in collab prose (this feeds the 700k ACTION gate
+      // — the GAP-122 leg-2 lesson), the phrase is anchored to the START of the trimmed line as
+      // a standalone status-bar indicator (optional "new task?" chrome prefix), NOT matched
+      // anywhere in the line. Mid-sentence prose has words before the phrase → no match.
       if (totalTokens === undefined) {
-        const tokenMatch = line.match(/\/clear to save\s+(\d+(?:[.,]\d+)?)\s*([kKmM])?\s*tokens/);
+        const tokenMatch = line.trim().match(/^(?:new task\?\s*)?\/clear to save\s+(\d+(?:[.,]\d+)?)\s*([kKmM])?\b/i);
         if (tokenMatch) {
           let tokens = parseFloat(tokenMatch[1]!.replace(/,/g, ''));
           const suffix = tokenMatch[2];

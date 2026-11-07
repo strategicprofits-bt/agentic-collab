@@ -340,6 +340,31 @@ describe('Engine Adapters', () => {
       assert.equal(result.totalTokens, 88500);
     });
 
+    // GAP-125: a pending-update NAG ("✔ Update installed · Restart to update") shares the
+    // status-bar line and steals its width, TRUNCATING "/clear to save 124.6k tokens" to
+    // "/clear to save 124.6k to…" (the word "tokens" is cut off). The old regex required a
+    // literal "tokens" suffix → no match → totalTokens went null fleet-wide from ~2026-11-03,
+    // killing the token snapshots AND the 700k auto-compact backstop. The number+unit is the
+    // signal; the trailing "tokens" word is redundant and now unreliable.
+    it('GAP-125: parses the NAG-truncated "/clear to save N.Nk to…" line (tokens word cut off)', () => {
+      const real = '  new task? /clear to save 124.6k to… · ✔ Update installed · Restart to update';
+      assert.equal(adapter.parseContextPercent(real).totalTokens, 124600);
+      assert.equal(adapter.parseContextPercent(real).contextPct, null);
+      // truncation with no trailing chrome at all
+      assert.equal(adapter.parseContextPercent('  new task? /clear to save 127.2k to…').totalTokens, 127200);
+      // whole-number truncated form
+      assert.equal(adapter.parseContextPercent('new task? /clear to save 718k to…').totalTokens, 718000);
+    });
+
+    // GAP-125 false-MATCH guard (the GAP-122 leg-2 lesson: this branch feeds the 700k ACTION
+    // gate, so a WIDENING must be checked for false MATCHES, not just no-match fail-safe). The
+    // truncation-tolerant match is anchored to the status-bar chrome at the START of the trimmed
+    // line, so "/clear to save N…" quoted MID-SENTENCE in a collab message does NOT capture.
+    it('GAP-125 guard: "/clear to save Nk" embedded in prose MUST NOT capture', () => {
+      assert.equal(adapter.parseContextPercent('I told them to run /clear to save 5k to free space').totalTokens, undefined);
+      assert.equal(adapter.parseContextPercent('the "/clear to save 718k to…" line is truncated').totalTokens, undefined);
+    });
+
     // GAP-097: the TRANSIENT per-turn streaming counter (bare "N tokens", no
     // "/clear to save" anchor) must NOT be captured as cumulative — it resets each
     // turn and sawtooths, which broke the auto-compact gate + the GAP-012 floor.
