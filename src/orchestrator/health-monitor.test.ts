@@ -425,6 +425,43 @@ describe('HealthMonitor', () => {
     assert.equal(g122Misses('g122-prose').length, 0, 'bare "context" prose is not an occupancy-shaped candidate');
   });
 
+  // GAP-131: the diagnostic's candidate filter was left UN-anchored when parseContextPercent got
+  // the GAP-122 whole-line (^…$) anchor — so prose/chat/log text that embeds a % NEAR the words
+  // "context"/"auto-compact" (e.g. an agent saying "my own context is at 99%") still matched and
+  // fired false parse_miss events (15/15 live events were such prose, zero genuine). The candidate
+  // filter must require the occupancy signature to span the WHOLE trimmed line, not sit mid-sentence.
+  it('GAP-131: prose embedding a % near "context"/"auto-compact" does NOT trigger a parse_miss', async () => {
+    const monitor = g122Setup('g131-prose');
+    // Verbatim shapes from the live false-positive corpus (all mid-sentence, with a %).
+    captureOutput = [
+      '  My own context is at 99% — compacting now per the 70% proactive threshold.',
+      '  5:02 AM, "1% until auto-compact" confirms genuine near-compaction. The',
+      '  auto-compact (the CLI\'s own "N% until auto-compact") is the ultimate reactive',
+      '  4. MarieKondo -- 346596kB RSS (2.1%mem). Pane: idle, just auto-compacted;',
+      '❯ ',
+    ].join('\n');
+    proxyCommands = [];
+    await monitor.pollAll();
+    assert.equal(
+      g122Misses('g131-prose').length, 0,
+      'prose with a % near occupancy words is not a standalone occupancy line → no parse_miss',
+    );
+  });
+
+  // GAP-131 (boundary-keep): the anchored filter must stay BROADER than parseContextPercent so a
+  // genuine STANDALONE occupancy line the parser's exact regex missed (format drift) still trips
+  // the diagnostic. parseContextPercent requires the ":" ("…auto-compact: N%"); a colonless drift
+  // is a standalone status line the parser misses but the diagnostic must still catch.
+  it('GAP-131: a genuine standalone occupancy line the parser missed STILL logs parse_miss', async () => {
+    const monitor = g122Setup('g131-keep');
+    captureOutput = '✻ Working\n   Context left until auto-compact 12%\n   new task? /clear to save 160k tokens\n❯ ';
+    proxyCommands = [];
+    await monitor.pollAll();
+    const misses = g122Misses('g131-keep');
+    assert.equal(misses.length, 1, 'colonless standalone occupancy drift is still an occupancy candidate');
+    assert.equal(misses[0]!.reason, 'parse_miss', 'standalone-but-unparsed line → parse_miss, not suppressed');
+  });
+
   // GAP-097: the token capture must anchor on the CUMULATIVE session line
   // ("new task? /clear to save NNNk tokens") and IGNORE the transient per-turn
   // streaming counter (a bare "N tokens" that resets each turn). The loose
