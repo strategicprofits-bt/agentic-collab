@@ -1015,15 +1015,27 @@ export class HealthMonitor {
     let reason: 'floor_null' | 'parse_miss';
     const lines = paneOutput.split('\n');
     const region = lines.slice(Math.max(0, lines.length - 20)).map(l => l.replace(/\s+$/, ''));
-    // GAP-122: an occupancy-SHAPED line — a digit-% co-occurring with an occupancy word, or the
-    // "until auto-compact" phrase. Deliberately NOT a bare /context/ match: prose/chat text
-    // containing the word "context" (e.g. "context_pct is null") produced false parse_miss
-    // events in the first live catch; requiring the %+keyword co-occurrence excludes it.
+    // An occupancy-SHAPED line — a digit-% co-occurring with an occupancy word. GAP-122 required
+    // the %+keyword co-occurrence (excludes bare "context" prose with no %), but that still let
+    // prose EMBEDDING a % near those words through ("my own context is at 99%", a quoted
+    // "1% until auto-compact", an RSS list row with "2.1%mem … auto-compacted").
+    // GAP-131: mirror parseContextPercent's whole-line (^…$) anchor — a genuine status-bar
+    // occupancy indicator OCCUPIES THE WHOLE LINE, so require the trimmed line (after stripping
+    // leading status glyphs/bullets/quotes) to BEGIN with the occupancy concept ("context" or a
+    // digit-%) AND END with an occupancy terminator (% or full/left/remaining/used/compact). Prose
+    // embeds the signature mid-sentence, so it fails one end or the other. Kept deliberately
+    // BROADER than the parser (any such standalone line, not the exact two patterns) so genuine
+    // format-drift the parser misses still trips the diagnostic. Verified against the 17 live
+    // false-positive candidate lines (all excluded) + the existing genuine fixtures (all kept).
     const candidateLines = region
       .filter(l => {
-        const t = l.trim();
+        const t = l.trim().replace(/^[^\w%]+/, ''); // drop leading glyphs/bullets/quotes/spaces (●✻✶ " etc.)
         if (!t) return false;
-        return (/\d\s*%/.test(t) && /context|auto-?compact/i.test(t)) || /until auto-compact/i.test(t);
+        if (!/\d\s*%/.test(t)) return false;                      // must carry an actual %
+        if (!/context|auto-?compact|until|window|remaining|left|used|full/i.test(t)) return false;
+        const startsOcc = /^(?:context\b|\d+\s*%)/i.test(t);      // line begins with the occupancy concept
+        const endsOcc = /(?:\d\s*%|\b(?:full|left|remaining|used|compact)\b)$/i.test(t); // …and ends as an indicator
+        return startsOcc && endsOcc;
       })
       .slice(0, 6);
 
